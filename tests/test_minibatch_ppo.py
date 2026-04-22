@@ -21,17 +21,14 @@ OBS_DIM = HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM)
 N       = 32  # rollout 길이
 
 
-def make_dummy_batch(n=N):
-    obs          = torch.randn(n, OBS_DIM)
-    actions      = torch.zeros(n, MAX_PLANETS, ACTION_DIM)
-    actions[:, :, 0] = torch.randint(0, 2, (n, MAX_PLANETS)).float()
-    actions[:, :, 1] = torch.rand(n, MAX_PLANETS)
-    # target one-hot
-    tgt = torch.randint(0, MAX_PLANETS, (n, MAX_PLANETS))
-    actions[:, :, 2:].scatter_(-1, tgt.unsqueeze(-1), 1.0)
-    old_log_probs = torch.randn(n)
-    returns       = torch.randn(n)
-    advantages    = torch.randn(n)
+def make_dummy_batch(model, n=N):
+    """model로 실제 log_prob을 뽑아 old_log_probs로 사용 — ratio 폭발 방지."""
+    obs = torch.randn(n, OBS_DIM).to(DEVICE)
+    with torch.no_grad():
+        action_t, old_log_probs, _ = model.get_action_and_value(obs)
+    actions   = action_t
+    returns   = torch.randn(n).to(DEVICE)
+    advantages = torch.randn(n).to(DEVICE)
     return obs, actions, old_log_probs, returns, advantages
 
 
@@ -45,7 +42,7 @@ def model_and_opt():
 def test_ppo_update_returns_five_values(model_and_opt):
     """ppo_update가 5개 값을 반환하는지 확인."""
     m, opt = model_and_opt
-    obs, actions, old_lp, rets, advs = make_dummy_batch()
+    obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     result = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
                         n_epochs=1, minibatch_size=N)
     assert len(result) == 5
@@ -54,7 +51,7 @@ def test_ppo_update_returns_five_values(model_and_opt):
 def test_approx_kl_nonnegative(model_and_opt):
     """approx_kl >= 0 (KL divergence 하한)."""
     m, opt = model_and_opt
-    obs, actions, old_lp, rets, advs = make_dummy_batch()
+    obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     _, _, _, approx_kl, _ = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
                                         n_epochs=1, minibatch_size=N)
     assert approx_kl >= 0, f"approx_kl={approx_kl} < 0"
@@ -63,7 +60,7 @@ def test_approx_kl_nonnegative(model_and_opt):
 def test_clip_frac_in_range(model_and_opt):
     """clip_frac in [0, 1]."""
     m, opt = model_and_opt
-    obs, actions, old_lp, rets, advs = make_dummy_batch()
+    obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     _, _, _, _, clip_frac = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
                                         n_epochs=1, minibatch_size=N)
     assert 0.0 <= clip_frac <= 1.0, f"clip_frac={clip_frac} out of range"
@@ -72,7 +69,7 @@ def test_clip_frac_in_range(model_and_opt):
 def test_no_nan_in_outputs(model_and_opt):
     """출력값에 NaN/Inf가 없는지 확인."""
     m, opt = model_and_opt
-    obs, actions, old_lp, rets, advs = make_dummy_batch()
+    obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     results = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
                          n_epochs=2, minibatch_size=16)
     for val in results:
@@ -84,7 +81,7 @@ def test_weights_change_after_update(model_and_opt):
     """업데이트 후 모델 가중치가 실제로 변하는지 확인."""
     m, opt = model_and_opt
     before = [p.clone() for p in m.parameters()]
-    obs, actions, old_lp, rets, advs = make_dummy_batch()
+    obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     ppo_update(m, opt, obs, actions, old_lp, rets, advs, n_epochs=1, minibatch_size=N)
     after = list(m.parameters())
     changed = any(not torch.equal(b, a) for b, a in zip(before, after))
@@ -95,9 +92,9 @@ def test_multi_epoch_updates_more_than_single(model_and_opt):
     """n_epochs=4가 n_epochs=1보다 가중치를 더 많이 움직이는지 확인."""
     import copy
 
-    obs, actions, old_lp, rets, advs = make_dummy_batch()
-
     m1, opt1 = model_and_opt
+    obs, actions, old_lp, rets, advs = make_dummy_batch(m1)
+
     m2 = copy.deepcopy(m1)
     opt2 = torch.optim.Adam(m2.parameters(), lr=1e-4)
 
