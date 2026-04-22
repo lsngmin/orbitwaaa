@@ -171,7 +171,10 @@ def tournament(population):
     with Pool(processes=min(len(pairs), os.cpu_count())) as pool:
         results = pool.map(play_match, pairs)
 
+    match_count = [0] * n
     for (i, j), result in zip(pair_idx, results):
+        match_count[i] += 1
+        match_count[j] += 1
         if result == 0:
             scores[i] += 1.0
         elif result == 1:
@@ -180,8 +183,8 @@ def tournament(population):
             scores[i] += 0.5
             scores[j] += 0.5
 
-    # 정규화 (0~1): 개체당 최대 MATCHES_PER_EVAL점
-    return [s / MATCHES_PER_EVAL for s in scores]
+    # 실제 대전 수로 정규화 (0~1)
+    return [s / max(c, 1) for s, c in zip(scores, match_count)]
 
 
 def crossover(a, b):
