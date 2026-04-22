@@ -2,10 +2,12 @@
 set -e
 
 echo "=== Python 버전 확인 ==="
-python3.11 --version || { echo "Python 3.11 필요. brew install python@3.11"; exit 1; }
+PYTHON=$(command -v python3.11 || command -v python3 || command -v python)
+$PYTHON --version
+echo "사용할 Python: $PYTHON"
 
 echo "=== 가상환경 생성 ==="
-python3.11 -m venv .venv
+$PYTHON -m venv .venv
 source .venv/bin/activate
 
 echo "=== pip 업그레이드 ==="
