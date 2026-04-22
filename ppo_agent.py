@@ -31,15 +31,21 @@ WEIGHTS_PATH = (
     else os.path.join(_base, "main_final.pt")
 )
 
-_model = None
+def _load_model():
+    m = OrbitWarsPolicy()
+    m.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
+    m.eval()
+    # warmup: 첫 forward pass JIT 컴파일을 import 시점에 처리
+    _dummy = torch.zeros(1, HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM))
+    with torch.no_grad():
+        m.forward(_dummy)
+    return m
+
+
+_model = _load_model()
 
 
 def _get_model():
-    global _model
-    if _model is None:
-        _model = OrbitWarsPolicy()
-        _model.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
-        _model.eval()
     return _model
 
 
