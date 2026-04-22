@@ -272,9 +272,9 @@ def compute_returns(rewards, dones, values, gamma=T["gamma"]):
     return returns
 
 
-def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, clip_range=T["clip_range"]):
-    advantages = returns - returns.mean()
-    advantages = advantages / (advantages.std() + 1e-8)
+def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, values, clip_range=T["clip_range"]):
+    advantages = returns - values.squeeze(-1)
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     obs           = obs.to(DEVICE)
     actions       = actions.to(DEVICE)
@@ -386,7 +386,7 @@ def train(n_envs=1):
                 main_model, opponent, n_steps=512, n_envs=n_envs, pool=pool
             )
             returns = compute_returns(rewards, dones, values)
-            p_loss, v_loss, e_loss = ppo_update(main_model, optimizer, obs, actions, log_probs, returns)
+            p_loss, v_loss, e_loss = ppo_update(main_model, optimizer, obs, actions, log_probs, returns, values)
             total_steps += len(obs)
 
             exp_opp = copy.deepcopy(main_model)
@@ -395,7 +395,7 @@ def train(n_envs=1):
                 exploiter, exp_opp, n_steps=256, n_envs=max(1, n_envs // 2), pool=pool
             )
             ret_e = compute_returns(rew_e, done_e, val_e)
-            ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e)
+            ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, val_e)
 
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
