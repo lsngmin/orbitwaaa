@@ -10,6 +10,8 @@ model:
 
 training:
   batch_size: 256
+  minibatch_size: 64    # minibatch PPO용 — batch_size의 약수여야 함
+  n_epochs: 4           # 같은 rollout을 몇 epoch 반복할지
   learning_rate: 0.0003
   total_timesteps: 10000000
   n_envs: 64

@@ -299,7 +299,8 @@ def compute_gae(rewards, dones, values, gamma=T["gamma"], lam=T["gae_lambda"]):
     return advantages, returns
 
 
-def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantages, clip_range=T["clip_range"]):
+def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantages,
+               clip_range=T["clip_range"], n_epochs=T["n_epochs"], minibatch_size=T["minibatch_size"]):
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     obs           = obs.to(DEVICE)
@@ -308,23 +309,49 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
     advantages    = advantages.to(DEVICE)
     returns       = returns.to(DEVICE)
 
-    log_probs, entropy, values = model.evaluate_actions(obs, actions)
+    N = len(obs)
+    p_losses, v_losses, e_losses = [], [], []
+    approx_kls, clip_fracs       = [], []
 
-    ratio       = (log_probs - old_log_probs).exp()
-    surr1       = ratio * advantages
-    surr2       = ratio.clamp(1 - clip_range, 1 + clip_range) * advantages
-    policy_loss = -torch.min(surr1, surr2).mean()
-    value_loss  = nn.functional.mse_loss(values.squeeze(-1), returns)
-    entropy_loss= -entropy.mean()
+    for _ in range(n_epochs):
+        idx = torch.randperm(N, device=DEVICE)
+        for start in range(0, N, minibatch_size):
+            mb = idx[start:start + minibatch_size]
 
-    loss = policy_loss + T["vf_coef"] * value_loss + T["ent_coef"] * entropy_loss
+            log_probs, entropy, values = model.evaluate_actions(obs[mb], actions[mb])
 
-    optimizer.zero_grad()
-    loss.backward()
-    nn.utils.clip_grad_norm_(model.parameters(), T["max_grad_norm"])
-    optimizer.step()
+            ratio        = (log_probs - old_log_probs[mb]).exp()
+            adv_mb       = advantages[mb]
+            surr1        = ratio * adv_mb
+            surr2        = ratio.clamp(1 - clip_range, 1 + clip_range) * adv_mb
+            policy_loss  = -torch.min(surr1, surr2).mean()
+            value_loss   = nn.functional.mse_loss(values.squeeze(-1), returns[mb])
+            entropy_loss = -entropy.mean()
 
-    return policy_loss.item(), value_loss.item(), entropy_loss.item()
+            loss = policy_loss + T["vf_coef"] * value_loss + T["ent_coef"] * entropy_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), T["max_grad_norm"])
+            optimizer.step()
+
+            with torch.no_grad():
+                approx_kl  = ((ratio - 1) - ratio.log()).mean().item()
+                clip_frac  = ((ratio - 1).abs() > clip_range).float().mean().item()
+
+            p_losses.append(policy_loss.item())
+            v_losses.append(value_loss.item())
+            e_losses.append(entropy_loss.item())
+            approx_kls.append(approx_kl)
+            clip_fracs.append(clip_frac)
+
+    return (
+        sum(p_losses) / len(p_losses),
+        sum(v_losses) / len(v_losses),
+        sum(e_losses) / len(e_losses),
+        sum(approx_kls) / len(approx_kls),
+        sum(clip_fracs) / len(clip_fracs),
+    )
 
 
 # ── 평가 ──────────────────────────────────────────────────────────────────────
@@ -413,7 +440,9 @@ def train(n_envs=1):
                 main_model, opponent, n_steps=512, n_envs=n_envs, pool=pool
             )
             advantages, returns = compute_gae(rewards, dones, values)
-            p_loss, v_loss, e_loss = ppo_update(main_model, optimizer, obs, actions, log_probs, returns, advantages)
+            p_loss, v_loss, e_loss, approx_kl, clip_frac = ppo_update(
+                main_model, optimizer, obs, actions, log_probs, returns, advantages
+            )
             total_steps += len(obs)
 
             exp_opp = copy.deepcopy(main_model)
@@ -427,6 +456,7 @@ def train(n_envs=1):
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
                 policy_loss=p_loss, value_loss=v_loss, entropy_loss=e_loss,
+                approx_kl=approx_kl, clip_frac=clip_frac,
                 league_size=len(league),
             )
 
