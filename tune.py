@@ -1,5 +1,6 @@
 """
 유전 알고리즘으로 strategy.py 가중치 자동 튜닝.
+토너먼트 방식: 개체끼리 서로 대전해서 승점으로 평가.
 
 실행:
     python tune.py
@@ -9,7 +10,6 @@
 """
 
 import json
-import math
 import random
 import os
 from multiprocessing import Pool
@@ -24,11 +24,11 @@ WEIGHT_RANGES = {
 }
 
 # GA 설정
-POPULATION_SIZE = 64    # 한 세대 개체 수 (코어 수에 맞춤)
-GENERATIONS     = 20    # 세대 수
-ELITE_RATIO     = 0.25  # 상위 25% 생존
-MUTATION_RATE   = 0.2   # 돌연변이 확률
-GAMES_PER_EVAL  = 5     # 개체당 자가대전 판 수
+POPULATION_SIZE  = 64   # 한 세대 개체 수
+GENERATIONS      = 20   # 세대 수
+ELITE_RATIO      = 0.25 # 상위 25% 생존
+MUTATION_RATE    = 0.2  # 돌연변이 확률
+MATCHES_PER_EVAL = 6    # 개체당 대전 상대 수 (랜덤 샘플)
 
 
 def random_individual():
@@ -36,10 +36,10 @@ def random_individual():
 
 
 def make_agent(weights):
-    """가중치를 주입한 agent 함수 반환."""
     def agent(obs):
         import math as _math
         from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
+        from prediction import aim, crosses_sun, estimate_arrival_turn, predict_position
 
         if isinstance(obs, dict):
             player      = obs.get("player", 0)
@@ -56,8 +56,6 @@ def make_agent(weights):
 
         planets = [Planet(*p) for p in raw_planets]
         fleets  = [Fleet(*f) for f in raw_fleets]
-
-        from prediction import aim, crosses_sun, estimate_arrival_turn, predict_position, fleet_speed
 
         def fleet_will_hit(fleet, planet):
             dx = _math.cos(fleet.angle)
@@ -132,51 +130,63 @@ def make_agent(weights):
             assigned[best_target.id] = assigned.get(best_target.id, 0) + best_needed
 
         return moves
-
     return agent
 
 
-def evaluate(weights):
-    """가중치 조합의 승률 측정 (자가대전 GAMES_PER_EVAL판)."""
-    wins = 0
-    agent = make_agent(weights)
-    for _ in range(GAMES_PER_EVAL):
-        try:
-            env = make("orbit_wars", debug=False)
-            env.run([agent, agent])
-            r = env.steps[-1][0].reward
-            if r == 1:
-                wins += 1
-            elif r == 0:
-                wins += 0.5
-        except Exception:
-            pass
-    return wins / GAMES_PER_EVAL
+def play_match(args):
+    """두 가중치 조합 대전. (이긴 쪽 인덱스, 0=무승부) 반환."""
+    w1, w2 = args
+    try:
+        env = make("orbit_wars", debug=False)
+        env.run([make_agent(w1), make_agent(w2)])
+        r0 = env.steps[-1][0].reward
+        r1 = env.steps[-1][1].reward
+        if r0 > r1:
+            return 0    # w1 승
+        elif r1 > r0:
+            return 1    # w2 승
+        else:
+            return -1   # 무승부
+    except Exception:
+        return -1
 
 
-def evaluate_vs_random(weights):
-    """random 상대로 승률 측정."""
-    wins = 0
-    agent = make_agent(weights)
-    for _ in range(GAMES_PER_EVAL):
-        try:
-            env = make("orbit_wars", debug=False)
-            env.run([agent, "random"])
-            r = env.steps[-1][0].reward
-            if r == 1:
-                wins += 1
-            elif r == 0:
-                wins += 0.5
-        except Exception:
-            pass
-    return wins / GAMES_PER_EVAL
+def tournament(population):
+    """
+    각 개체를 MATCHES_PER_EVAL명 랜덤 상대와 대전.
+    승=1점, 무=0.5점, 패=0점으로 총점 계산.
+    """
+    n = len(population)
+    scores = [0.0] * n
+
+    # 대전 쌍 생성
+    pairs = []
+    pair_idx = []
+    for i in range(n):
+        opponents = random.sample([j for j in range(n) if j != i], MATCHES_PER_EVAL)
+        for j in opponents:
+            pairs.append((population[i], population[j]))
+            pair_idx.append((i, j))
+
+    with Pool(processes=min(len(pairs), os.cpu_count())) as pool:
+        results = pool.map(play_match, pairs)
+
+    for (i, j), result in zip(pair_idx, results):
+        if result == 0:
+            scores[i] += 1.0
+        elif result == 1:
+            scores[j] += 1.0
+        else:
+            scores[i] += 0.5
+            scores[j] += 0.5
+
+    # 정규화 (0~1)
+    max_score = MATCHES_PER_EVAL * n
+    return [s / max_score for s in scores]
 
 
 def crossover(a, b):
-    child = {}
-    for k in WEIGHT_RANGES:
-        child[k] = a[k] if random.random() < 0.5 else b[k]
-    return child
+    return {k: a[k] if random.random() < 0.5 else b[k] for k in WEIGHT_RANGES}
 
 
 def mutate(individual):
@@ -188,17 +198,13 @@ def mutate(individual):
 
 
 def run():
-    print(f"GA 시작: {POPULATION_SIZE}개체 × {GENERATIONS}세대 × {GAMES_PER_EVAL}판")
-    population = [random_individual() for _ in range(POPULATION_SIZE)]
-
+    print(f"GA 시작 (토너먼트): {POPULATION_SIZE}개체 × {GENERATIONS}세대 × {MATCHES_PER_EVAL}대전/개체")
+    population   = [random_individual() for _ in range(POPULATION_SIZE)]
     best_overall = None
     best_score   = -1.0
 
     for gen in range(GENERATIONS):
-        # 병렬 평가
-        with Pool(processes=min(POPULATION_SIZE, os.cpu_count())) as pool:
-            scores = pool.map(evaluate_vs_random, population)
-
+        scores = tournament(population)
         ranked = sorted(zip(scores, population), key=lambda x: -x[0])
         top_score, top_weights = ranked[0]
 
@@ -208,21 +214,19 @@ def run():
             with open("best_weights.json", "w") as f:
                 json.dump(best_overall, f, indent=2)
 
-        print(f"Gen {gen+1:02d} | best={top_score:.3f} | avg={sum(scores)/len(scores):.3f} | weights={top_weights}")
+        avg = sum(scores) / len(scores)
+        print(f"Gen {gen+1:02d} | best={top_score:.3f} | avg={avg:.3f} | {top_weights}")
 
-        # 상위 25% 생존
         n_elite = max(2, int(POPULATION_SIZE * ELITE_RATIO))
         elites  = [w for _, w in ranked[:n_elite]]
 
-        # 다음 세대 생성
         next_gen = list(elites)
         while len(next_gen) < POPULATION_SIZE:
-            a, b  = random.sample(elites, 2)
-            child = mutate(crossover(a, b))
-            next_gen.append(child)
+            a, b = random.sample(elites, 2)
+            next_gen.append(mutate(crossover(a, b)))
         population = next_gen
 
-    print(f"\n최적 가중치 (승률 {best_score:.1%}):")
+    print(f"\n최적 가중치 (토너먼트 점수 {best_score:.3f}):")
     print(json.dumps(best_overall, indent=2))
     print("→ best_weights.json 저장 완료")
 
