@@ -79,13 +79,16 @@ class LeaguePool:
 def state_score(raw_obs, player):
     """행성 경제 상태를 단일 스칼라로 요약.
 
-    ships * 0.01 + production * 0.5 + planet_count * 1.0
+    (planet_ships + fleet_ships) * 0.01 + production * 0.5 + planet_count * 1.0
+    fleet_ships 포함으로 공격 발사 시 패널티 제거.
     계수는 terminal reward(±1.0) 대비 dense signal이 지나치지 않도록 조정.
     """
     if isinstance(raw_obs, dict):
         planets = raw_obs.get("planets", [])
+        fleets  = raw_obs.get("fleets", [])
     else:
         planets = getattr(raw_obs, "planets", [])
+        fleets  = getattr(raw_obs, "fleets", [])
 
     total_ships = total_prod = planet_count = 0.0
     for p in planets:
@@ -96,6 +99,12 @@ def state_score(raw_obs, player):
             total_ships  += ships
             total_prod   += prod
             planet_count += 1.0
+
+    for f in fleets:
+        owner = f[1] if isinstance(f, (list, tuple)) else f.owner
+        ships = f[6] if isinstance(f, (list, tuple)) else f.ships
+        if owner == player:
+            total_ships += ships
 
     return total_ships * 0.01 + total_prod * 0.5 + planet_count * 1.0
 

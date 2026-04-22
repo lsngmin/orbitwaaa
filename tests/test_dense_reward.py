@@ -14,10 +14,11 @@ import pytest
 from train import state_score
 
 
-def make_raw_obs(planets):
+def make_raw_obs(planets, fleets=None):
     """planet list → raw_obs dict 형태."""
     # planet tuple: (id, owner, x, y, radius, ships, production)
-    return {"planets": planets}
+    # fleet tuple:  (id, owner, x, y, angle, from_planet_id, ships)
+    return {"planets": planets, "fleets": fleets or []}
 
 
 # ── state_score 직관성 ────────────────────────────────────────────────────────
@@ -90,3 +91,32 @@ def test_zero_coef_means_zero_dense_reward():
     delta  = state_score(obs_after, player=0) - state_score(obs_before, player=0)
     reward = coef * delta
     assert reward == 0.0
+
+
+# ── fleet ships 포함 ──────────────────────────────────────────────────────────
+
+def test_fleet_ships_included_in_score():
+    """발사된 fleet ships도 score에 포함되어야 함 (공격 패널티 제거)."""
+    # 행성에 ships=10, fleet 없음
+    obs_before = make_raw_obs(
+        planets=[(0, 0, 50.0, 50.0, 2.0, 10, 1)],
+    )
+    # 행성에 ships=5, 내 fleet에 ships=5 (발사 후)
+    # fleet tuple: (id, owner, x, y, angle, from_planet_id, ships)
+    obs_after = make_raw_obs(
+        planets=[(0, 0, 50.0, 50.0, 2.0, 5, 1)],
+        fleets=[(0, 0, 55.0, 50.0, 0.0, 0, 5)],
+    )
+    assert state_score(obs_before, player=0) == state_score(obs_after, player=0), \
+        "fleet 발사 후 score가 변해서는 안 됨 (총 전력 불변)"
+
+
+def test_enemy_fleet_not_included():
+    """적 fleet ships는 player=0 score에 포함되지 않아야 함."""
+    obs_no_fleet   = make_raw_obs(planets=[(0, 0, 50.0, 50.0, 2.0, 10, 1)])
+    obs_enemy_fleet = make_raw_obs(
+        planets=[(0, 0, 50.0, 50.0, 2.0, 10, 1)],
+        fleets=[(0, 1, 55.0, 50.0, 0.0, 1, 50)],  # owner=1 (적)
+    )
+    assert state_score(obs_no_fleet, player=0) == state_score(obs_enemy_fleet, player=0), \
+        "적 fleet이 player=0 score에 영향을 줌"
