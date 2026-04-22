@@ -191,7 +191,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
 
     dense_coef = T["dense_reward_coef"]
-    prev_score = state_score(env.state[0].observation, player=0)
+    prev_score = (state_score(env.state[0].observation, player=0)
+                - state_score(env.state[1].observation, player=1))
 
     step = 0
     while step < n_steps:
@@ -210,7 +211,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         env.step([moves_main, moves_opp])
         done = env.done
 
-        curr_score = state_score(env.state[0].observation, player=0)
+        curr_score = (state_score(env.state[0].observation, player=0)
+                    - state_score(env.state[1].observation, player=1))
         reward     = dense_coef * (curr_score - prev_score)
         prev_score = curr_score
 
@@ -229,7 +231,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         if done:
             env = make("orbit_wars", debug=False)
             env.reset()
-            prev_score    = state_score(env.state[0].observation, player=0)
+            prev_score    = (state_score(env.state[0].observation, player=0)
+                           - state_score(env.state[1].observation, player=1))
             history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
             history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
             history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)

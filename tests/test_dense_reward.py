@@ -111,6 +111,34 @@ def test_fleet_ships_included_in_score():
         "fleet 발사 후 score가 변해서는 안 됨 (총 전력 불변)"
 
 
+# ── 상대적 차분 보상 ──────────────────────────────────────────────────────────
+
+def test_symmetric_growth_yields_zero_delta():
+    """양쪽이 동등하게 성장하면 delta = 0 이어야 함."""
+    obs0 = make_raw_obs([(0, 0, 50.0, 50.0, 2.0, 10, 1)])
+    obs1 = make_raw_obs([(0, 1, 50.0, 50.0, 2.0, 10, 1)])  # player=1 동일 규모
+
+    before = state_score(obs0, player=0) - state_score(obs1, player=1)
+
+    obs0_after = make_raw_obs([(0, 0, 50.0, 50.0, 2.0, 20, 2)])
+    obs1_after = make_raw_obs([(0, 1, 50.0, 50.0, 2.0, 20, 2)])
+
+    after = state_score(obs0_after, player=0) - state_score(obs1_after, player=1)
+    assert abs(after - before) < 1e-6, f"대칭 성장 delta={after - before} != 0"
+
+
+def test_relative_advantage_positive_when_player_gains_more():
+    """내가 더 많이 성장하면 delta > 0."""
+    obs0 = make_raw_obs([(0, 0, 50.0, 50.0, 2.0, 10, 1)])
+    obs1 = make_raw_obs([(0, 1, 50.0, 50.0, 2.0, 10, 1)])
+    before = state_score(obs0, player=0) - state_score(obs1, player=1)
+
+    obs0_after = make_raw_obs([(0, 0, 50.0, 50.0, 2.0, 10, 1),
+                               (1, 0, 60.0, 50.0, 2.0,  5, 2)])  # 행성 추가 점령
+    after = state_score(obs0_after, player=0) - state_score(obs1, player=1)
+    assert after > before, f"내가 더 성장했는데 delta={after - before} <= 0"
+
+
 def test_enemy_fleet_not_included():
     """적 fleet ships는 player=0 score에 포함되지 않아야 함."""
     obs_no_fleet   = make_raw_obs(planets=[(0, 0, 50.0, 50.0, 2.0, 10, 1)])
