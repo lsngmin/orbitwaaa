@@ -5,10 +5,10 @@ from prediction import (
 )
 
 # 가중치 (나중에 자동 튜닝 대상)
-W_PRODUCTION = 3.0   # 생산량 높을수록 좋음
-W_SHIPS      = 0.3   # 방어력 높을수록 나쁨 (비용)
-W_DISTANCE   = 0.05  # 멀수록 나쁨
-W_ENEMY      = 2.0   # 적 행성 보너스
+W_PRODUCTION = 4.632  # 생산량 높을수록 좋음
+W_SHIPS      = 0.444  # 방어력 높을수록 나쁨 (비용)
+W_DISTANCE   = 0.419  # 멀수록 나쁨
+W_ENEMY      = 4.055  # 적 행성 보너스
 
 # 게임 페이즈
 EARLY_END = 150
