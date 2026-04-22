@@ -24,7 +24,12 @@ from prediction import aim, crosses_sun
 
 # ── 가중치 경로 ───────────────────────────────────────────────────────────────
 
-WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "mid_run", "main_final.pt")
+_base = os.path.dirname(os.path.abspath(__file__))
+WEIGHTS_PATH = (
+    os.path.join(_base, "mid_run", "main_final.pt")
+    if os.path.exists(os.path.join(_base, "mid_run", "main_final.pt"))
+    else os.path.join(_base, "main_final.pt")
+)
 
 _model = None
 
