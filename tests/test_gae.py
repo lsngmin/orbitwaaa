@@ -74,6 +74,38 @@ def test_gae_differs_from_old_returns_mean_baseline():
         "GAE advantage가 이전 returns.mean() 방식과 동일 — 회귀 의심"
 
 
+def test_gae_last_value_bootstrap():
+    """non-terminal truncation 시 last_value가 마지막 delta에 반영되는지 확인."""
+    rewards = torch.tensor([0.0, 0.0, 0.0])
+    dones   = torch.tensor([0.0, 0.0, 0.0])   # 에피소드 미종료 — truncated
+    values  = torch.tensor([[0.5], [0.5], [0.5]])
+    gamma, lam = 0.99, 0.0  # lambda=0으로 delta만 보기
+
+    adv_no_boot, _ = compute_gae(rewards, dones, values, last_value=0.0,   gamma=gamma, lam=lam)
+    adv_boot,    _ = compute_gae(rewards, dones, values, last_value=1.0,   gamma=gamma, lam=lam)
+
+    # last_value=1.0이면 마지막 delta = 0 + 0.99*1.0 - 0.5 = 0.49 > 0
+    # last_value=0.0이면 마지막 delta = 0 + 0.99*0.0 - 0.5 = -0.5
+    assert adv_boot[-1] > adv_no_boot[-1], (
+        f"last_value bootstrap 미반영: boot={adv_boot[-1]:.4f}, no_boot={adv_no_boot[-1]:.4f}"
+    )
+
+
+def test_gae_last_value_zero_when_terminal():
+    """마지막 step이 done=1이면 last_value가 무시되어야 함."""
+    rewards = torch.tensor([0.0, 0.0, 1.0])
+    dones   = torch.tensor([0.0, 0.0, 1.0])   # 마지막이 terminal
+    values  = torch.tensor([[0.5], [0.5], [0.5]])
+
+    adv_no_boot, _ = compute_gae(rewards, dones, values, last_value=0.0)
+    adv_boot,    _ = compute_gae(rewards, dones, values, last_value=999.0)
+
+    # 마지막이 done=1이므로 last_value는 어떤 값이든 결과가 같아야 함
+    assert torch.allclose(adv_no_boot, adv_boot, atol=1e-5), (
+        "terminal step에서 last_value가 advantage에 영향을 줌"
+    )
+
+
 def test_gae_shape():
     """출력 shape가 입력 rewards와 동일한지 확인."""
     N = 16
