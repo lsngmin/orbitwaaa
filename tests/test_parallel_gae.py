@@ -19,8 +19,8 @@ from train import compute_gae, _collect_single
 
 def _make_mock_collect_single(n_steps=4):
     """_collect_single의 반환값을 시뮬레이션 (실제 env 없이)."""
-    rewards    = torch.tensor([0.0, 0.0, 0.0, 1.0])[:n_steps]
-    dones      = torch.tensor([0.0, 0.0, 0.0, 1.0])[:n_steps]
+    rewards    = torch.zeros(n_steps)
+    dones      = torch.zeros(n_steps)
     values     = torch.zeros(n_steps, 1)
     obs        = torch.zeros(n_steps, 8)
     actions    = torch.zeros(n_steps, 3)
