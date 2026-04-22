@@ -34,12 +34,7 @@ orbitwaaa/
 │
 ├── checkpoints/       # 학습된 모델 저장
 ├── logs/              # 학습 로그 CSV
-├── best_weights.json  # GA 최적 가중치
-│
-├── GAME_RULES.md      # 대회 공식 룰
-├── agents.md          # 에이전트 작성 가이드
-├── setup.sh           # 환경 자동 셋업
-└── kaggle_init.sh     # Kaggle API 인증 설정
+└── best_weights.json  # GA 최적 가중치
 ```
 
 ## 전략 구조
@@ -125,66 +120,3 @@ LeaguePool      — 과거 버전 5개 유지, 승률 55% 이상이면 추가
 | 날짜 | steps | p_loss | v_loss | league_size | 비고 |
 |------|-------|--------|--------|-------------|------|
 | 2026-04-22 | 학습 중 | - | - | 1 | A40 × 1 |
-
-## 셋업
-
-```bash
-bash setup.sh        # Python 3.11 venv + 패키지 설치
-bash kaggle_init.sh  # Kaggle API 인증
-```
-
-## 로컬 테스트
-
-```bash
-source .venv/bin/activate
-
-# rule-based vs random
-python -c "
-from kaggle_environments import make
-env = make('orbit_wars', debug=True)
-env.run(['main.py', 'random'])
-final = env.steps[-1]
-print(f'Player 0: {final[0].reward}, Player 1: {final[1].reward}')
-"
-
-# Jupyter 시각화
-jupyter notebook
-```
-
-## GA 가중치 튜닝
-
-```bash
-python tune.py
-# → best_weights.json 저장
-```
-
-## PPO 학습
-
-```bash
-python train.py
-# → checkpoints/main_latest.pt 저장
-# → logs/train_*.csv 학습 로그
-# 서버 재시작 시 자동 재개 (checkpoints/resume.pt)
-```
-
-## 제출
-
-**Rule-based 버전:**
-```bash
-kaggle competitions submit orbit-wars -f main.py -m "orbitwaaa-v1"
-```
-
-**PPO 버전 (학습 완료 후):**
-```bash
-tar -czf submission.tar.gz \
-  main.py model.py env_wrapper.py prediction.py \
-  config.yaml checkpoints/main_final.pt
-kaggle competitions submit orbit-wars -f submission.tar.gz -m "orbitwaaa-v2"
-```
-
-## 리더보드 확인
-
-```bash
-kaggle competitions leaderboard orbit-wars -s
-kaggle competitions submissions orbit-wars
-```
