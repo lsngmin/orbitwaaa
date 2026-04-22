@@ -42,9 +42,13 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids):
     mine_mid   = {p.id: 0 for p in planets}
 
     for f in fleets:
+        dx = math.cos(f.angle)
+        dy = math.sin(f.angle)
+
+        # 레이 상에서 가장 먼저 충돌하는 행성 하나만 선택 (게임 규칙: 첫 충돌에서 소멸)
+        first_planet = None
+        first_t      = math.inf
         for p in planets:
-            dx = math.cos(f.angle)
-            dy = math.sin(f.angle)
             fx = f.x - p.x
             fy = f.y - p.y
             t  = -(fx * dx + fy * dy)
@@ -54,20 +58,26 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids):
             cy = f.y + t * dy
             if math.hypot(cx - p.x, cy - p.y) > p.radius * 1.5:
                 continue
+            if t < first_t:
+                first_t      = t
+                first_planet = p
 
-            dist = math.hypot(f.x - p.x, f.y - p.y)
-            eta  = estimate_arrival_turn(dist, f.ships)
+        if first_planet is None:
+            continue
 
-            if f.owner == player:
-                if eta <= ETA_NEAR:
-                    mine_near[p.id]  += f.ships
-                elif eta <= ETA_MID:
-                    mine_mid[p.id]   += f.ships
-            else:
-                if eta <= ETA_NEAR:
-                    enemy_near[p.id] += f.ships
-                elif eta <= ETA_MID:
-                    enemy_mid[p.id]  += f.ships
+        # ETA는 레이 진행 거리(t)로 계산 — center-to-center 대신 실제 도달 거리
+        eta = estimate_arrival_turn(first_t, f.ships)
+
+        if f.owner == player:
+            if eta <= ETA_NEAR:
+                mine_near[first_planet.id] += f.ships
+            elif eta <= ETA_MID:
+                mine_mid[first_planet.id]  += f.ships
+        else:
+            if eta <= ETA_NEAR:
+                enemy_near[first_planet.id] += f.ships
+            elif eta <= ETA_MID:
+                enemy_mid[first_planet.id]  += f.ships
 
     arr = np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)
     for i, p in enumerate(planets[:MAX_PLANETS]):
