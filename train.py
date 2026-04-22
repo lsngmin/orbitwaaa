@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from utils import TrainingLogger, save_checkpoint, load_checkpoint
 import yaml
 from collections import deque
 from kaggle_environments import make
@@ -281,32 +282,42 @@ def evaluate(main_model, opponent_model, n_games=20):
 
 # ── Main Training Loop ────────────────────────────────────────────────────────
 
+CKPT_PATH = os.path.join(SAVE_DIR, "resume.pt")
+
+
 def train():
     print(f"Device: {DEVICE}")
 
-    # Main agent
-    main_model  = OrbitWarsPolicy().to(DEVICE)
-    optimizer   = optim.Adam(main_model.parameters(), lr=T["learning_rate"])
+    logger = TrainingLogger()
 
-    # Main exploiter — Main 약점 공략, 주기적 리셋
-    exploiter       = OrbitWarsPolicy().to(DEVICE)
-    exploiter_opt   = optim.Adam(exploiter.parameters(), lr=T["learning_rate"])
+    # Main agent
+    main_model = OrbitWarsPolicy().to(DEVICE)
+    optimizer  = optim.Adam(main_model.parameters(), lr=T["learning_rate"])
+
+    # Main exploiter
+    exploiter     = OrbitWarsPolicy().to(DEVICE)
+    exploiter_opt = optim.Adam(exploiter.parameters(), lr=T["learning_rate"])
 
     # League pool
     league = LeaguePool()
-    league.add(main_model, generation=0, win_rate=0.0)
 
     generation      = 0
     total_steps     = 0
     exploiter_reset = 0
 
+    # 재개 시도
+    result = load_checkpoint(CKPT_PATH, main_model, optimizer, DEVICE)
+    if result:
+        generation, total_steps, league.agents = result
+    else:
+        league.add(main_model, generation=0, win_rate=0.0)
+
     while total_steps < T["total_timesteps"]:
         generation += 1
 
         # ── Matchmaking ──────────────────────────────────────────
-        # Main: 50% self-play, 50% league 상대
         if random.random() < 0.5 or len(league) == 0:
-            opponent = copy.deepcopy(main_model)
+            opponent   = copy.deepcopy(main_model)
             opponent.eval()
             match_type = "self"
         else:
@@ -318,39 +329,58 @@ def train():
             main_model, opponent, n_steps=512
         )
         returns = compute_returns(rewards, dones, values)
-        p_loss, v_loss, e_loss = ppo_update(main_model, optimizer, obs, actions, log_probs, returns)
+        p_loss, v_loss, e_loss = ppo_update(
+            main_model, optimizer, obs, actions, log_probs, returns
+        )
         total_steps += len(obs)
 
         # ── Exploiter rollout + update ───────────────────────────
-        # Exploiter는 항상 Main 상대로만 학습
-        exp_opponent = copy.deepcopy(main_model)
-        exp_opponent.eval()
+        exp_opp = copy.deepcopy(main_model)
+        exp_opp.eval()
         obs_e, act_e, rew_e, done_e, logp_e, val_e = collect_rollout(
-            exploiter, exp_opponent, n_steps=256
+            exploiter, exp_opp, n_steps=256
         )
         ret_e = compute_returns(rew_e, done_e, val_e)
         ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e)
 
-        print(f"Gen {generation:04d} | steps={total_steps:,} | match={match_type} | "
-              f"p_loss={p_loss:.4f} v_loss={v_loss:.4f} e_loss={e_loss:.4f}")
+        # ── 로그 ─────────────────────────────────────────────────
+        logger.log(
+            generation=generation,
+            total_steps=total_steps,
+            match_type=match_type,
+            policy_loss=p_loss,
+            value_loss=v_loss,
+            entropy_loss=e_loss,
+            league_size=len(league),
+        )
 
         # ── 주기적 평가 및 League 추가 ──────────────────────────
         if generation % SP["eval_interval"] == 0:
-            opp_eval   = league.sample_opponent() or exploiter
-            win_rate   = evaluate(main_model, opp_eval, n_games=20)
-            print(f"  평가: 승률 {win_rate:.2%}")
+            opp_eval = league.sample_opponent() or exploiter
+            win_rate = evaluate(main_model, opp_eval, n_games=20)
+
+            logger.log(
+                generation=generation,
+                total_steps=total_steps,
+                match_type="eval",
+                policy_loss=p_loss,
+                value_loss=v_loss,
+                entropy_loss=e_loss,
+                win_rate=win_rate,
+                league_size=len(league),
+            )
 
             if win_rate >= SP["win_threshold"]:
                 league.add(main_model, generation, win_rate)
 
-            # Exploiter 주기적 리셋 (Main에 너무 특화되지 않도록)
             exploiter_reset += 1
             if exploiter_reset % 5 == 0:
                 exploiter     = OrbitWarsPolicy().to(DEVICE)
                 exploiter_opt = optim.Adam(exploiter.parameters(), lr=T["learning_rate"])
                 print("  Exploiter 리셋")
 
-            # 체크포인트 저장
+            # 재개용 체크포인트 저장
+            save_checkpoint(CKPT_PATH, main_model, optimizer, generation, total_steps, league.agents)
             torch.save(main_model.state_dict(), os.path.join(SAVE_DIR, "main_latest.pt"))
 
     print("학습 완료")
