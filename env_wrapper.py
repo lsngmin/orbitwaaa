@@ -19,21 +19,28 @@ with open("config.yaml") as f:
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
-PLANET_DIM   = 11
+PLANET_DIM   = 13  # +2: incoming을 ETA bin(near/mid)으로 분리
 FLEET_DIM    = 7
+
+
+ETA_NEAR = 5   # 1~5턴: 즉각 위협
+ETA_MID  = 15  # 6~15턴: 중기 계획
 
 
 def encode_planets(raw_planets, raw_fleets, player, comet_ids):
     """행성 목록을 (MAX_PLANETS, PLANET_DIM) 배열로 인코딩."""
     from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
-    from prediction import is_orbiting, fleet_speed
+    from prediction import is_orbiting, estimate_arrival_turn
 
     planets = [Planet(*p) for p in raw_planets]
     fleets  = [Fleet(*f) for f in raw_fleets]
 
-    # 행성별 incoming fleet 집계
-    incoming_enemy = {p.id: 0 for p in planets}
-    incoming_mine  = {p.id: 0 for p in planets}
+    # 행성별 ETA bin 집계: near(1~5턴) / mid(6~15턴)
+    enemy_near = {p.id: 0 for p in planets}
+    enemy_mid  = {p.id: 0 for p in planets}
+    mine_near  = {p.id: 0 for p in planets}
+    mine_mid   = {p.id: 0 for p in planets}
+
     for f in fleets:
         for p in planets:
             dx = math.cos(f.angle)
@@ -41,14 +48,26 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids):
             fx = f.x - p.x
             fy = f.y - p.y
             t  = -(fx * dx + fy * dy)
-            if t > 0:
-                cx = f.x + t * dx
-                cy = f.y + t * dy
-                if math.hypot(cx - p.x, cy - p.y) <= p.radius * 1.5:
-                    if f.owner == player:
-                        incoming_mine[p.id]  += f.ships
-                    else:
-                        incoming_enemy[p.id] += f.ships
+            if t <= 0:
+                continue
+            cx = f.x + t * dx
+            cy = f.y + t * dy
+            if math.hypot(cx - p.x, cy - p.y) > p.radius * 1.5:
+                continue
+
+            dist = math.hypot(f.x - p.x, f.y - p.y)
+            eta  = estimate_arrival_turn(dist, f.ships)
+
+            if f.owner == player:
+                if eta <= ETA_NEAR:
+                    mine_near[p.id]  += f.ships
+                elif eta <= ETA_MID:
+                    mine_mid[p.id]   += f.ships
+            else:
+                if eta <= ETA_NEAR:
+                    enemy_near[p.id] += f.ships
+                elif eta <= ETA_MID:
+                    enemy_mid[p.id]  += f.ships
 
     arr = np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)
     for i, p in enumerate(planets[:MAX_PLANETS]):
@@ -65,8 +84,10 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids):
             p.production / 5.0,
             1.0 if is_orbiting(p) else 0.0,
             1.0 if p.id in comet_ids else 0.0,
-            min(incoming_enemy[p.id] / 1000.0, 1.0),
-            min(incoming_mine[p.id]  / 1000.0, 1.0),
+            min(enemy_near[p.id] / 1000.0, 1.0),
+            min(enemy_mid[p.id]  / 1000.0, 1.0),
+            min(mine_near[p.id]  / 1000.0, 1.0),
+            min(mine_mid[p.id]   / 1000.0, 1.0),
         ]
     return arr
 
