@@ -13,7 +13,8 @@ class TrainingLogger:
         self.fields = [
             "generation", "total_steps", "match_type",
             "policy_loss", "value_loss", "entropy_loss",
-            "approx_kl", "clip_frac",
+            "approx_kl", "clip_frac", "epochs_done",
+            "ent_launch", "ent_ships", "ent_target",
             "win_rate", "league_size",
         ]
         with open(self.path, "w", newline="") as f:
@@ -28,9 +29,16 @@ class TrainingLogger:
 
         win_rate = kwargs.get("win_rate", "")
         win_str  = f" | win_rate={win_rate:.2%}" if isinstance(win_rate, float) else ""
-        approx_kl = kwargs.get("approx_kl", "")
-        clip_frac  = kwargs.get("clip_frac", "")
-        kl_str     = f" | kl={approx_kl:.4f} | cf={clip_frac:.3f}" if isinstance(approx_kl, float) else ""
+        approx_kl   = kwargs.get("approx_kl", "")
+        clip_frac   = kwargs.get("clip_frac", "")
+        epochs_done = kwargs.get("epochs_done", "")
+        ent_launch  = kwargs.get("ent_launch", "")
+        ent_ships   = kwargs.get("ent_ships", "")
+        ent_target  = kwargs.get("ent_target", "")
+        kl_str  = (f" | kl={approx_kl:.4f} | cf={clip_frac:.3f}"
+                   f" | ep={epochs_done}") if isinstance(approx_kl, float) else ""
+        ent_str = (f" | el={ent_launch:.2f} | es={ent_ships:.2f} | et={ent_target:.2f}"
+                   ) if isinstance(ent_launch, float) else ""
         print(
             f"Gen {kwargs.get('generation', '?'):04d} | "
             f"steps={kwargs.get('total_steps', 0):,} | "
@@ -38,5 +46,5 @@ class TrainingLogger:
             f"p_loss={kwargs.get('policy_loss', 0):.4f} | "
             f"v_loss={kwargs.get('value_loss', 0):.4f} | "
             f"e_loss={kwargs.get('entropy_loss', 0):.4f}"
-            f"{kl_str}{win_str}"
+            f"{kl_str}{ent_str}{win_str}"
         )

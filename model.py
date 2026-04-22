@@ -195,10 +195,9 @@ class OrbitWarsPolicy(nn.Module):
             + target_dist.log_prob(target).sum(-1)
         )
 
-        entropy = (
-            launch_dist.entropy().sum(-1)
-            + ships_dist.entropy().sum(-1)
-            + target_dist.entropy().sum(-1)
-        )
+        ent_launch = launch_dist.entropy().sum(-1)
+        ent_ships  = ships_dist.entropy().sum(-1)
+        ent_target = target_dist.entropy().sum(-1)
+        entropy    = ent_launch + ent_ships + ent_target
 
-        return log_prob, entropy, value
+        return log_prob, entropy, value, ent_launch, ent_ships, ent_target

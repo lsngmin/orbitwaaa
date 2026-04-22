@@ -360,7 +360,8 @@ def compute_gae(rewards, dones, values, last_value=0.0, gamma=T["gamma"], lam=T[
 
 
 def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantages,
-               clip_range=T["clip_range"], n_epochs=T["n_epochs"], minibatch_size=T["minibatch_size"]):
+               clip_range=T["clip_range"], n_epochs=T["n_epochs"], minibatch_size=T["minibatch_size"],
+               target_kl=T.get("target_kl")):
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     obs           = obs.to(DEVICE)
@@ -372,13 +373,16 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
     N = len(obs)
     p_losses, v_losses, e_losses = [], [], []
     approx_kls, clip_fracs       = [], []
+    ent_launches, ent_ships_l, ent_targets = [], [], []
+    epochs_done = 0
 
-    for _ in range(n_epochs):
+    for epoch in range(n_epochs):
+        early_stop = False
         idx = torch.randperm(N, device=DEVICE)
         for start in range(0, N, minibatch_size):
             mb = idx[start:start + minibatch_size]
 
-            log_probs, entropy, values = model.evaluate_actions(obs[mb], actions[mb])
+            log_probs, entropy, values, ent_l, ent_s, ent_t = model.evaluate_actions(obs[mb], actions[mb])
 
             ratio        = (log_probs - old_log_probs[mb]).exp()
             adv_mb       = advantages[mb]
@@ -396,14 +400,25 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
             optimizer.step()
 
             with torch.no_grad():
-                approx_kl  = ((ratio - 1) - ratio.log()).mean().item()
-                clip_frac  = ((ratio - 1).abs() > clip_range).float().mean().item()
+                approx_kl = ((ratio - 1) - ratio.log()).mean().item()
+                clip_frac = ((ratio - 1).abs() > clip_range).float().mean().item()
 
             p_losses.append(policy_loss.item())
             v_losses.append(value_loss.item())
             e_losses.append(entropy_loss.item())
             approx_kls.append(approx_kl)
             clip_fracs.append(clip_frac)
+            ent_launches.append(ent_l.mean().item())
+            ent_ships_l.append(ent_s.mean().item())
+            ent_targets.append(ent_t.mean().item())
+
+            if target_kl is not None and approx_kl > target_kl:
+                early_stop = True
+                break
+
+        epochs_done += 1
+        if early_stop:
+            break
 
     return (
         sum(p_losses) / len(p_losses),
@@ -411,6 +426,10 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
         sum(e_losses) / len(e_losses),
         sum(approx_kls) / len(approx_kls),
         sum(clip_fracs) / len(clip_fracs),
+        epochs_done,
+        sum(ent_launches) / len(ent_launches),
+        sum(ent_ships_l)  / len(ent_ships_l),
+        sum(ent_targets)  / len(ent_targets),
     )
 
 
@@ -506,7 +525,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
             obs, actions, advantages, returns, log_probs = collect_rollout(
                 main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
             )
-            p_loss, v_loss, e_loss, approx_kl, clip_frac = ppo_update(
+            p_loss, v_loss, e_loss, approx_kl, clip_frac, epochs_done, ent_l, ent_s, ent_t = ppo_update(
                 main_model, optimizer, obs, actions, log_probs, returns, advantages
             )
             total_steps += len(obs)
@@ -521,7 +540,8 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
                 policy_loss=p_loss, value_loss=v_loss, entropy_loss=e_loss,
-                approx_kl=approx_kl, clip_frac=clip_frac,
+                approx_kl=approx_kl, clip_frac=clip_frac, epochs_done=epochs_done,
+                ent_launch=ent_l, ent_ships=ent_s, ent_target=ent_t,
                 league_size=len(league),
             )
 
