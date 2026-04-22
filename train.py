@@ -197,22 +197,36 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
 # ── 병렬 rollout worker (별도 프로세스, CPU 전용) ───────────────────────────
 
+def _init_worker():
+    """worker 프로세스 초기화: CUDA 숨기기, 스레드 수 제한, 로그 억제."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    torch.set_num_threads(2)
+    import logging
+    logging.getLogger("kaggle_environments").setLevel(logging.ERROR)
+
+
 def _rollout_worker(args):
     """spawn된 자식 프로세스에서 실행. GPU 없이 CPU만 사용."""
     main_state, opp_state, n_steps = args
     cpu = torch.device("cpu")
 
-    main_model = OrbitWarsPolicy().to(cpu)
-    main_model.load_state_dict(main_state)
-    main_model.eval()
+    try:
+        main_model = OrbitWarsPolicy().to(cpu)
+        main_model.load_state_dict(main_state)
+        main_model.eval()
 
-    opponent_model = None
-    if opp_state is not None:
-        opponent_model = OrbitWarsPolicy().to(cpu)
-        opponent_model.load_state_dict(opp_state)
-        opponent_model.eval()
+        opponent_model = None
+        if opp_state is not None:
+            opponent_model = OrbitWarsPolicy().to(cpu)
+            opponent_model.load_state_dict(opp_state)
+            opponent_model.eval()
 
-    return _collect_single(main_model, opponent_model, n_steps, cpu)
+        return _collect_single(main_model, opponent_model, n_steps, cpu)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None):
@@ -343,7 +357,7 @@ def train(n_envs=1):
     pool = None
     if n_envs > 1:
         ctx  = mp.get_context("spawn")
-        pool = ctx.Pool(n_envs)
+        pool = ctx.Pool(n_envs, initializer=_init_worker)
         print(f"병렬 rollout pool: {n_envs}개 worker")
 
     try:
