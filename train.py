@@ -449,10 +449,17 @@ def evaluate(main_model, opponent_model, n_games=20):
 
 # ── Main Training Loop ────────────────────────────────────────────────────────
 
-def train(n_envs=1):
+def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, rollout_steps=None):
     global DEVICE, SAVE_DIR
 
-    print(f"Device: {DEVICE} | run_dir: {SAVE_DIR} | n_envs: {n_envs}")
+    total_timesteps = total_timesteps or T["total_timesteps"]
+    eval_interval   = eval_interval   or SP["eval_interval"]
+    n_games         = n_games         or 20
+    rollout_steps   = rollout_steps   or 512
+
+    print(f"Device: {DEVICE} | run_dir: {SAVE_DIR} | n_envs: {n_envs} | "
+          f"total_timesteps: {total_timesteps} | eval_interval: {eval_interval} | "
+          f"n_games: {n_games} | rollout_steps: {rollout_steps}")
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     logger = TrainingLogger(log_dir=os.path.join(SAVE_DIR, "..", "logs"))
@@ -484,7 +491,7 @@ def train(n_envs=1):
         print(f"병렬 rollout pool: {n_envs}개 worker")
 
     try:
-        while total_steps < T["total_timesteps"]:
+        while total_steps < total_timesteps:
             generation += 1
 
             self_prob  = _self_play_prob(total_steps, len(league))
@@ -497,7 +504,7 @@ def train(n_envs=1):
                 match_type = "league"
 
             obs, actions, advantages, returns, log_probs = collect_rollout(
-                main_model, opponent, n_steps=512, n_envs=n_envs, pool=pool
+                main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
             )
             p_loss, v_loss, e_loss, approx_kl, clip_frac = ppo_update(
                 main_model, optimizer, obs, actions, log_probs, returns, advantages
@@ -507,7 +514,7 @@ def train(n_envs=1):
             exp_opp = copy.deepcopy(main_model)
             exp_opp.eval()
             obs_e, act_e, adv_e, ret_e, logp_e = collect_rollout(
-                exploiter, exp_opp, n_steps=256, n_envs=max(1, n_envs // 2), pool=pool
+                exploiter, exp_opp, n_steps=max(1, rollout_steps // 2), n_envs=max(1, n_envs // 2), pool=pool
             )
             ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e)
 
@@ -518,9 +525,9 @@ def train(n_envs=1):
                 league_size=len(league),
             )
 
-            if generation % SP["eval_interval"] == 0:
+            if generation % eval_interval == 0:
                 opp_eval = league.sample_opponent() or exploiter
-                win_rate = evaluate(main_model, opp_eval, n_games=20)
+                win_rate = evaluate(main_model, opp_eval, n_games=n_games)
 
                 logger.log(
                     generation=generation, total_steps=total_steps, match_type="eval",
@@ -552,12 +559,29 @@ def train(n_envs=1):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu",     type=int, default=0,             help="GPU index")
-    parser.add_argument("--run-dir", type=str, default="checkpoints", help="checkpoint 저장 디렉토리")
-    parser.add_argument("--n-envs",  type=int, default=1,             help="병렬 env 수 (1=단일)")
+    parser.add_argument("--gpu",              type=int,   default=0,             help="GPU index")
+    parser.add_argument("--run-dir",          type=str,   default="checkpoints", help="checkpoint 저장 디렉토리")
+    parser.add_argument("--n-envs",           type=int,   default=1,             help="병렬 env 수 (1=단일)")
+    parser.add_argument("--total-timesteps",  type=int,   default=None,          help="학습 총 스텝 (기본: config)")
+    parser.add_argument("--eval-interval",    type=int,   default=None,          help="평가 주기 세대 수 (기본: config)")
+    parser.add_argument("--n-games",          type=int,   default=None,          help="평가 게임 수 (기본: 20)")
+    parser.add_argument("--rollout-steps",    type=int,   default=None,          help="rollout 스텝 수 (기본: 512)")
+    parser.add_argument("--smoke",            action="store_true",               help="smoke test 세팅 (10000 steps, eval 5, 4 games)")
     cli = parser.parse_args()
 
     DEVICE   = torch.device(f"cuda:{cli.gpu}" if torch.cuda.is_available() else "cpu")
     SAVE_DIR = cli.run_dir
 
-    train(n_envs=cli.n_envs)
+    if cli.smoke:
+        cli.total_timesteps = cli.total_timesteps or 10000
+        cli.eval_interval   = cli.eval_interval   or 5
+        cli.n_games         = cli.n_games         or 4
+        cli.rollout_steps   = cli.rollout_steps   or 128
+
+    train(
+        n_envs=cli.n_envs,
+        total_timesteps=cli.total_timesteps,
+        eval_interval=cli.eval_interval,
+        n_games=cli.n_games,
+        rollout_steps=cli.rollout_steps,
+    )
