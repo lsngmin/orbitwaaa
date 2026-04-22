@@ -261,6 +261,25 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
     )
 
 
+# ── Phase 기반 self-play 비율 ─────────────────────────────────────────────────
+
+def _self_play_prob(total_steps: int, league_size: int) -> float:
+    """total_steps + league_size 기준으로 self-play 확률 반환.
+
+    league_size < phase_min_league : early 강제 (pool 다양성 부족)
+    total_steps < phase_early_steps: early  — self 0.8 / league 0.2
+    total_steps < phase_mid_steps  : mid    — self 0.6 / league 0.4
+    그 이후                         : late   — self 0.4 / league 0.6
+    """
+    if league_size == 0:
+        return 1.0
+    if league_size < SP["phase_min_league"] or total_steps < SP["phase_early_steps"]:
+        return 0.8
+    if total_steps < SP["phase_mid_steps"]:
+        return 0.6
+    return 0.4
+
+
 # ── PPO 업데이트 ──────────────────────────────────────────────────────────────
 
 def compute_returns(rewards, dones, values, gamma=T["gamma"]):
@@ -374,7 +393,8 @@ def train(n_envs=1):
         while total_steps < T["total_timesteps"]:
             generation += 1
 
-            if random.random() < 0.5 or len(league) == 0:
+            self_prob  = _self_play_prob(total_steps, len(league))
+            if random.random() < self_prob:
                 opponent   = copy.deepcopy(main_model)
                 opponent.eval()
                 match_type = "self"
