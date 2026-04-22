@@ -233,14 +233,17 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         _, _, last_value = main_model.get_action_and_value(last_obs_t.unsqueeze(0).to(device))
     last_value = last_value.squeeze().cpu()
 
+    rewards = torch.stack(rew_list)
+    dones   = torch.stack(done_list)
+    values  = torch.stack(val_list)
+    advantages, returns = compute_gae(rewards, dones, values, last_value=last_value)
+
     return (
         torch.stack(obs_list),
         torch.stack(act_list),
-        torch.stack(rew_list),
-        torch.stack(done_list),
+        advantages,
+        returns,
         torch.stack(logp_list),
-        torch.stack(val_list),
-        last_value,
     )
 
 
@@ -298,8 +301,6 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
         torch.cat([r[2] for r in results]),
         torch.cat([r[3] for r in results]),
         torch.cat([r[4] for r in results]),
-        torch.cat([r[5] for r in results]),
-        results[-1][6],  # last_value: 마지막 worker의 값 사용
     )
 
 
@@ -483,10 +484,9 @@ def train(n_envs=1):
                 opponent   = league.sample_opponent()
                 match_type = "league"
 
-            obs, actions, rewards, dones, log_probs, values, last_val = collect_rollout(
+            obs, actions, advantages, returns, log_probs = collect_rollout(
                 main_model, opponent, n_steps=512, n_envs=n_envs, pool=pool
             )
-            advantages, returns = compute_gae(rewards, dones, values, last_value=last_val)
             p_loss, v_loss, e_loss, approx_kl, clip_frac = ppo_update(
                 main_model, optimizer, obs, actions, log_probs, returns, advantages
             )
@@ -494,10 +494,9 @@ def train(n_envs=1):
 
             exp_opp = copy.deepcopy(main_model)
             exp_opp.eval()
-            obs_e, act_e, rew_e, done_e, logp_e, val_e, last_val_e = collect_rollout(
+            obs_e, act_e, adv_e, ret_e, logp_e = collect_rollout(
                 exploiter, exp_opp, n_steps=256, n_envs=max(1, n_envs // 2), pool=pool
             )
-            adv_e, ret_e = compute_gae(rew_e, done_e, val_e, last_value=last_val_e)
             ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e)
 
             logger.log(
