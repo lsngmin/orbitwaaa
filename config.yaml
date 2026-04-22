@@ -2,6 +2,7 @@ model:
   embed_dim: 128
   planet_temporal_layers: 2
   fleet_temporal_layers: 1
+  fleet_temporal: true      # false면 current-step fleet만 local_attn에 입력 (ablation B)
   local_layers: 2
   global_layers: 4
   num_heads: 8

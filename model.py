@@ -23,6 +23,7 @@ ENV = CFG["env"]
 EMBED_DIM              = M["embed_dim"]
 PLANET_TEMPORAL_LAYERS = M["planet_temporal_layers"]
 FLEET_TEMPORAL_LAYERS  = M["fleet_temporal_layers"]
+FLEET_TEMPORAL         = M["fleet_temporal"]
 LOCAL_LAYERS           = M["local_layers"]
 GLOBAL_LAYERS          = M["global_layers"]
 NUM_HEADS              = M["num_heads"]
@@ -59,7 +60,8 @@ class OrbitWarsPolicy(nn.Module):
 
         # 1. Temporal Attention — planet/fleet 분리
         self.planet_temporal_attn = make_transformer(PLANET_TEMPORAL_LAYERS)
-        self.fleet_temporal_attn  = make_transformer(FLEET_TEMPORAL_LAYERS)
+        # ablation B (fleet_temporal=false): fleet_temporal_attn 미사용, current-step만 통과
+        self.fleet_temporal_attn  = make_transformer(FLEET_TEMPORAL_LAYERS) if FLEET_TEMPORAL else None
 
         # 2. Local Attention — fleet ↔ 행성 관계
         self.local_attn = make_transformer(LOCAL_LAYERS)
@@ -111,12 +113,16 @@ class OrbitWarsPolicy(nn.Module):
         p_t   = self.planet_temporal_attn(p_t)
         p_t   = p_t[:, -1, :].view(B, MAX_PLANETS, EMBED_DIM)
 
-        # fleet: 고잡음 신호 — 별도 encoder로 planet branch 오염 차단
-        f_pos = self.fleet_temporal_pos(t_idx)
-        f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
-        f_t   = f_t + f_pos.unsqueeze(0)
-        f_t   = self.fleet_temporal_attn(f_t)
-        f_t   = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
+        # fleet: ablation A=temporal encoding, ablation B=current-step only
+        if FLEET_TEMPORAL:
+            f_pos = self.fleet_temporal_pos(t_idx)
+            f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
+            f_t   = f_t + f_pos.unsqueeze(0)
+            f_t   = self.fleet_temporal_attn(f_t)
+            f_t   = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
+        else:
+            # current-step fleet embedding만 사용 (마지막 턴)
+            f_t = f_emb[:, -1, :, :]  # (B, F, E)
 
         # --- 2. Local Attention (fleet ↔ 행성) ---
         local_tokens = torch.cat([p_t, f_t], dim=1)  # (B, P+F, E)
