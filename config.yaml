@@ -14,6 +14,7 @@ training:
   total_timesteps: 10000000
   n_envs: 64
   gamma: 0.99
+  gae_lambda: 0.95
   clip_range: 0.2
   ent_coef: 0.01        # 탐험 장려 엔트로피 계수
   vf_coef: 0.5          # Critic loss 가중치

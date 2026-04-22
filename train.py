@@ -282,17 +282,24 @@ def _self_play_prob(total_steps: int, league_size: int) -> float:
 
 # ── PPO 업데이트 ──────────────────────────────────────────────────────────────
 
-def compute_returns(rewards, dones, values, gamma=T["gamma"]):
-    returns = torch.zeros_like(rewards)
-    R = 0.0
-    for t in reversed(range(len(rewards))):
-        R = rewards[t] + gamma * R * (1.0 - dones[t])
-        returns[t] = R
-    return returns
+def compute_gae(rewards, dones, values, gamma=T["gamma"], lam=T["gae_lambda"]):
+    """GAE(γ, λ) advantage + returns 계산.
+
+    returns = advantages + values (critic target으로 사용)
+    """
+    T_len     = len(rewards)
+    advantages = torch.zeros_like(rewards)
+    last_gae   = 0.0
+    for t in reversed(range(T_len)):
+        next_val   = values[t + 1].squeeze() if t + 1 < T_len else 0.0
+        delta      = rewards[t] + gamma * next_val * (1.0 - dones[t]) - values[t].squeeze()
+        last_gae   = delta + gamma * lam * (1.0 - dones[t]) * last_gae
+        advantages[t] = last_gae
+    returns = advantages + values.squeeze(-1)
+    return advantages, returns
 
 
-def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, values, clip_range=T["clip_range"]):
-    advantages = returns - values.squeeze(-1)
+def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantages, clip_range=T["clip_range"]):
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     obs           = obs.to(DEVICE)
@@ -405,8 +412,8 @@ def train(n_envs=1):
             obs, actions, rewards, dones, log_probs, values = collect_rollout(
                 main_model, opponent, n_steps=512, n_envs=n_envs, pool=pool
             )
-            returns = compute_returns(rewards, dones, values)
-            p_loss, v_loss, e_loss = ppo_update(main_model, optimizer, obs, actions, log_probs, returns, values)
+            advantages, returns = compute_gae(rewards, dones, values)
+            p_loss, v_loss, e_loss = ppo_update(main_model, optimizer, obs, actions, log_probs, returns, advantages)
             total_steps += len(obs)
 
             exp_opp = copy.deepcopy(main_model)
@@ -414,8 +421,8 @@ def train(n_envs=1):
             obs_e, act_e, rew_e, done_e, logp_e, val_e = collect_rollout(
                 exploiter, exp_opp, n_steps=256, n_envs=max(1, n_envs // 2), pool=pool
             )
-            ret_e = compute_returns(rew_e, done_e, val_e)
-            ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, val_e)
+            adv_e, ret_e = compute_gae(rew_e, done_e, val_e)
+            ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e)
 
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
