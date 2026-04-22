@@ -9,12 +9,14 @@ Hierarchical Transformer Policy for Orbit Wars.
   5. Actor / Critic  — 행동 확률 + 상태 가치
 """
 
+import os
 import math
 import torch
 import torch.nn as nn
 import yaml
 
-with open("config.yaml") as f:
+_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+with open(_cfg_path) as f:
     CFG = yaml.safe_load(f)
 
 M   = CFG["model"]

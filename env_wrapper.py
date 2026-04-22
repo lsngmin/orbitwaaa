@@ -5,15 +5,21 @@ OrbitWars Gymnasium 환경 wrapper.
 행동(action) → [from_planet_id, angle, num_ships] 리스트로 변환
 """
 
+import os
 import math
 import numpy as np
-import gymnasium as gym
-from gymnasium import spaces
-from collections import deque
-from kaggle_environments import make
 import yaml
+from collections import deque
 
-with open("config.yaml") as f:
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+    from kaggle_environments import make
+except ImportError:
+    pass
+
+_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+with open(_cfg_path) as f:
     CONFIG = yaml.safe_load(f)
 
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
