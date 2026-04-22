@@ -213,7 +213,7 @@ class OrbitWarsEnv(gym.Env):
             target_idx = int(np.argmax(target_probs))
             target     = planets[target_idx]
 
-            ships_ratio  = (ships_ratio + 1.0) / 2.0  # [-1,1] → [0,1]
+            ships_ratio  = float(np.clip(ships_ratio, 0.0, 1.0))
             ships_needed = max(1, int(p.ships * ships_ratio))
             ships_needed = min(ships_needed, p.ships)
             if ships_needed <= 0:

@@ -88,7 +88,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player):
         if p.owner != acting_player:
             continue
         launch      = action_np[i, 0]
-        ships_ratio = (action_np[i, 1] + 1.0) / 2.0
+        ships_ratio = float(np.clip(action_np[i, 1], 0.0, 1.0))
         target_idx  = int(np.argmax(action_np[i, 2:2 + len(planets)]))
 
         if launch < 0.5:
