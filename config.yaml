@@ -8,8 +8,8 @@ model:
 
 training:
   batch_size: 256
-  learning_rate: 3e-4
-  total_timesteps: 10_000_000
+  learning_rate: 0.0003
+  total_timesteps: 10000000
   n_envs: 64
   gamma: 0.99
   clip_range: 0.2
