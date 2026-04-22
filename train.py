@@ -76,13 +76,16 @@ class LeaguePool:
 
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
 
-def decode_action_to_moves(action_np, raw_planets, av):
-    """Pure function: 샘플된 action_np → env moves 리스트. 모델 접근 없음."""
+def decode_action_to_moves(action_np, raw_planets, av, acting_player):
+    """Pure function: 샘플된 action_np → env moves 리스트. 모델 접근 없음.
+
+    acting_player: 절대 owner ID (0 or 1). 행성 소유 판정에 사용.
+    """
     planets = [Planet(*p) for p in raw_planets]
     moves   = []
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
-        if p.owner != 0:
+        if p.owner != acting_player:
             continue
         launch      = action_np[i, 0]
         ships_ratio = (action_np[i, 1] + 1.0) / 2.0
@@ -90,7 +93,7 @@ def decode_action_to_moves(action_np, raw_planets, av):
 
         if launch < 0.5:
             continue
-        if target_idx >= len(planets) or planets[target_idx].owner == 0:
+        if target_idx >= len(planets) or planets[target_idx].owner == acting_player:
             continue
 
         target       = planets[target_idx]
@@ -110,12 +113,12 @@ def decode_action_to_moves(action_np, raw_planets, av):
 
 
 def _opp_moves(opponent_model, obs_tensor, raw_planets, av, device):
-    """상대 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
+    """상대(player 1) 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
     if opponent_model is None:
         return []
     with torch.no_grad():
         action, _, _ = opponent_model.get_action_and_value(obs_tensor.unsqueeze(0).to(device))
-    return decode_action_to_moves(action.squeeze(0).cpu().numpy(), raw_planets, av)
+    return decode_action_to_moves(action.squeeze(0).cpu().numpy(), raw_planets, av, acting_player=1)
 
 
 def get_obs_tensor(raw_obs, player, history_p, history_f):
@@ -160,7 +163,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         with torch.no_grad():
             action_t, log_prob, value = main_model.get_action_and_value(obs_t.unsqueeze(0).to(device))
         action_np  = action_t.squeeze(0).cpu().numpy()
-        moves_main = decode_action_to_moves(action_np, raw_planets, av)
+        moves_main = decode_action_to_moves(action_np, raw_planets, av, acting_player=0)
 
         raw_obs_opp = env.state[1].observation
         obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
@@ -315,7 +318,7 @@ def evaluate(main_model, opponent_model, n_games=20):
             obs_t, raw_p, av = get_obs_tensor(raw_main, 0, history_p, history_f)
             with torch.no_grad():
                 action_t, _, _ = main_model.get_action_and_value(obs_t.unsqueeze(0).to(DEVICE))
-            moves_main = decode_action_to_moves(action_t.squeeze(0).cpu().numpy(), raw_p, av)
+            moves_main = decode_action_to_moves(action_t.squeeze(0).cpu().numpy(), raw_p, av, acting_player=0)
 
             raw_opp = env.state[1].observation
             obs_o, raw_po, avo = get_obs_tensor(raw_opp, 1, history_p_opp, history_f_opp)
