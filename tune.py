@@ -180,9 +180,8 @@ def tournament(population):
             scores[i] += 0.5
             scores[j] += 0.5
 
-    # 정규화 (0~1)
-    max_score = MATCHES_PER_EVAL * n
-    return [s / max_score for s in scores]
+    # 정규화 (0~1): 개체당 최대 MATCHES_PER_EVAL점
+    return [s / MATCHES_PER_EVAL for s in scores]
 
 
 def crossover(a, b):
