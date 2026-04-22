@@ -44,7 +44,7 @@ def test_decode_no_launch(mock_sun, mock_aim):
     """launch < 0.5 → 빈 moves."""
     action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
     raw_planets = [make_raw(0, 10.0, 10.0, 0)]
-    moves = decode_action_to_moves(action_np, raw_planets, av=0.0)
+    moves = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
     assert moves == []
     mock_aim.assert_not_called()
 
@@ -63,7 +63,7 @@ def test_decode_launch_to_enemy(mock_sun, mock_aim):
         make_raw(0, 10.0, 10.0, owner=0, ships=20),
         make_raw(1, 90.0, 90.0, owner=1, ships=5),
     ]
-    moves = decode_action_to_moves(action_np, raw_planets, av=0.0)
+    moves = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
     assert len(moves) == 1
     assert moves[0][0] == 0  # from_planet_id
 
@@ -81,7 +81,7 @@ def test_decode_own_planet_target_skipped(mock_sun, mock_aim):
         make_raw(0, 10.0, 10.0, owner=0, ships=20),
         make_raw(1, 90.0, 90.0, owner=0, ships=5),  # 내 행성
     ]
-    moves = decode_action_to_moves(action_np, raw_planets, av=0.0)
+    moves = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
     assert moves == []
 
 
@@ -98,7 +98,7 @@ def test_decode_sun_blocked(mock_sun, mock_aim):
         make_raw(0, 10.0, 10.0, owner=0, ships=20),
         make_raw(1, 90.0, 90.0, owner=1, ships=5),
     ]
-    moves = decode_action_to_moves(action_np, raw_planets, av=0.0)
+    moves = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
     assert moves == []
 
 
@@ -154,8 +154,8 @@ def test_decode_is_pure_function(mock_sun, mock_aim):
         make_raw(1, 80.0, 80.0, owner=1, ships=5),
     ]
 
-    moves1 = decode_action_to_moves(action_np, raw_planets, av=0.0)
-    moves2 = decode_action_to_moves(action_np, raw_planets, av=0.0)
+    moves1 = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
+    moves2 = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
 
     assert moves1 == moves2
     assert len(moves1) == 1
@@ -187,9 +187,9 @@ def test_collect_single_stored_action_matches_decoded_moves():
         sampled_actions.append(action_t.squeeze(0).cpu().numpy().copy())
         return action_t, lp, v
 
-    def tracing_decode(action_np, raw_planets, av):
+    def tracing_decode(action_np, raw_planets, av, acting_player=0):
         decoded_actions.append(action_np.copy())
-        return original_decode(action_np, raw_planets, av)
+        return original_decode(action_np, raw_planets, av, acting_player=acting_player)
 
     model.get_action_and_value = tracing_sample
 
