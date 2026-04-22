@@ -1,0 +1,28 @@
+model:
+  embed_dim: 128
+  temporal_layers: 2
+  local_layers: 2
+  global_layers: 4
+  num_heads: 8
+  temporal_window: 20
+
+training:
+  batch_size: 256
+  learning_rate: 3e-4
+  total_timesteps: 10_000_000
+  n_envs: 64
+  gamma: 0.99
+  clip_range: 0.2
+  ent_coef: 0.01        # 탐험 장려 엔트로피 계수
+  vf_coef: 0.5          # Critic loss 가중치
+  max_grad_norm: 0.5    # gradient clipping
+
+env:
+  max_planets: 40
+  max_fleets: 100
+  history_turns: 20     # temporal window
+
+selfplay:
+  eval_interval: 50     # N세대마다 이전 버전과 대전
+  win_threshold: 0.55   # 이 승률 넘어야 새 버전으로 교체
+  pool_size: 5          # 대전 상대 풀 크기 (과거 버전 몇 개 유지)
