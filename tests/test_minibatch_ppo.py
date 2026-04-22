@@ -15,7 +15,7 @@ import torch
 import pytest
 from unittest.mock import patch
 from model import OrbitWarsPolicy, HISTORY, MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, ACTION_DIM
-from train import ppo_update
+from train import ppo_update, DEVICE
 
 OBS_DIM = HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM)
 N       = 32  # rollout 길이
@@ -37,7 +37,7 @@ def make_dummy_batch(n=N):
 
 @pytest.fixture
 def model_and_opt():
-    m   = OrbitWarsPolicy()
+    m   = OrbitWarsPolicy().to(DEVICE)
     opt = torch.optim.Adam(m.parameters(), lr=1e-4)
     return m, opt
 
