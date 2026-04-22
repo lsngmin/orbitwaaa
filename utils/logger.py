@@ -13,6 +13,7 @@ class TrainingLogger:
         self.fields = [
             "generation", "total_steps", "match_type",
             "policy_loss", "value_loss", "entropy_loss",
+            "approx_kl", "clip_frac",
             "win_rate", "league_size",
         ]
         with open(self.path, "w", newline="") as f:
@@ -27,6 +28,9 @@ class TrainingLogger:
 
         win_rate = kwargs.get("win_rate", "")
         win_str  = f" | win_rate={win_rate:.2%}" if isinstance(win_rate, float) else ""
+        approx_kl = kwargs.get("approx_kl", "")
+        clip_frac  = kwargs.get("clip_frac", "")
+        kl_str     = f" | kl={approx_kl:.4f} | cf={clip_frac:.3f}" if isinstance(approx_kl, float) else ""
         print(
             f"Gen {kwargs.get('generation', '?'):04d} | "
             f"steps={kwargs.get('total_steps', 0):,} | "
@@ -34,5 +38,5 @@ class TrainingLogger:
             f"p_loss={kwargs.get('policy_loss', 0):.4f} | "
             f"v_loss={kwargs.get('value_loss', 0):.4f} | "
             f"e_loss={kwargs.get('entropy_loss', 0):.4f}"
-            f"{win_str}"
+            f"{kl_str}{win_str}"
         )
