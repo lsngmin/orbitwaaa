@@ -74,6 +74,32 @@ class LeaguePool:
         return len(self.agents)
 
 
+# ── Dense Reward ─────────────────────────────────────────────────────────────
+
+def state_score(raw_obs, player):
+    """행성 경제 상태를 단일 스칼라로 요약.
+
+    ships * 0.01 + production * 0.5 + planet_count * 1.0
+    계수는 terminal reward(±1.0) 대비 dense signal이 지나치지 않도록 조정.
+    """
+    if isinstance(raw_obs, dict):
+        planets = raw_obs.get("planets", [])
+    else:
+        planets = getattr(raw_obs, "planets", [])
+
+    total_ships = total_prod = planet_count = 0.0
+    for p in planets:
+        owner = p[1] if isinstance(p, (list, tuple)) else p.owner
+        ships = p[5] if isinstance(p, (list, tuple)) else p.ships
+        prod  = p[6] if isinstance(p, (list, tuple)) else p.production
+        if owner == player:
+            total_ships  += ships
+            total_prod   += prod
+            planet_count += 1.0
+
+    return total_ships * 0.01 + total_prod * 0.5 + planet_count * 1.0
+
+
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
 
 def decode_action_to_moves(action_np, raw_planets, av, acting_player):
@@ -155,6 +181,9 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
     history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
 
+    dense_coef = T["dense_reward_coef"]
+    prev_score = state_score(env.state[0].observation, player=0)
+
     step = 0
     while step < n_steps:
         raw_obs_main = env.state[0].observation
@@ -172,10 +201,13 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         env.step([moves_main, moves_opp])
         done = env.done
 
-        reward = 0.0
+        curr_score = state_score(env.state[0].observation, player=0)
+        reward     = dense_coef * (curr_score - prev_score)
+        prev_score = curr_score
+
         if done:
             r      = env.state[0].reward
-            reward = 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
+            reward += 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
 
         obs_list.append(obs_t)
         act_list.append(action_t.squeeze(0).cpu())
@@ -188,6 +220,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         if done:
             env = make("orbit_wars", debug=False)
             env.reset()
+            prev_score    = state_score(env.state[0].observation, player=0)
             history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
             history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
             history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)

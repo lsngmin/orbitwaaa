@@ -21,6 +21,7 @@ training:
   ent_coef: 0.01        # 탐험 장려 엔트로피 계수
   vf_coef: 0.5          # Critic loss 가중치
   max_grad_norm: 0.5    # gradient clipping
+  dense_reward_coef: 0.003  # dense reward 계수 (0이면 terminal-only)
 
 env:
   max_planets: 40
