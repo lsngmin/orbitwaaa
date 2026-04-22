@@ -76,22 +76,17 @@ class LeaguePool:
 
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
 
-def model_to_moves(model, obs_tensor, raw_planets, av, device=None):
-    if device is None:
-        device = DEVICE
+def decode_action_to_moves(action_np, raw_planets, av):
+    """Pure function: 샘플된 action_np → env moves 리스트. 모델 접근 없음."""
     planets = [Planet(*p) for p in raw_planets]
+    moves   = []
 
-    with torch.no_grad():
-        action, _, _ = model.get_action_and_value(obs_tensor.unsqueeze(0).to(device))
-    action = action.squeeze(0).cpu().numpy()
-
-    moves = []
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != 0:
             continue
-        launch      = action[i, 0]
-        ships_ratio = (action[i, 1] + 1.0) / 2.0
-        target_idx  = int(np.argmax(action[i, 2:2 + len(planets)]))
+        launch      = action_np[i, 0]
+        ships_ratio = (action_np[i, 1] + 1.0) / 2.0
+        target_idx  = int(np.argmax(action_np[i, 2:2 + len(planets)]))
 
         if launch < 0.5:
             continue
@@ -112,6 +107,15 @@ def model_to_moves(model, obs_tensor, raw_planets, av, device=None):
 
         moves.append([p.id, angle, ships_needed])
     return moves
+
+
+def _opp_moves(opponent_model, obs_tensor, raw_planets, av, device):
+    """상대 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
+    if opponent_model is None:
+        return []
+    with torch.no_grad():
+        action, _, _ = opponent_model.get_action_and_value(obs_tensor.unsqueeze(0).to(device))
+    return decode_action_to_moves(action.squeeze(0).cpu().numpy(), raw_planets, av)
 
 
 def get_obs_tensor(raw_obs, player, history_p, history_f):
@@ -155,11 +159,12 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
         with torch.no_grad():
             action_t, log_prob, value = main_model.get_action_and_value(obs_t.unsqueeze(0).to(device))
-        moves_main = model_to_moves(main_model, obs_t, raw_planets, av, device)
+        action_np  = action_t.squeeze(0).cpu().numpy()
+        moves_main = decode_action_to_moves(action_np, raw_planets, av)
 
         raw_obs_opp = env.state[1].observation
         obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
-        moves_opp = model_to_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device) if opponent_model else []
+        moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
 
         env.step([moves_main, moves_opp])
         done = env.done
@@ -308,11 +313,13 @@ def evaluate(main_model, opponent_model, n_games=20):
         while not env.done:
             raw_main = env.state[0].observation
             obs_t, raw_p, av = get_obs_tensor(raw_main, 0, history_p, history_f)
-            moves_main = model_to_moves(main_model, obs_t, raw_p, av)
+            with torch.no_grad():
+                action_t, _, _ = main_model.get_action_and_value(obs_t.unsqueeze(0).to(DEVICE))
+            moves_main = decode_action_to_moves(action_t.squeeze(0).cpu().numpy(), raw_p, av)
 
             raw_opp = env.state[1].observation
             obs_o, raw_po, avo = get_obs_tensor(raw_opp, 1, history_p_opp, history_f_opp)
-            moves_opp = model_to_moves(opponent_model, obs_o, raw_po, avo) if opponent_model else []
+            moves_opp = _opp_moves(opponent_model, obs_o, raw_po, avo, DEVICE)
 
             env.step([moves_main, moves_opp])
 
