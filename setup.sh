@@ -1,13 +1,16 @@
 #!/bin/bash
 set -e
 
-echo "=== Python 버전 확인 ==="
-PYTHON=$(command -v python3.11 || command -v python3 || command -v python)
-$PYTHON --version
-echo "사용할 Python: $PYTHON"
+echo "=== Python 3.11 설치 확인 ==="
+if ! command -v python3.11 &>/dev/null; then
+    echo "Python 3.11 없음. 설치 중..."
+    sudo apt update -y
+    sudo apt install -y python3.11 python3.11-venv
+fi
+python3.11 --version
 
 echo "=== 가상환경 생성 ==="
-$PYTHON -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 
 echo "=== pip 업그레이드 ==="
