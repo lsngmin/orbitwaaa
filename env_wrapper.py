@@ -199,7 +199,7 @@ class OrbitWarsEnv(gym.Env):
             ships_ratio  = float(action[i, 1])
             target_logits = action[i, 2:]
 
-            if launch_prob < 0.0:
+            if launch_prob < 0.5:
                 continue
 
             # 타겟 선택 (argmax, 유효한 타겟만)
