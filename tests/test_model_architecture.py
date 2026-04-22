@@ -93,3 +93,54 @@ def test_fleet_temporal_layer_count_less_than_planet(model):
     """fleet temporal이 planet보다 레이어 수가 적거나 같은지 확인 (고잡음 신호 축소 원칙)."""
     from model import PLANET_TEMPORAL_LAYERS, FLEET_TEMPORAL_LAYERS
     assert FLEET_TEMPORAL_LAYERS <= PLANET_TEMPORAL_LAYERS
+
+
+# ── P2-2: fleet_temporal ablation flag ───────────────────────────────────────
+
+import model as _model_module
+
+
+def _make_model_with_flag(fleet_temporal: bool):
+    """FLEET_TEMPORAL 플래그를 바꿔서 모델을 생성한 뒤 원래 값으로 복구."""
+    original = _model_module.FLEET_TEMPORAL
+    _model_module.FLEET_TEMPORAL = fleet_temporal
+    try:
+        return _model_module.OrbitWarsPolicy()
+    finally:
+        _model_module.FLEET_TEMPORAL = original
+
+
+def test_ablation_a_fleet_temporal_attn_exists():
+    """fleet_temporal=True → fleet_temporal_attn이 None이 아님."""
+    m = _make_model_with_flag(True)
+    assert m.fleet_temporal_attn is not None
+
+
+def test_ablation_b_fleet_temporal_attn_is_none():
+    """fleet_temporal=False → fleet_temporal_attn이 None."""
+    m = _make_model_with_flag(False)
+    assert m.fleet_temporal_attn is None
+
+
+def test_ablation_b_forward_shape():
+    """fleet_temporal=False일 때도 forward output shape이 동일한지 확인."""
+    m = _make_model_with_flag(False)
+    m.eval()
+    obs = torch.randn(2, OBS_DIM)
+    original = _model_module.FLEET_TEMPORAL
+    _model_module.FLEET_TEMPORAL = False
+    try:
+        logits, val = m(obs)
+    finally:
+        _model_module.FLEET_TEMPORAL = original
+    assert logits.shape == (2, MAX_PLANETS, ACTION_DIM)
+    assert val.shape    == (2, 1)
+
+
+def test_ablation_b_fewer_params_than_a():
+    """fleet_temporal=False 모델이 True 모델보다 파라미터 수가 적은지 확인."""
+    m_a = _make_model_with_flag(True)
+    m_b = _make_model_with_flag(False)
+    params_a = sum(p.numel() for p in m_a.parameters())
+    params_b = sum(p.numel() for p in m_b.parameters())
+    assert params_b < params_a, f"ablation B params({params_b}) >= A({params_a})"
