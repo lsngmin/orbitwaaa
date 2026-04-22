@@ -20,12 +20,13 @@ with open("config.yaml") as f:
 M   = CFG["model"]
 ENV = CFG["env"]
 
-EMBED_DIM       = M["embed_dim"]
-TEMPORAL_LAYERS = M["temporal_layers"]
-LOCAL_LAYERS    = M["local_layers"]
-GLOBAL_LAYERS   = M["global_layers"]
-NUM_HEADS       = M["num_heads"]
-HISTORY         = M["temporal_window"]
+EMBED_DIM              = M["embed_dim"]
+PLANET_TEMPORAL_LAYERS = M["planet_temporal_layers"]
+FLEET_TEMPORAL_LAYERS  = M["fleet_temporal_layers"]
+LOCAL_LAYERS           = M["local_layers"]
+GLOBAL_LAYERS          = M["global_layers"]
+NUM_HEADS              = M["num_heads"]
+HISTORY                = M["temporal_window"]
 MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
 PLANET_DIM      = 11
@@ -52,11 +53,13 @@ class OrbitWarsPolicy(nn.Module):
         self.planet_embed = nn.Linear(PLANET_DIM, EMBED_DIM)
         self.fleet_embed  = nn.Linear(FLEET_DIM,  EMBED_DIM)
 
-        # 위치 인코딩 (temporal용)
-        self.temporal_pos = nn.Embedding(HISTORY, EMBED_DIM)
+        # 위치 인코딩 — planet/fleet 분리
+        self.planet_temporal_pos = nn.Embedding(HISTORY, EMBED_DIM)
+        self.fleet_temporal_pos  = nn.Embedding(HISTORY, EMBED_DIM)
 
-        # 1. Temporal Attention — 시간축 패턴
-        self.temporal_attn = make_transformer(TEMPORAL_LAYERS)
+        # 1. Temporal Attention — planet/fleet 분리
+        self.planet_temporal_attn = make_transformer(PLANET_TEMPORAL_LAYERS)
+        self.fleet_temporal_attn  = make_transformer(FLEET_TEMPORAL_LAYERS)
 
         # 2. Local Attention — fleet ↔ 행성 관계
         self.local_attn = make_transformer(LOCAL_LAYERS)
@@ -99,19 +102,21 @@ class OrbitWarsPolicy(nn.Module):
         f_emb = self.fleet_embed(f_raw)   # (B, H, F, E)
 
         # --- 1. Temporal Attention ---
-        # 각 행성 토큰의 시간축 패턴 학습
-        # (B, P, H, E) → (B*P, H, E) → transformer → (B, P, H, E)
-        p_t = p_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_PLANETS, HISTORY, EMBED_DIM)
-        pos = self.temporal_pos(torch.arange(HISTORY, device=obs_flat.device))
-        p_t = p_t + pos.unsqueeze(0)
-        p_t = self.temporal_attn(p_t)           # (B*P, H, E)
-        p_t = p_t[:, -1, :].view(B, MAX_PLANETS, EMBED_DIM)  # 최신 턴만 추출
+        t_idx = torch.arange(HISTORY, device=obs_flat.device)
 
-        # fleet도 동일하게
-        f_t = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
-        f_t = f_t + pos.unsqueeze(0)
-        f_t = self.temporal_attn(f_t)
-        f_t = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
+        # planet: 저주파 상태 변화 (점유, 생산, 압박)
+        p_pos = self.planet_temporal_pos(t_idx)
+        p_t   = p_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_PLANETS, HISTORY, EMBED_DIM)
+        p_t   = p_t + p_pos.unsqueeze(0)
+        p_t   = self.planet_temporal_attn(p_t)
+        p_t   = p_t[:, -1, :].view(B, MAX_PLANETS, EMBED_DIM)
+
+        # fleet: 고잡음 신호 — 별도 encoder로 planet branch 오염 차단
+        f_pos = self.fleet_temporal_pos(t_idx)
+        f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
+        f_t   = f_t + f_pos.unsqueeze(0)
+        f_t   = self.fleet_temporal_attn(f_t)
+        f_t   = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
 
         # --- 2. Local Attention (fleet ↔ 행성) ---
         local_tokens = torch.cat([p_t, f_t], dim=1)  # (B, P+F, E)
