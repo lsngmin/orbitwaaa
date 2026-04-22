@@ -2,48 +2,43 @@
 PPO inference agent for submission.
 
 전역에서 모델을 한 번 로드하고, 매 turn history buffer를 유지하며
-학습된 정책 분포에서 샘플한 action을 그대로 실행합니다.
+deterministic greedy action을 반환합니다.
 
 제출 번들에 필요한 파일:
-  ppo_agent.py, submission_model.py, env_wrapper.py, prediction.py, config.yaml,
+  ppo_agent.py, model.py, env_wrapper.py, prediction.py, config.yaml,
   mid_run/main_final.pt (또는 WEIGHTS_PATH 경로 수정)
 """
 
 import os
+import math
 import torch
 import numpy as np
 from collections import deque
 
-from submission_model import OrbitWarsActor
+from model import OrbitWarsPolicy
 from env_wrapper import (
     encode_planets, encode_fleets,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
 )
-from prediction import aim
+from prediction import aim, crosses_sun
 
 # ── 가중치 경로 ───────────────────────────────────────────────────────────────
 
 _base = os.path.dirname(os.path.abspath(__file__))
-
-def _find_weights():
-    candidates = [
-        os.path.join(_base, "checkpoints", "main_final.pt"),
-        os.path.join(_base, "checkpoints", "main_latest.pt"),
-        os.path.join(_base, "main_final.pt"),
-        os.path.join(_base, "main_latest.pt"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(f"No weights found. Tried: {candidates}")
-
-WEIGHTS_PATH = _find_weights()
+WEIGHTS_PATH = (
+    os.path.join(_base, "mid_run", "main_final.pt")
+    if os.path.exists(os.path.join(_base, "mid_run", "main_final.pt"))
+    else os.path.join(_base, "main_final.pt")
+)
 
 def _load_model():
-    m = OrbitWarsActor()
-    state = torch.load(WEIGHTS_PATH, map_location="cpu")
-    m.load_state_dict(state, strict=False)
+    m = OrbitWarsPolicy()
+    m.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
     m.eval()
+    # warmup: 첫 forward pass JIT 컴파일을 import 시점에 처리
+    _dummy = torch.zeros(1, HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM))
+    with torch.no_grad():
+        m.forward(_dummy)
     return m
 
 
@@ -74,49 +69,41 @@ def _get_history(player: int):
     return _history[player]
 
 
-# ── Sampled action decode ─────────────────────────────────────────────────────
+# ── Deterministic action decode ───────────────────────────────────────────────
 
-def _decode_sampled_action(action_np, raw_planets, av, acting_player):
-    """샘플된 action_np (MAX_PLANETS, ACTION_DIM) → env moves list.
+def _decode_greedy(action_logits, raw_planets, av, acting_player):
+    """action_logits (MAX_PLANETS, ACTION_DIM) → moves list.
 
-    모델 샘플은 그대로 사용하되, 액션 유효성만 보장.
+    launch  : sigmoid(logit) > 0.5  (no sampling)
+    ships   : sigmoid(logit)        (mean of Normal)
+    target  : argmax(logits)        (no sampling)
     """
     from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
-    from prediction import crosses_sun
-    import math
 
     planets = [Planet(*p) for p in raw_planets]
     moves = []
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
-        # 내 행성에서만 발사 (유효성)
         if p.owner != acting_player:
             continue
 
-        launch = action_np[i, 0]
-        if launch < 0.5:
+        launch_prob = torch.sigmoid(action_logits[i, 0]).item()
+        if launch_prob < 0.5:
             continue
 
-        ships_ratio = float(action_np[i, 1])
-        target_idx  = int(np.argmax(action_np[i, 2:2 + len(planets)]))
+        ships_ratio = float(torch.sigmoid(action_logits[i, 1]).clamp(0.0, 1.0).item())
+        target_idx  = int(action_logits[i, 2:2 + len(planets)].argmax().item())
 
-        if target_idx >= len(planets):
-            continue
-        target = planets[target_idx]
-
-        # 자기 행성 공격 금지 (유효성)
-        if target.owner == acting_player:
+        if target_idx >= len(planets) or planets[target_idx].owner == acting_player:
             continue
 
-        # ships 수 보장 (유효성)
+        target       = planets[target_idx]
         ships_needed = max(1, int(p.ships * ships_ratio))
         ships_needed = min(ships_needed, p.ships)
         if ships_needed <= 0:
             continue
 
         angle = aim(p, target, av, ships_needed)
-
-        # 태양 충돌 금지 (유효성)
         tx = p.x + math.cos(angle) * math.hypot(target.x - p.x, target.y - p.y)
         ty = p.y + math.sin(angle) * math.hypot(target.x - p.x, target.y - p.y)
         if crosses_sun(p.x, p.y, tx, ty):
@@ -155,6 +142,6 @@ def ppo_agent(obs):
 
     model = _get_model()
     with torch.no_grad():
-        action = model.get_action(obs_t)
+        action_logits, _ = model.forward(obs_t)
 
-    return _decode_sampled_action(action.squeeze(0).cpu().numpy(), raw_planets, av, acting_player=player)
+    return _decode_greedy(action_logits.squeeze(0), raw_planets, av, acting_player=player)
