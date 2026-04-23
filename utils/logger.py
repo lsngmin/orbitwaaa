@@ -20,6 +20,8 @@ class TrainingLogger:
             "policy_loss", "value_loss", "entropy_loss",
             "approx_kl", "clip_frac", "epochs_done",
             "ent_launch", "ent_ships", "ent_target",
+            "kl_launch", "kl_ships", "kl_target",
+            "cf_launch", "cf_ships", "cf_target",
             "mean_dense_rew", "mean_cap_bonus", "mean_terminal_rew",
             "win_rate", "league_size",
         ]
@@ -44,12 +46,21 @@ class TrainingLogger:
         mean_dense  = kwargs.get("mean_dense_rew", "")
         mean_cap    = kwargs.get("mean_cap_bonus", "")
         mean_term   = kwargs.get("mean_terminal_rew", "")
+        kl_l = kwargs.get("kl_launch", "")
+        kl_s = kwargs.get("kl_ships", "")
+        kl_t = kwargs.get("kl_target", "")
+        cf_l = kwargs.get("cf_launch", "")
+        cf_s = kwargs.get("cf_ships", "")
+        cf_t = kwargs.get("cf_target", "")
         kl_str  = (f" | kl={approx_kl:.4f} | cf={clip_frac:.3f}"
                    f" | ep={epochs_done}") if _is_num(approx_kl) else ""
         ent_str = (f" | el={ent_launch:.2f} | es={ent_ships:.2f} | et={ent_target:.2f}"
                    ) if _is_num(ent_launch) else ""
         rew_str = (f" | dr={mean_dense:+.4f} | cb={mean_cap:+.4f} | tr={mean_term:+.4f}"
                    ) if _is_num(mean_dense) else ""
+        head_str = (f" | klh=[{kl_l:.3f}/{kl_s:.3f}/{kl_t:.3f}]"
+                    f" | cfh=[{cf_l:.2f}/{cf_s:.2f}/{cf_t:.2f}]"
+                    ) if _is_num(kl_l) else ""
         print(
             f"Gen {kwargs.get('generation', '?'):04d} | "
             f"steps={kwargs.get('total_steps', 0):,} | "
@@ -57,5 +68,5 @@ class TrainingLogger:
             f"p_loss={kwargs.get('policy_loss', 0):.4f} | "
             f"v_loss={kwargs.get('value_loss', 0):.4f} | "
             f"e_loss={kwargs.get('entropy_loss', 0):.4f}"
-            f"{kl_str}{ent_str}{rew_str}{win_str}"
+            f"{kl_str}{ent_str}{rew_str}{head_str}{win_str}"
         )

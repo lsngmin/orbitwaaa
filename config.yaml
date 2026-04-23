@@ -12,13 +12,13 @@ training:
   batch_size: 256
   minibatch_size: 128   # minibatch PPO용 — batch_size의 약수여야 함
   n_epochs: 4           # 같은 rollout을 몇 epoch 반복할지
-  learning_rate: 0.00003
+  learning_rate: 0.0001
   total_timesteps: 10000000
   n_envs: 64
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
-  target_kl: 0.05       # 이 값 초과 시 PPO epoch 조기 종료 (None이면 비활성)
+  target_kl: null       # 이 값 초과 시 PPO epoch 조기 종료 (None이면 비활성)
   ent_coef: 0.001       # 탐험 장려 엔트로피 계수
   vf_coef: 0.5          # Critic loss 가중치
   max_grad_norm: 0.5    # gradient clipping

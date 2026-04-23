@@ -224,6 +224,7 @@ def get_obs_tensor(raw_obs, player, history_p, history_f):
 
 def _collect_single(main_model, opponent_model, n_steps, device):
     obs_list, act_list, rew_list, done_list, logp_list, val_list = [], [], [], [], [], []
+    logp_heads_list = []
     sum_dense = sum_cap = sum_terminal = 0.0
 
     env = make("orbit_wars", debug=False)
@@ -244,7 +245,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
         with torch.no_grad():
-            action_t, log_prob, value = main_model.get_action_and_value(obs_t.unsqueeze(0).to(device))
+            action_t, log_prob, value, lp_heads = main_model.get_action_and_value(obs_t.unsqueeze(0).to(device))
         action_np  = action_t.squeeze(0).cpu().numpy()
         moves_main = decode_action_to_moves(action_np, raw_planets, av, acting_player=0)
 
@@ -280,6 +281,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         rew_list.append(torch.tensor(reward, dtype=torch.float32))
         done_list.append(torch.tensor(float(done), dtype=torch.float32))
         logp_list.append(log_prob.squeeze(0).cpu())
+        logp_heads_list.append(lp_heads.squeeze(0).cpu())
         val_list.append(value.squeeze(0).cpu())
 
         step += 1
@@ -297,7 +299,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     last_raw = env.state[0].observation
     last_obs_t, _, _ = get_obs_tensor(last_raw, 0, history_p, history_f)
     with torch.no_grad():
-        _, _, last_value = main_model.get_action_and_value(last_obs_t.unsqueeze(0).to(device))
+        _, _, last_value, _ = main_model.get_action_and_value(last_obs_t.unsqueeze(0).to(device))
     last_value = last_value.squeeze().cpu()
 
     rewards = torch.stack(rew_list)
@@ -316,6 +318,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         advantages,
         returns,
         torch.stack(logp_list),
+        torch.stack(logp_heads_list),
         reward_stats,
     )
 
@@ -369,9 +372,9 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
     results = pool.map(_rollout_worker, worker_args)
 
     # reward_stats: worker별 평균을 다시 평균
-    keys = results[0][5].keys()
+    keys = results[0][6].keys()
     merged_stats = {
-        k: sum(r[5][k] for r in results) / len(results) for k in keys
+        k: sum(r[6][k] for r in results) / len(results) for k in keys
     }
     return (
         torch.cat([r[0] for r in results]),
@@ -379,6 +382,7 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
         torch.cat([r[2] for r in results]),
         torch.cat([r[3] for r in results]),
         torch.cat([r[4] for r in results]),
+        torch.cat([r[5] for r in results]),
         merged_stats,
     )
 
@@ -427,6 +431,7 @@ def compute_gae(rewards, dones, values, last_value=0.0, gamma=T["gamma"], lam=T[
 
 
 def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantages,
+               old_logp_heads=None,
                clip_range=T["clip_range"], n_epochs=T["n_epochs"], minibatch_size=T["minibatch_size"],
                target_kl=T.get("target_kl")):
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -436,11 +441,15 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
     old_log_probs = old_log_probs.to(DEVICE)
     advantages    = advantages.to(DEVICE)
     returns       = returns.to(DEVICE)
+    if old_logp_heads is not None:
+        old_logp_heads = old_logp_heads.to(DEVICE)
 
     N = len(obs)
     p_losses, v_losses, e_losses = [], [], []
     approx_kls, clip_fracs       = [], []
     ent_launches, ent_ships_l, ent_targets = [], [], []
+    kl_l_hist, kl_s_hist, kl_t_hist = [], [], []
+    cf_l_hist, cf_s_hist, cf_t_hist = [], [], []
     epochs_done = 0
 
     for epoch in range(n_epochs):
@@ -449,7 +458,7 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
         for start in range(0, N, minibatch_size):
             mb = idx[start:start + minibatch_size]
 
-            log_probs, entropy, values, ent_l, ent_s, ent_t = model.evaluate_actions(obs[mb], actions[mb])
+            log_probs, entropy, values, ent_l, ent_s, ent_t, lp_heads = model.evaluate_actions(obs[mb], actions[mb])
 
             ratio        = (log_probs - old_log_probs[mb]).exp()
             adv_mb       = advantages[mb]
@@ -470,6 +479,19 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
                 approx_kl = ((ratio - 1) - ratio.log()).mean().item()
                 clip_frac = ((ratio - 1).abs() > clip_range).float().mean().item()
 
+                if old_logp_heads is not None:
+                    # per-head diagnostic: ratio/kl/cf를 head별로 분리 (loss에는 안 씀)
+                    diff_h   = lp_heads - old_logp_heads[mb]           # (B, 3)
+                    ratio_h  = diff_h.exp()
+                    kl_h     = ((ratio_h - 1) - diff_h).mean(dim=0)    # (3,)
+                    cf_h     = ((ratio_h - 1).abs() > clip_range).float().mean(dim=0)
+                    kl_l_hist.append(kl_h[0].item())
+                    kl_s_hist.append(kl_h[1].item())
+                    kl_t_hist.append(kl_h[2].item())
+                    cf_l_hist.append(cf_h[0].item())
+                    cf_s_hist.append(cf_h[1].item())
+                    cf_t_hist.append(cf_h[2].item())
+
             p_losses.append(policy_loss.item())
             v_losses.append(value_loss.item())
             e_losses.append(entropy_loss.item())
@@ -487,6 +509,14 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
         if early_stop:
             break
 
+    def _avg(lst):
+        return (sum(lst) / len(lst)) if lst else 0.0
+
+    head_metrics = {
+        "kl_launch": _avg(kl_l_hist), "kl_ships": _avg(kl_s_hist), "kl_target": _avg(kl_t_hist),
+        "cf_launch": _avg(cf_l_hist), "cf_ships": _avg(cf_s_hist), "cf_target": _avg(cf_t_hist),
+    }
+
     return (
         sum(p_losses) / len(p_losses),
         sum(v_losses) / len(v_losses),
@@ -497,6 +527,7 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
         sum(ent_launches) / len(ent_launches),
         sum(ent_ships_l)  / len(ent_ships_l),
         sum(ent_targets)  / len(ent_targets),
+        head_metrics,
     )
 
 
@@ -516,7 +547,7 @@ def evaluate(main_model, opponent_model, n_games=20):
             raw_main = env.state[0].observation
             obs_t, raw_p, av = get_obs_tensor(raw_main, 0, history_p, history_f)
             with torch.no_grad():
-                action_t, _, _ = main_model.get_action_and_value(obs_t.unsqueeze(0).to(DEVICE))
+                action_t, _, _, _ = main_model.get_action_and_value(obs_t.unsqueeze(0).to(DEVICE))
             moves_main = decode_action_to_moves(action_t.squeeze(0).cpu().numpy(), raw_p, av, acting_player=0)
 
             raw_opp = env.state[1].observation
@@ -589,20 +620,22 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 opponent   = league.sample_opponent()
                 match_type = "league"
 
-            obs, actions, advantages, returns, log_probs, rew_stats = collect_rollout(
+            obs, actions, advantages, returns, log_probs, logp_heads, rew_stats = collect_rollout(
                 main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
             )
-            p_loss, v_loss, e_loss, approx_kl, clip_frac, epochs_done, ent_l, ent_s, ent_t = ppo_update(
-                main_model, optimizer, obs, actions, log_probs, returns, advantages
+            p_loss, v_loss, e_loss, approx_kl, clip_frac, epochs_done, ent_l, ent_s, ent_t, head_metrics = ppo_update(
+                main_model, optimizer, obs, actions, log_probs, returns, advantages,
+                old_logp_heads=logp_heads,
             )
             total_steps += len(obs)
 
             exp_opp = copy.deepcopy(main_model)
             exp_opp.eval()
-            obs_e, act_e, adv_e, ret_e, logp_e, _ = collect_rollout(
+            obs_e, act_e, adv_e, ret_e, logp_e, logp_heads_e, _ = collect_rollout(
                 exploiter, exp_opp, n_steps=max(1, rollout_steps // 2), n_envs=max(1, n_envs // 2), pool=pool
             )
-            ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e)
+            ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e,
+                       old_logp_heads=logp_heads_e)
 
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
@@ -613,6 +646,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_dense_rew=rew_stats["mean_dense"],
                 mean_cap_bonus=rew_stats["mean_cap"],
                 mean_terminal_rew=rew_stats["mean_terminal"],
+                **head_metrics,
             )
 
             if generation % eval_interval == 0:

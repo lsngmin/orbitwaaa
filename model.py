@@ -161,11 +161,10 @@ class OrbitWarsPolicy(nn.Module):
         target_dist   = torch.distributions.Categorical(logits=target_logits)
         target        = target_dist.sample()
 
-        log_prob = (
-            launch_dist.log_prob(launch).sum(-1)
-            + ships_dist.log_prob(ships_ratio).sum(-1)
-            + target_dist.log_prob(target).sum(-1)
-        )
+        lp_launch = launch_dist.log_prob(launch).sum(-1)
+        lp_ships  = ships_dist.log_prob(ships_ratio).sum(-1)
+        lp_target = target_dist.log_prob(target).sum(-1)
+        log_prob  = lp_launch + lp_ships + lp_target
 
         # action 합치기: (B, P, P+2)
         target_onehot = torch.zeros(*target_logits.shape, device=obs_flat.device)
@@ -176,7 +175,8 @@ class OrbitWarsPolicy(nn.Module):
             target_onehot,
         ], dim=-1)
 
-        return action, log_prob, value
+        lp_heads = torch.stack([lp_launch, lp_ships, lp_target], dim=-1)
+        return action, log_prob, value, lp_heads
 
     def evaluate_actions(self, obs_flat, actions):
         """PPO 업데이트용: 주어진 행동의 log_prob + entropy + value."""
@@ -191,15 +191,15 @@ class OrbitWarsPolicy(nn.Module):
         ships_dist  = torch.distributions.Normal(ships_mean, 0.1)
         target_dist = torch.distributions.Categorical(logits=action_logits[:, :, 2:])
 
-        log_prob = (
-            launch_dist.log_prob(launch).sum(-1)
-            + ships_dist.log_prob(ships_ratio).sum(-1)
-            + target_dist.log_prob(target).sum(-1)
-        )
+        lp_launch = launch_dist.log_prob(launch).sum(-1)
+        lp_ships  = ships_dist.log_prob(ships_ratio).sum(-1)
+        lp_target = target_dist.log_prob(target).sum(-1)
+        log_prob  = lp_launch + lp_ships + lp_target
 
         ent_launch = launch_dist.entropy().sum(-1)
         ent_ships  = ships_dist.entropy().sum(-1)
         ent_target = target_dist.entropy().sum(-1)
         entropy    = ent_launch + ent_ships + ent_target
 
-        return log_prob, entropy, value, ent_launch, ent_ships, ent_target
+        lp_heads = torch.stack([lp_launch, lp_ships, lp_target], dim=-1)
+        return log_prob, entropy, value, ent_launch, ent_ships, ent_target, lp_heads

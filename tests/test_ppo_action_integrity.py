@@ -184,9 +184,9 @@ def test_collect_single_stored_action_matches_decoded_moves():
     original_decode  = train.decode_action_to_moves
 
     def tracing_sample(*args, **kwargs):
-        action_t, lp, v = original_sample(*args, **kwargs)
+        action_t, lp, v, lp_h = original_sample(*args, **kwargs)
         sampled_actions.append(action_t.squeeze(0).cpu().numpy().copy())
-        return action_t, lp, v
+        return action_t, lp, v, lp_h
 
     def tracing_decode(action_np, raw_planets, av, acting_player=0):
         decoded_actions.append(action_np.copy())
