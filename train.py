@@ -79,9 +79,8 @@ class LeaguePool:
 def state_score(raw_obs, player):
     """행성 경제 상태를 단일 스칼라로 요약.
 
-    (planet_ships + fleet_ships) * 0.01 + production * 0.5 + planet_count * 1.0
-    fleet_ships 포함으로 공격 발사 시 패널티 제거.
-    계수는 terminal reward(±1.0) 대비 dense signal이 지나치지 않도록 조정.
+    (planet_ships + fleet_ships) * 0.01 + production * 1.0 + planet_count * 2.0
+    production / planet_count 가중치 상향: 초반 영토 확장의 학습 신호 강화.
     """
     if isinstance(raw_obs, dict):
         planets = raw_obs.get("planets", [])
@@ -106,7 +105,37 @@ def state_score(raw_obs, player):
         if owner == player:
             total_ships += ships
 
-    return total_ships * 0.01 + total_prod * 0.5 + planet_count * 1.0
+    return total_ships * 0.01 + total_prod * 1.0 + planet_count * 2.0
+
+
+def neutral_capture_bonus(prev_raw_obs, curr_raw_obs, player):
+    """중립 행성 점령 보너스: production에 비례한 즉각 보상.
+
+    이전 턴 중립(owner=-1) → 현재 내 행성(owner=player)으로 바뀐 경우만 적용.
+    생산성 높은 행성 점령일수록 큰 보상.
+    """
+    def _planets(raw):
+        if isinstance(raw, dict):
+            return raw.get("planets", [])
+        return getattr(raw, "planets", [])
+
+    prev_map = {}
+    for p in _planets(prev_raw_obs):
+        pid   = p[0] if isinstance(p, (list, tuple)) else p.id
+        owner = p[1] if isinstance(p, (list, tuple)) else p.owner
+        prod  = p[6] if isinstance(p, (list, tuple)) else p.production
+        prev_map[pid] = (owner, prod)
+
+    bonus = 0.0
+    for p in _planets(curr_raw_obs):
+        pid   = p[0] if isinstance(p, (list, tuple)) else p.id
+        owner = p[1] if isinstance(p, (list, tuple)) else p.owner
+        prev_owner, prod = prev_map.get(pid, (-1, 0))
+        if prev_owner == -1 and owner == player:     # 중립 → 내 것
+            bonus += prod * 0.1
+        elif prev_owner == player and owner != player:  # 내 것 → 잃음
+            bonus -= prod * 0.05
+    return bonus
 
 
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
@@ -208,13 +237,16 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
         moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
 
+        prev_obs_main = env.state[0].observation
         env.step([moves_main, moves_opp])
         done = env.done
 
-        curr_score = (state_score(env.state[0].observation, player=0)
-                    - state_score(env.state[1].observation, player=1))
-        reward     = dense_coef * (curr_score - prev_score)
-        prev_score = curr_score
+        curr_obs_main  = env.state[0].observation
+        curr_score     = (state_score(curr_obs_main, player=0)
+                        - state_score(env.state[1].observation, player=1))
+        cap_bonus      = neutral_capture_bonus(prev_obs_main, curr_obs_main, player=0)
+        reward         = dense_coef * (curr_score - prev_score) + cap_bonus
+        prev_score     = curr_score
 
         if done:
             r      = env.state[0].reward
