@@ -1,0 +1,290 @@
+import os
+import sys
+import math
+from unittest.mock import patch
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from env_wrapper import MAX_PLANETS
+from train import decode_action_to_moves
+from utils.hit_tracker import HitRateTracker
+
+
+class FakePlanet:
+    def __init__(self, id, x, y, owner, ships, production, radius=3.0, *args):
+        self.id = id
+        self.x = x
+        self.y = y
+        self.owner = owner
+        self.ships = ships
+        self.production = production
+        self.radius = radius
+
+
+def make_raw(id_, x, y, owner, ships=20, production=2, radius=3.0):
+    return (id_, x, y, owner, ships, production, radius)
+
+
+@patch("train.Planet", FakePlanet)
+@patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
+def test_decode_action_counts_cover_filters_and_launch(mock_aim):
+    action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
+
+    # planet 0 -> invalid target (self-owned)
+    action_np[0, 0] = 1.0
+    action_np[0, 3] = 10.0  # target_idx=1
+
+    # planet 2 -> zero ships after clipping/min
+    action_np[2, 0] = 1.0
+    action_np[2, 7] = 10.0  # target_idx=5
+
+    # planet 3 -> sun filtered
+    action_np[3, 0] = 1.0
+    action_np[3, 7] = 10.0  # target_idx=5
+
+    # planet 4 -> valid launch
+    action_np[4, 0] = 1.0
+    action_np[4, 7] = 10.0  # target_idx=5
+    action_np[4, 1] = 0.5
+
+    raw_planets = [
+        make_raw(0, 10.0, 10.0, owner=0, ships=20),
+        make_raw(1, 20.0, 20.0, owner=0, ships=10),   # self target
+        make_raw(2, 30.0, 30.0, owner=0, ships=0),    # zero-ships source
+        make_raw(3, 40.0, 40.0, owner=0, ships=20),
+        make_raw(4, 50.0, 50.0, owner=0, ships=20),
+        make_raw(5, 80.0, 80.0, owner=1, ships=5),    # enemy for valid launch
+    ]
+
+    def fake_crosses_sun(x1, y1, x2, y2):
+        # Third launched source only is sun-blocked.
+        return x1 == 40.0
+
+    with patch("train.crosses_sun", side_effect=fake_crosses_sun):
+        moves, counts, launches = decode_action_to_moves(
+            action_np, raw_planets, av=0.0, acting_player=0, return_counts=True
+        )
+
+    assert len(moves) == 1
+    assert len(launches) == 1
+    assert launches[0]["source_id"] == 4
+    assert launches[0]["target_id"] == 5
+    assert launches[0]["ships"] == 10
+    assert math.isclose(launches[0]["angle"], math.pi / 4)
+    assert counts == {
+        "attempts": 4,
+        "filtered_invalid_target": 1,
+        "filtered_zero_ships": 1,
+        "filtered_sun": 1,
+        "launched": 1,
+    }
+
+
+def test_hit_rate_tracker_summary_returns_per_step_means():
+    tracker = HitRateTracker()
+    tracker.record({
+        "attempts": 4,
+        "filtered_invalid_target": 1,
+        "filtered_zero_ships": 1,
+        "filtered_sun": 1,
+        "launched": 1,
+    })
+    tracker.record({
+        "attempts": 2,
+        "filtered_invalid_target": 0,
+        "filtered_zero_ships": 0,
+        "filtered_sun": 1,
+        "launched": 1,
+    })
+
+    summary = tracker.summary()
+
+    assert summary["mean_attempts"] == 3.0
+    assert summary["mean_launched"] == 1.0
+    assert summary["mean_filtered_invalid_target"] == 0.5
+    assert summary["mean_filtered_zero_ships"] == 0.5
+    assert summary["mean_filtered_sun"] == 1.0
+    assert summary["launch_rate"] == 2 / 6
+
+
+# ── V2: resolve_step ────────────────────────────────────────────────────────
+
+def _make_launch(source_id, target_id, ships, angle, start_x, start_y):
+    return {
+        "source_id": source_id,
+        "target_id": target_id,
+        "ships": ships,
+        "angle": angle,
+        "start_x": start_x,
+        "start_y": start_y,
+    }
+
+
+def _planet(pid, owner, x, y, radius=3.0, ships=10, production=1):
+    return (pid, owner, x, y, radius, ships, production)
+
+
+def _obs(planets, fleets, next_fleet_id=0):
+    return {"planets": planets, "fleets": fleets, "next_fleet_id": next_fleet_id}
+
+
+def test_register_launches_assigns_sequential_ids():
+    tracker = HitRateTracker(player_id=0)
+    launches = [
+        _make_launch(0, 5, 10, 0.0, 10.0, 10.0),
+        _make_launch(2, 7, 20, math.pi, 30.0, 30.0),
+    ]
+    tracker.register_launches(launches, next_fleet_id=42)
+    assert set(tracker.pending.keys()) == {42, 43}
+    assert tracker.pending[42]["target_id"] == 5
+    assert tracker.pending[43]["target_id"] == 7
+
+
+def test_resolve_out_of_bounds():
+    tracker = HitRateTracker(player_id=0)
+    # Fleet at (99, 50), angle 0, ships 10 → new_pos ≈ (100.96, 50) → out
+    tracker.register_launches(
+        [_make_launch(0, 1, 10, 0.0, 99.0, 50.0)],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(planets=[_planet(0, 0, 99.0, 50.0)], fleets=[])
+    curr_obs = _obs(planets=[_planet(0, 0, 99.0, 50.0)], fleets=[])
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    assert tracker.counters["out"] == 1
+    assert 1 not in tracker.pending
+
+
+def test_resolve_sun_crash():
+    tracker = HitRateTracker(player_id=0)
+    # Fleet near sun center, heading further in
+    tracker.register_launches(
+        [_make_launch(0, 1, 10, 0.0, 45.0, 50.0)],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(planets=[_planet(0, 0, 45.0, 50.0)], fleets=[])
+    curr_obs = _obs(planets=[_planet(0, 0, 45.0, 50.0)], fleets=[])
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    assert tracker.counters["sun_crash"] == 1
+
+
+def test_resolve_target_hit_exclusive_and_captured():
+    tracker = HitRateTracker(player_id=0)
+    # 시작 위치는 엔진 규약대로 source planet radius+0.1 바깥이므로 source를 obs에 안 넣음
+    # Fleet at (20, 50), angle 0, ships 10 → new_pos ≈ (21.96, 50). Target at (22, 50) radius 3.
+    tracker.register_launches(
+        [_make_launch(0, 5, 10, 0.0, 20.0, 50.0)],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(
+        planets=[
+            _planet(5, 1, 22.0, 50.0, ships=1),  # enemy-owned, low ships
+        ],
+        fleets=[],
+    )
+    curr_obs = _obs(
+        planets=[
+            _planet(5, 0, 22.0, 50.0, ships=5),  # captured by us
+        ],
+        fleets=[],
+    )
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    assert tracker.counters["target_hit_exclusive"] == 1
+    assert tracker.counters["target_hit_ambiguous"] == 0
+    assert tracker.counters["captured_exclusive"] == 1
+
+
+def test_resolve_hit_other_when_wrong_planet():
+    tracker = HitRateTracker(player_id=0)
+    # Fleet intends target=9 but hits planet 5
+    tracker.register_launches(
+        [_make_launch(0, 9, 10, 0.0, 20.0, 50.0)],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(
+        planets=[
+            _planet(5, 1, 22.0, 50.0),
+            _planet(9, 1, 80.0, 50.0),
+        ],
+        fleets=[],
+    )
+    curr_obs = _obs(
+        planets=[
+            _planet(5, 1, 22.0, 50.0),
+            _planet(9, 1, 80.0, 50.0),
+        ],
+        fleets=[],
+    )
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    assert tracker.counters["hit_other_exclusive"] == 1
+    assert tracker.counters["target_hit_exclusive"] == 0
+
+
+def test_resolve_ambiguous_when_two_own_fleets_hit_same_planet():
+    tracker = HitRateTracker(player_id=0)
+    tracker.register_launches(
+        [
+            _make_launch(0, 5, 10, 0.0, 20.0, 50.0),
+            _make_launch(1, 5, 10, 0.0, 20.0, 50.1),
+        ],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(
+        planets=[_planet(5, 1, 22.0, 50.0, ships=1)],
+        fleets=[],
+    )
+    curr_obs = _obs(
+        planets=[_planet(5, 0, 22.0, 50.0, ships=19)],
+        fleets=[],
+    )
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    # 두 fleet 모두 planet 5 hit → ambiguous. target도 동일하므로 target_hit_ambiguous=2
+    assert tracker.counters["target_hit_ambiguous"] == 2
+    assert tracker.counters["target_hit_exclusive"] == 0
+    assert tracker.counters["captured_ambiguous"] == 2
+
+
+def test_resolve_ambiguous_when_enemy_fleet_hits_same_planet():
+    tracker = HitRateTracker(player_id=0)
+    tracker.register_launches(
+        [_make_launch(0, 5, 10, 0.0, 20.0, 50.0)],
+        next_fleet_id=1,
+    )
+    # 적 fleet (id=99, owner=1)가 prev_obs에서 같은 planet 5 쪽으로 날아가다 소멸
+    enemy_fleet = (99, 1, 20.0, 50.0, 0.0, 0, 10)
+    prev_obs = _obs(
+        planets=[_planet(5, -1, 22.0, 50.0, ships=3)],
+        fleets=[enemy_fleet],
+    )
+    curr_obs = _obs(
+        planets=[_planet(5, 0, 22.0, 50.0, ships=7)],
+        fleets=[],
+    )
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    # 내 fleet는 target 맞음, 하지만 enemy도 같이 붙어서 ambiguous
+    assert tracker.counters["target_hit_ambiguous"] == 1
+    assert tracker.counters["target_hit_exclusive"] == 0
+
+
+def test_resolve_keeps_alive_fleet_in_pending():
+    tracker = HitRateTracker(player_id=0)
+    tracker.register_launches(
+        [_make_launch(0, 5, 10, 0.0, 10.0, 10.0)],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(
+        planets=[_planet(5, 1, 90.0, 90.0)],
+        fleets=[],
+    )
+    # fleet 여전히 비행 중
+    curr_obs = _obs(
+        planets=[_planet(5, 1, 90.0, 90.0)],
+        fleets=[(1, 0, 11.96, 10.0, 0.0, 0, 10)],
+    )
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    assert 1 in tracker.pending
+    assert math.isclose(tracker.pending[1]["last_x"], 11.96)
+    # 아무 카운터도 증가하지 않아야 함
+    for k in ["out", "sun_crash", "target_hit_exclusive", "hit_other_exclusive"]:
+        assert tracker.counters[k] == 0

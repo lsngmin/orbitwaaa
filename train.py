@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from utils import TrainingLogger, save_checkpoint, load_checkpoint
+from utils.hit_tracker import HitRateTracker
 import yaml
 from collections import deque
 from kaggle_environments import make
@@ -126,6 +127,26 @@ def _snapshot_planet_owners(raw_obs):
     return result
 
 
+def _snapshot_obs_for_resolve(raw_obs):
+    """env.step() 직전 obs의 planets/fleets/next_fleet_id를 깊은 복사해 고정.
+
+    resolve_step이 prev_obs로 참조할 용도. env가 in-place mutate하므로 필수.
+    """
+    if isinstance(raw_obs, dict):
+        planets = raw_obs.get("planets", [])
+        fleets  = raw_obs.get("fleets", [])
+        nfid    = raw_obs.get("next_fleet_id", 0)
+    else:
+        planets = getattr(raw_obs, "planets", [])
+        fleets  = getattr(raw_obs, "fleets", [])
+        nfid    = getattr(raw_obs, "next_fleet_id", 0)
+    return {
+        "planets": [tuple(p) for p in planets],
+        "fleets":  [tuple(f) for f in fleets],
+        "next_fleet_id": nfid,
+    }
+
+
 def neutral_capture_bonus(prev_map, curr_raw_obs, player):
     """중립 행성 점령 보너스: production에 비례한 즉각 보상.
 
@@ -156,13 +177,19 @@ def neutral_capture_bonus(prev_map, curr_raw_obs, player):
 
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
 
-def decode_action_to_moves(action_np, raw_planets, av, acting_player):
+def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_counts=False):
     """Pure function: 샘플된 action_np → env moves 리스트. 모델 접근 없음.
 
     acting_player: 절대 owner ID (0 or 1). 행성 소유 판정에 사용.
+    return_counts: True면 (moves, counts, launches) 튜플 반환 (hit rate tracking용).
+        launches: moves와 1:1 대응하는 메타 dict 리스트 (source_id, target_id,
+        ships, angle, start_x, start_y). fleet_id 매핑/resolve_step 입력으로 사용.
     """
     planets = [Planet(*p) for p in raw_planets]
     moves   = []
+    launches = []
+    counts  = {"attempts": 0, "filtered_invalid_target": 0,
+               "filtered_zero_ships": 0, "filtered_sun": 0, "launched": 0}
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
@@ -173,20 +200,39 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player):
 
         if launch < 0.5:
             continue
+        counts["attempts"] += 1
+
         if target_idx >= len(planets) or planets[target_idx].owner == acting_player:
+            counts["filtered_invalid_target"] += 1
             continue
 
         target       = planets[target_idx]
         ships_needed = max(1, int(p.ships * ships_ratio))
         ships_needed = min(ships_needed, p.ships)
         if ships_needed <= 0:
+            counts["filtered_zero_ships"] += 1
             continue
 
         angle, tx, ty, _ = aim(p, target, av, ships_needed)
         if crosses_sun(p.x, p.y, tx, ty):
+            counts["filtered_sun"] += 1
             continue
 
+        counts["launched"] += 1
         moves.append([p.id, angle, ships_needed])
+        start_x = p.x + math.cos(angle) * (p.radius + 0.1)
+        start_y = p.y + math.sin(angle) * (p.radius + 0.1)
+        launches.append({
+            "source_id": p.id,
+            "target_id": target.id,
+            "ships": ships_needed,
+            "angle": angle,
+            "start_x": start_x,
+            "start_y": start_y,
+        })
+
+    if return_counts:
+        return moves, counts, launches
     return moves
 
 
@@ -225,6 +271,7 @@ def get_obs_tensor(raw_obs, player, history_p, history_f):
 def _collect_single(main_model, opponent_model, n_steps, device):
     obs_list, act_list, rew_list, done_list, logp_list, val_list = [], [], [], [], [], []
     logp_heads_list = []
+    hit_tracker = HitRateTracker()
     sum_dense = sum_cap = sum_terminal = 0.0
 
     env = make("orbit_wars", debug=False)
@@ -247,18 +294,25 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         with torch.no_grad():
             action_t, log_prob, value, lp_heads = main_model.get_action_and_value(obs_t.unsqueeze(0).to(device))
         action_np  = action_t.squeeze(0).cpu().numpy()
-        moves_main = decode_action_to_moves(action_np, raw_planets, av, acting_player=0)
+        moves_main, decode_counts, launches_main = decode_action_to_moves(
+            action_np, raw_planets, av, acting_player=0, return_counts=True,
+        )
+        hit_tracker.record(decode_counts)
 
         raw_obs_opp = env.state[1].observation
         obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
         moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
 
         # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
-        prev_map = _snapshot_planet_owners(env.state[0].observation)
+        prev_map      = _snapshot_planet_owners(env.state[0].observation)
+        prev_obs_snap = _snapshot_obs_for_resolve(env.state[0].observation)
+        hit_tracker.register_launches(launches_main, prev_obs_snap["next_fleet_id"])
         env.step([moves_main, moves_opp])
         done = env.done
 
         curr_obs_main  = env.state[0].observation
+        max_speed      = env.configuration.shipSpeed
+        hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
         curr_score     = (state_score(curr_obs_main, player=0)
                         - state_score(env.state[1].observation, player=1))
         dense_r        = dense_coef * (curr_score - prev_score)
@@ -288,6 +342,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         if done:
             env = make("orbit_wars", debug=False)
             env.reset()
+            hit_tracker.pending.clear()  # fleet id는 env 단위로 리셋됨
             prev_score    = (state_score(env.state[0].observation, player=0)
                            - state_score(env.state[1].observation, player=1))
             history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
@@ -311,6 +366,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "mean_dense":    sum_dense    / max(n_steps, 1),
         "mean_cap":      sum_cap      / max(n_steps, 1),
         "mean_terminal": sum_terminal / max(n_steps, 1),
+        **hit_tracker.summary(),
     }
     return (
         torch.stack(obs_list),
@@ -646,6 +702,21 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_dense_rew=rew_stats["mean_dense"],
                 mean_cap_bonus=rew_stats["mean_cap"],
                 mean_terminal_rew=rew_stats["mean_terminal"],
+                mean_attempts=rew_stats["mean_attempts"],
+                mean_launched=rew_stats["mean_launched"],
+                launch_rate=rew_stats["launch_rate"],
+                mean_filtered_invalid_target=rew_stats["mean_filtered_invalid_target"],
+                mean_filtered_zero_ships=rew_stats["mean_filtered_zero_ships"],
+                mean_filtered_sun=rew_stats["mean_filtered_sun"],
+                mean_out=rew_stats.get("mean_out", 0.0),
+                mean_sun_crash=rew_stats.get("mean_sun_crash", 0.0),
+                mean_target_hit_exclusive=rew_stats.get("mean_target_hit_exclusive", 0.0),
+                mean_target_hit_ambiguous=rew_stats.get("mean_target_hit_ambiguous", 0.0),
+                mean_hit_other_exclusive=rew_stats.get("mean_hit_other_exclusive", 0.0),
+                mean_hit_other_ambiguous=rew_stats.get("mean_hit_other_ambiguous", 0.0),
+                mean_captured_exclusive=rew_stats.get("mean_captured_exclusive", 0.0),
+                mean_captured_ambiguous=rew_stats.get("mean_captured_ambiguous", 0.0),
+                mean_unknown_removal=rew_stats.get("mean_unknown_removal", 0.0),
                 **head_metrics,
             )
 

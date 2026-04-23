@@ -23,6 +23,13 @@ class TrainingLogger:
             "kl_launch", "kl_ships", "kl_target",
             "cf_launch", "cf_ships", "cf_target",
             "mean_dense_rew", "mean_cap_bonus", "mean_terminal_rew",
+            "mean_attempts", "mean_launched", "launch_rate",
+            "mean_filtered_invalid_target", "mean_filtered_zero_ships", "mean_filtered_sun",
+            "mean_out", "mean_sun_crash",
+            "mean_target_hit_exclusive", "mean_target_hit_ambiguous",
+            "mean_hit_other_exclusive", "mean_hit_other_ambiguous",
+            "mean_captured_exclusive", "mean_captured_ambiguous",
+            "mean_unknown_removal",
             "win_rate", "league_size",
         ]
         with open(self.path, "w", newline="") as f:
@@ -46,6 +53,12 @@ class TrainingLogger:
         mean_dense  = kwargs.get("mean_dense_rew", "")
         mean_cap    = kwargs.get("mean_cap_bonus", "")
         mean_term   = kwargs.get("mean_terminal_rew", "")
+        mean_attempts = kwargs.get("mean_attempts", "")
+        mean_launched = kwargs.get("mean_launched", "")
+        launch_rate   = kwargs.get("launch_rate", "")
+        mean_filtered_invalid = kwargs.get("mean_filtered_invalid_target", "")
+        mean_filtered_zero    = kwargs.get("mean_filtered_zero_ships", "")
+        mean_filtered_sun     = kwargs.get("mean_filtered_sun", "")
         kl_l = kwargs.get("kl_launch", "")
         kl_s = kwargs.get("kl_ships", "")
         kl_t = kwargs.get("kl_target", "")
@@ -61,6 +74,24 @@ class TrainingLogger:
         head_str = (f" | klh=[{kl_l:.3f}/{kl_s:.3f}/{kl_t:.3f}]"
                     f" | cfh=[{cf_l:.2f}/{cf_s:.2f}/{cf_t:.2f}]"
                     ) if _is_num(kl_l) else ""
+        decode_str = (
+            f" | dec=[a={mean_attempts:.2f}/l={mean_launched:.2f}/r={launch_rate:.0%}"
+            f"/inv={mean_filtered_invalid:.2f}/z={mean_filtered_zero:.2f}/sun={mean_filtered_sun:.2f}]"
+        ) if _is_num(mean_attempts) else ""
+        mean_out        = kwargs.get("mean_out", "")
+        mean_sun_crash  = kwargs.get("mean_sun_crash", "")
+        mean_th_ex      = kwargs.get("mean_target_hit_exclusive", "")
+        mean_th_am      = kwargs.get("mean_target_hit_ambiguous", "")
+        mean_ho_ex      = kwargs.get("mean_hit_other_exclusive", "")
+        mean_ho_am      = kwargs.get("mean_hit_other_ambiguous", "")
+        mean_cap_ex     = kwargs.get("mean_captured_exclusive", "")
+        mean_cap_am     = kwargs.get("mean_captured_ambiguous", "")
+        hit_str = (
+            f" | hit=[out={mean_out:.2f}/sun={mean_sun_crash:.2f}"
+            f"/th={mean_th_ex:.2f}+{mean_th_am:.2f}"
+            f"/ho={mean_ho_ex:.2f}+{mean_ho_am:.2f}"
+            f"/cap={mean_cap_ex:.2f}+{mean_cap_am:.2f}]"
+        ) if _is_num(mean_out) else ""
         print(
             f"Gen {kwargs.get('generation', '?'):04d} | "
             f"steps={kwargs.get('total_steps', 0):,} | "
@@ -68,5 +99,5 @@ class TrainingLogger:
             f"p_loss={kwargs.get('policy_loss', 0):.4f} | "
             f"v_loss={kwargs.get('value_loss', 0):.4f} | "
             f"e_loss={kwargs.get('entropy_loss', 0):.4f}"
-            f"{kl_str}{ent_str}{rew_str}{head_str}{win_str}"
+            f"{kl_str}{ent_str}{rew_str}{head_str}{decode_str}{hit_str}{win_str}"
         )

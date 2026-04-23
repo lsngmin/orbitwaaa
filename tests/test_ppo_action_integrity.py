@@ -22,17 +22,18 @@ from env_wrapper import MAX_PLANETS
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 class FakePlanet:
-    def __init__(self, id, x, y, owner, ships, production, *args):
+    def __init__(self, id, x, y, owner, ships, production, radius=3.0, *args):
         self.id         = id
         self.x          = x
         self.y          = y
         self.owner      = owner
         self.ships      = ships
         self.production = production
+        self.radius     = radius
 
 
-def make_raw(id_, x, y, owner, ships=20, production=2):
-    return (id_, x, y, owner, ships, production)
+def make_raw(id_, x, y, owner, ships=20, production=2, radius=3.0):
+    return (id_, x, y, owner, ships, production, radius)
 
 
 # ── Unit test 2: decode correctness ──────────────────────────────────────────
@@ -188,9 +189,15 @@ def test_collect_single_stored_action_matches_decoded_moves():
         sampled_actions.append(action_t.squeeze(0).cpu().numpy().copy())
         return action_t, lp, v, lp_h
 
-    def tracing_decode(action_np, raw_planets, av, acting_player=0):
+    def tracing_decode(action_np, raw_planets, av, acting_player=0, return_counts=False):
         decoded_actions.append(action_np.copy())
-        return original_decode(action_np, raw_planets, av, acting_player=acting_player)
+        return original_decode(
+            action_np,
+            raw_planets,
+            av,
+            acting_player=acting_player,
+            return_counts=return_counts,
+        )
 
     model.get_action_and_value = tracing_sample
 
