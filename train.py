@@ -168,7 +168,7 @@ def get_obs_tensor(raw_obs, player, history_p, history_f):
         av          = getattr(raw_obs, "angular_velocity", 0)
         comet_ids   = set(getattr(raw_obs, "comet_planet_ids", []) or [])
 
-    history_p.append(encode_planets(raw_planets, raw_fleets, player, comet_ids))
+    history_p.append(encode_planets(raw_planets, raw_fleets, player, comet_ids, av))
     history_f.append(encode_fleets(raw_fleets, player))
 
     p_hist = np.stack(list(history_p), axis=0)

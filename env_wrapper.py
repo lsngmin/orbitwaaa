@@ -25,7 +25,7 @@ with open(_cfg_path) as f:
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
-PLANET_DIM   = 13  # +2: incoming을 ETA bin(near/mid)으로 분리
+PLANET_DIM   = 16  # +3: min_eta_norm, pred_x, pred_y 추가
 FLEET_DIM    = 7
 
 
@@ -33,13 +33,14 @@ ETA_NEAR = 5   # 1~5턴: 즉각 위협
 ETA_MID  = 15  # 6~15턴: 중기 계획
 
 
-def encode_planets(raw_planets, raw_fleets, player, comet_ids):
+def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=0.0):
     """행성 목록을 (MAX_PLANETS, PLANET_DIM) 배열로 인코딩."""
     from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
-    from prediction import is_orbiting, estimate_arrival_turn
+    from prediction import is_orbiting, estimate_arrival_turn, predict_position
 
-    planets = [Planet(*p) for p in raw_planets]
-    fleets  = [Fleet(*f) for f in raw_fleets]
+    planets    = [Planet(*p) for p in raw_planets]
+    fleets     = [Fleet(*f) for f in raw_fleets]
+    my_planets = [p for p in planets if p.owner == player]
 
     # 행성별 ETA bin 집계: near(1~5턴) / mid(6~15턴)
     enemy_near = {p.id: 0 for p in planets}
@@ -90,6 +91,20 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids):
         owner_me      = 1.0 if p.owner == player else 0.0
         owner_enemy   = 1.0 if p.owner not in (-1, player) else 0.0
         owner_neutral = 1.0 if p.owner == -1 else 0.0
+
+        # ETA feature: 내 행성 중 가장 가까운 곳에서 이 행성까지의 최소 ETA
+        min_eta = 50.0
+        if my_planets:
+            for src in my_planets:
+                dist = math.hypot(p.x - src.x, p.y - src.y)
+                eta_to = estimate_arrival_turn(dist, 50)  # 50 ships 기준 근사
+                if eta_to < min_eta:
+                    min_eta = float(eta_to)
+        min_eta_norm = min(min_eta / 50.0, 1.0)
+
+        # 예상 도착 위치: min_eta 턴 후 이 행성의 위치
+        pred_x, pred_y = predict_position(p, angular_velocity, int(min_eta))
+
         arr[i] = [
             p.x / 100.0,
             p.y / 100.0,
@@ -104,6 +119,10 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids):
             min(enemy_mid[p.id]  / 1000.0, 1.0),
             min(mine_near[p.id]  / 1000.0, 1.0),
             min(mine_mid[p.id]   / 1000.0, 1.0),
+            # ── 신규 ──
+            min_eta_norm,
+            pred_x / 100.0,
+            pred_y / 100.0,
         ]
     return arr
 
@@ -172,6 +191,7 @@ class OrbitWarsEnv(gym.Env):
         self._done   = False
         self._step   = 0
         self._planets_snapshot = []
+        self._av     = 0.0
 
     def _get_obs_raw(self):
         obs = self._env.state[self._player].observation
@@ -208,10 +228,12 @@ class OrbitWarsEnv(gym.Env):
             maxlen=HISTORY
         )
 
+        self._av = 0.0
+
         # 첫 관측
         self._env.reset()
         raw_planets, raw_fleets, comet_ids = self._current_obs()
-        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids))
+        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, self._av))
         self._fleet_history.append(encode_fleets(raw_fleets, self._player))
 
         return self._build_tensor(), {}
@@ -224,6 +246,7 @@ class OrbitWarsEnv(gym.Env):
         planets = [Planet(*p) for p in raw_planets]
         raw = self._get_obs_raw()
         av  = raw.get("angular_velocity", 0) if isinstance(raw, dict) else getattr(raw, "angular_velocity", 0)
+        self._av = av
 
         my_planets = [p for p in planets if p.owner == self._player]
         moves      = []
@@ -270,7 +293,7 @@ class OrbitWarsEnv(gym.Env):
 
         # 새 관측
         raw_planets, raw_fleets, comet_ids = self._current_obs()
-        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids))
+        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, self._av))
         self._fleet_history.append(encode_fleets(raw_fleets, self._player))
         obs = self._build_tensor()
 
