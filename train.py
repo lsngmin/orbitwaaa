@@ -108,30 +108,41 @@ def state_score(raw_obs, player):
     return total_ships * 0.01 + total_prod * 1.0 + planet_count * 2.0
 
 
-def neutral_capture_bonus(prev_raw_obs, curr_raw_obs, player):
-    """중립 행성 점령 보너스: production에 비례한 즉각 보상.
+def _snapshot_planet_owners(raw_obs):
+    """env.state observation → {planet_id: (owner, prod)} 딕셔너리.
 
-    이전 턴 중립(owner=-1) → 현재 내 행성(owner=player)으로 바뀐 경우만 적용.
-    생산성 높은 행성 점령일수록 큰 보상.
+    env.step() 전에 호출해서 in-place mutation을 방지한다.
     """
-    def _planets(raw):
-        if isinstance(raw, dict):
-            return raw.get("planets", [])
-        return getattr(raw, "planets", [])
-
-    prev_map = {}
-    for p in _planets(prev_raw_obs):
+    if isinstance(raw_obs, dict):
+        planets = raw_obs.get("planets", [])
+    else:
+        planets = getattr(raw_obs, "planets", [])
+    result = {}
+    for p in planets:
         pid   = p[0] if isinstance(p, (list, tuple)) else p.id
         owner = p[1] if isinstance(p, (list, tuple)) else p.owner
         prod  = p[6] if isinstance(p, (list, tuple)) else p.production
-        prev_map[pid] = (owner, prod)
+        result[pid] = (owner, prod)
+    return result
+
+
+def neutral_capture_bonus(prev_map, curr_raw_obs, player):
+    """중립 행성 점령 보너스: production에 비례한 즉각 보상.
+
+    prev_map: _snapshot_planet_owners()로 미리 추출한 {pid: (owner, prod)}.
+              env.step() 이후 참조 오염을 피하기 위해 raw_obs 직접 참조 대신 사용.
+    """
+    if isinstance(curr_raw_obs, dict):
+        curr_planets = curr_raw_obs.get("planets", [])
+    else:
+        curr_planets = getattr(curr_raw_obs, "planets", [])
 
     bonus = 0.0
-    for p in _planets(curr_raw_obs):
+    for p in curr_planets:
         pid   = p[0] if isinstance(p, (list, tuple)) else p.id
         owner = p[1] if isinstance(p, (list, tuple)) else p.owner
         prev_owner, prod = prev_map.get(pid, (-1, 0))
-        if prev_owner == -1 and owner == player:     # 중립 → 내 것
+        if prev_owner == -1 and owner == player:        # 중립 → 내 것
             bonus += prod * 0.1
         elif prev_owner == player and owner != player:  # 내 것 → 잃음
             bonus -= prod * 0.05
@@ -210,6 +221,7 @@ def get_obs_tensor(raw_obs, player, history_p, history_f):
 
 def _collect_single(main_model, opponent_model, n_steps, device):
     obs_list, act_list, rew_list, done_list, logp_list, val_list = [], [], [], [], [], []
+    sum_dense = sum_cap = sum_terminal = 0.0
 
     env = make("orbit_wars", debug=False)
     env.reset()
@@ -237,20 +249,28 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
         moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
 
-        prev_obs_main = env.state[0].observation
+        # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
+        prev_map = _snapshot_planet_owners(env.state[0].observation)
         env.step([moves_main, moves_opp])
         done = env.done
 
         curr_obs_main  = env.state[0].observation
         curr_score     = (state_score(curr_obs_main, player=0)
                         - state_score(env.state[1].observation, player=1))
-        cap_bonus      = neutral_capture_bonus(prev_obs_main, curr_obs_main, player=0)
-        reward         = dense_coef * (curr_score - prev_score) + cap_bonus
+        dense_r        = dense_coef * (curr_score - prev_score)
+        cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0)
+        terminal_r     = 0.0
+        reward         = dense_r + cap_bonus
         prev_score     = curr_score
 
         if done:
-            r      = env.state[0].reward
-            reward += 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
+            r          = env.state[0].reward
+            terminal_r = 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
+            reward    += terminal_r
+
+        sum_dense    += dense_r
+        sum_cap      += cap_bonus
+        sum_terminal += terminal_r
 
         obs_list.append(obs_t)
         act_list.append(action_t.squeeze(0).cpu())
@@ -282,12 +302,18 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     values  = torch.stack(val_list)
     advantages, returns = compute_gae(rewards, dones, values, last_value=last_value)
 
+    reward_stats = {
+        "mean_dense":    sum_dense    / max(n_steps, 1),
+        "mean_cap":      sum_cap      / max(n_steps, 1),
+        "mean_terminal": sum_terminal / max(n_steps, 1),
+    }
     return (
         torch.stack(obs_list),
         torch.stack(act_list),
         advantages,
         returns,
         torch.stack(logp_list),
+        reward_stats,
     )
 
 
@@ -339,12 +365,18 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
 
     results = pool.map(_rollout_worker, worker_args)
 
+    # reward_stats: worker별 평균을 다시 평균
+    keys = results[0][5].keys()
+    merged_stats = {
+        k: sum(r[5][k] for r in results) / len(results) for k in keys
+    }
     return (
         torch.cat([r[0] for r in results]),
         torch.cat([r[1] for r in results]),
         torch.cat([r[2] for r in results]),
         torch.cat([r[3] for r in results]),
         torch.cat([r[4] for r in results]),
+        merged_stats,
     )
 
 
@@ -554,7 +586,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 opponent   = league.sample_opponent()
                 match_type = "league"
 
-            obs, actions, advantages, returns, log_probs = collect_rollout(
+            obs, actions, advantages, returns, log_probs, rew_stats = collect_rollout(
                 main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
             )
             p_loss, v_loss, e_loss, approx_kl, clip_frac, epochs_done, ent_l, ent_s, ent_t = ppo_update(
@@ -564,7 +596,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
 
             exp_opp = copy.deepcopy(main_model)
             exp_opp.eval()
-            obs_e, act_e, adv_e, ret_e, logp_e = collect_rollout(
+            obs_e, act_e, adv_e, ret_e, logp_e, _ = collect_rollout(
                 exploiter, exp_opp, n_steps=max(1, rollout_steps // 2), n_envs=max(1, n_envs // 2), pool=pool
             )
             ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e)
@@ -575,6 +607,9 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 approx_kl=approx_kl, clip_frac=clip_frac, epochs_done=epochs_done,
                 ent_launch=ent_l, ent_ships=ent_s, ent_target=ent_t,
                 league_size=len(league),
+                mean_dense_rew=rew_stats["mean_dense"],
+                mean_cap_bonus=rew_stats["mean_cap"],
+                mean_terminal_rew=rew_stats["mean_terminal"],
             )
 
             if generation % eval_interval == 0:
