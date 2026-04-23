@@ -107,7 +107,7 @@ def test_decode_sun_blocked(mock_sun, mock_aim):
 def test_single_sample_per_step():
     """
     _collect_single에서 main agent의 get_action_and_value가
-    스텝당 정확히 1회만 호출되는지 확인.
+    스텝당 정확히 1회 + 마지막에 GAE bootstrap용 1회 호출되는지 확인.
     """
     from train import _collect_single
     from model import OrbitWarsPolicy
@@ -128,9 +128,10 @@ def test_single_sample_per_step():
     N_STEPS = 3
     _collect_single(model, None, n_steps=N_STEPS, device=device)
 
-    assert call_count[0] == N_STEPS, (
+    expected = N_STEPS + 1  # +1: last_value bootstrap for GAE truncation
+    assert call_count[0] == expected, (
         f"get_action_and_value called {call_count[0]} times for {N_STEPS} steps "
-        f"(expected {N_STEPS} — double sampling bug re-introduced?)"
+        f"(expected {expected} = steps + bootstrap — double sampling bug re-introduced?)"
     )
 
 
@@ -193,12 +194,16 @@ def test_collect_single_stored_action_matches_decoded_moves():
 
     model.get_action_and_value = tracing_sample
 
+    N_STEPS = 3
     with patch.object(train, "decode_action_to_moves", side_effect=tracing_decode):
-        _collect_single(model, None, n_steps=3, device=device)
+        _collect_single(model, None, n_steps=N_STEPS, device=device)
 
-    assert len(sampled_actions) == len(decoded_actions) == 3
+    # sampled: N_STEPS + 1 (마지막은 GAE bootstrap용, decode와 무관)
+    # decoded: N_STEPS
+    assert len(sampled_actions) == N_STEPS + 1
+    assert len(decoded_actions) == N_STEPS
 
-    for step, (sampled, decoded) in enumerate(zip(sampled_actions, decoded_actions)):
+    for step, (sampled, decoded) in enumerate(zip(sampled_actions[:N_STEPS], decoded_actions)):
         np.testing.assert_array_equal(
             sampled, decoded,
             err_msg=f"Step {step}: stored action_t ≠ decoded action (double-sampling bug)"

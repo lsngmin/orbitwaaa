@@ -92,7 +92,10 @@ def test_weights_change_after_update(model_and_opt):
 
 
 def test_multi_epoch_updates_more_than_single(model_and_opt):
-    """n_epochs=4가 n_epochs=1보다 가중치를 더 많이 움직이는지 확인."""
+    """n_epochs=4가 n_epochs=1보다 가중치를 더 많이 움직이는지 확인.
+
+    target_kl 조기 종료가 개입하지 않도록 None으로 비활성화하여 공정 비교.
+    """
     import copy
 
     m1, opt1 = model_and_opt
@@ -103,8 +106,10 @@ def test_multi_epoch_updates_more_than_single(model_and_opt):
 
     init_params = [p.clone() for p in m1.parameters()]
 
-    ppo_update(m1, opt1, obs, actions, old_lp, rets, advs, n_epochs=1, minibatch_size=N)
-    ppo_update(m2, opt2, obs, actions, old_lp, rets, advs, n_epochs=4, minibatch_size=N)
+    ppo_update(m1, opt1, obs, actions, old_lp, rets, advs,
+               n_epochs=1, minibatch_size=N, target_kl=None)
+    ppo_update(m2, opt2, obs, actions, old_lp, rets, advs,
+               n_epochs=4, minibatch_size=N, target_kl=None)
 
     delta1 = sum((p - i).abs().sum().item() for p, i in zip(m1.parameters(), init_params))
     delta2 = sum((p - i).abs().sum().item() for p, i in zip(m2.parameters(), init_params))
