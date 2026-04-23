@@ -1,5 +1,12 @@
 import math
 
+from kaggle_environments.envs.orbit_wars.orbit_wars import (
+    BOARD_SIZE,
+    CENTER,
+    SUN_RADIUS,
+    point_to_segment_distance,
+)
+
 CENTER_X = 50.0
 CENTER_Y = 50.0
 MAX_SPEED = 6.0
@@ -85,6 +92,49 @@ def sun_approach_distance(src_x, src_y, dst_x, dst_y):
     cx = src_x + t * dx
     cy = src_y + t * dy
     return math.hypot(cx - CENTER_X, cy - CENTER_Y)
+
+
+def first_collision_on_path(src_planet, angle, num_ships, planets, av,
+                            max_turns=120):
+    """launch 전 경로 유효성: 그 angle/ships로 날릴 때 첫 충돌을 예측.
+
+    엔진과 동일 순서로 체크: out → sun → planet direct.
+    각 flight turn t에서 planet 위치는 (t-1)번 회전한 상태로 본다
+    (엔진은 fleet movement 시점에 아직 그 step의 planet rotation이 적용 안 됨).
+    Sweep은 여기선 안 본다(첫 컷). Source 자기자신과의 충돌은 무시.
+
+    Returns:
+        (cause, planet_id_or_None) — cause ∈ {"out", "sun", "planet", "none"}
+    """
+    speed = fleet_speed(num_ships)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    cur_x = src_planet.x + cos_a * (src_planet.radius + 0.1)
+    cur_y = src_planet.y + sin_a * (src_planet.radius + 0.1)
+
+    for t in range(1, max_turns + 1):
+        new_x = cur_x + cos_a * speed
+        new_y = cur_y + sin_a * speed
+
+        if not (0.0 <= new_x <= BOARD_SIZE and 0.0 <= new_y <= BOARD_SIZE):
+            return ("out", None)
+
+        if point_to_segment_distance((CENTER, CENTER),
+                                     (cur_x, cur_y), (new_x, new_y)) < SUN_RADIUS:
+            return ("sun", None)
+
+        for planet in planets:
+            if planet.id == src_planet.id:
+                continue
+            px, py = predict_position(planet, av, t - 1)
+            if point_to_segment_distance((px, py),
+                                         (cur_x, cur_y), (new_x, new_y)) < planet.radius:
+                return ("planet", planet.id)
+
+        cur_x, cur_y = new_x, new_y
+
+    return ("none", None)
 
 
 def aim(src_planet, dst_planet, angular_velocity, num_ships):

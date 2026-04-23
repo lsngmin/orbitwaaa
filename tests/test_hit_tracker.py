@@ -62,7 +62,8 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
         # Third launched source only is sun-blocked.
         return x1 == 40.0
 
-    with patch("train.crosses_sun", side_effect=fake_crosses_sun):
+    with patch("train.crosses_sun", side_effect=fake_crosses_sun), \
+         patch("train.first_collision_on_path", return_value=("planet", 5)):
         moves, counts, launches = decode_action_to_moves(
             action_np, raw_planets, av=0.0, acting_player=0, return_counts=True
         )
@@ -78,6 +79,7 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
         "filtered_invalid_target": 1,
         "filtered_zero_ships": 1,
         "filtered_sun": 1,
+        "filtered_path": 0,
         "launched": 1,
     }
 

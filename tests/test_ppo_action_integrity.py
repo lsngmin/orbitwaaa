@@ -53,7 +53,8 @@ def test_decode_no_launch(mock_sun, mock_aim):
 @patch("train.Planet", FakePlanet)
 @patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
-def test_decode_launch_to_enemy(mock_sun, mock_aim):
+@patch("train.first_collision_on_path", return_value=("planet", 1))
+def test_decode_launch_to_enemy(mock_path, mock_sun, mock_aim):
     """launch >= 0.5, enemy target → move 1개 생성."""
     action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
     action_np[0, 0] = 1.0   # launch
@@ -141,7 +142,8 @@ def test_single_sample_per_step():
 @patch("train.Planet", FakePlanet)
 @patch("train.aim", return_value=(0.5, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
-def test_decode_is_pure_function(mock_sun, mock_aim):
+@patch("train.first_collision_on_path", return_value=("planet", 1))
+def test_decode_is_pure_function(mock_path, mock_sun, mock_aim):
     """
     동일한 action_np 입력 → 동일한 moves 출력.
     decode_action_to_moves가 외부 상태에 의존하지 않음을 확인.

@@ -25,6 +25,7 @@ class TrainingLogger:
             "mean_dense_rew", "mean_cap_bonus", "mean_terminal_rew",
             "mean_attempts", "mean_launched", "launch_rate",
             "mean_filtered_invalid_target", "mean_filtered_zero_ships", "mean_filtered_sun",
+            "mean_filtered_path",
             "mean_out", "mean_sun_crash",
             "mean_target_hit_exclusive", "mean_target_hit_ambiguous",
             "mean_hit_other_exclusive", "mean_hit_other_ambiguous",
@@ -59,6 +60,7 @@ class TrainingLogger:
         mean_filtered_invalid = kwargs.get("mean_filtered_invalid_target", "")
         mean_filtered_zero    = kwargs.get("mean_filtered_zero_ships", "")
         mean_filtered_sun     = kwargs.get("mean_filtered_sun", "")
+        mean_filtered_path    = kwargs.get("mean_filtered_path", "")
         kl_l = kwargs.get("kl_launch", "")
         kl_s = kwargs.get("kl_ships", "")
         kl_t = kwargs.get("kl_target", "")
@@ -76,7 +78,8 @@ class TrainingLogger:
                     ) if _is_num(kl_l) else ""
         decode_str = (
             f" | dec=[a={mean_attempts:.2f}/l={mean_launched:.2f}/r={launch_rate:.0%}"
-            f"/inv={mean_filtered_invalid:.2f}/z={mean_filtered_zero:.2f}/sun={mean_filtered_sun:.2f}]"
+            f"/inv={mean_filtered_invalid:.2f}/z={mean_filtered_zero:.2f}/sun={mean_filtered_sun:.2f}"
+            f"/path={mean_filtered_path:.2f}]"
         ) if _is_num(mean_attempts) else ""
         mean_out        = kwargs.get("mean_out", "")
         mean_sun_crash  = kwargs.get("mean_sun_crash", "")

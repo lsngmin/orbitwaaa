@@ -30,7 +30,7 @@ import multiprocessing as mp
 
 from model import OrbitWarsPolicy
 from env_wrapper import encode_planets, encode_fleets, MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY
-from prediction import aim, crosses_sun
+from prediction import aim, crosses_sun, first_collision_on_path
 
 with open("config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -189,7 +189,8 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_cou
     moves   = []
     launches = []
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
-               "filtered_zero_ships": 0, "filtered_sun": 0, "launched": 0}
+               "filtered_zero_ships": 0, "filtered_sun": 0,
+               "filtered_path": 0, "launched": 0}
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
@@ -213,9 +214,17 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_cou
             counts["filtered_zero_ships"] += 1
             continue
 
-        angle, tx, ty, _ = aim(p, target, av, ships_needed)
+        angle, tx, ty, turns = aim(p, target, av, ships_needed)
         if crosses_sun(p.x, p.y, tx, ty):
             counts["filtered_sun"] += 1
+            continue
+
+        max_turns = min((turns or 0) + 2, 120) if turns else 120
+        cause, hit_pid = first_collision_on_path(
+            p, angle, ships_needed, planets, av, max_turns=max_turns,
+        )
+        if cause != "planet" or hit_pid != target.id:
+            counts["filtered_path"] += 1
             continue
 
         counts["launched"] += 1
@@ -708,6 +717,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_filtered_invalid_target=rew_stats["mean_filtered_invalid_target"],
                 mean_filtered_zero_ships=rew_stats["mean_filtered_zero_ships"],
                 mean_filtered_sun=rew_stats["mean_filtered_sun"],
+                mean_filtered_path=rew_stats.get("mean_filtered_path", 0.0),
                 mean_out=rew_stats.get("mean_out", 0.0),
                 mean_sun_crash=rew_stats.get("mean_sun_crash", 0.0),
                 mean_target_hit_exclusive=rew_stats.get("mean_target_hit_exclusive", 0.0),
