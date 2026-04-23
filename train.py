@@ -195,7 +195,7 @@ def _opp_moves(opponent_model, obs_tensor, raw_planets, av, device):
     if opponent_model is None:
         return []
     with torch.no_grad():
-        action, _, _ = opponent_model.get_action_and_value(obs_tensor.unsqueeze(0).to(device))
+        action, *_ = opponent_model.get_action_and_value(obs_tensor.unsqueeze(0).to(device))
     return decode_action_to_moves(action.squeeze(0).cpu().numpy(), raw_planets, av, acting_player=1)
 
 

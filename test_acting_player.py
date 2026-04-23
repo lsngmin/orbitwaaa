@@ -240,7 +240,7 @@ def test_smoke_both_players_act():
         while not env.done:
             obs_t, raw_p, av = get_obs_tensor(env.state[0].observation, 0, hp, hf)
             with torch.no_grad():
-                action_t, _, _ = main_model.get_action_and_value(obs_t.unsqueeze(0))
+                action_t, *_ = main_model.get_action_and_value(obs_t.unsqueeze(0))
             moves_main = decode_action_to_moves(
                 action_t.squeeze(0).cpu().numpy(), raw_p, av, acting_player=0
             )

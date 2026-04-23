@@ -62,10 +62,11 @@ def test_forward_output_shapes(model):
 def test_get_action_and_value_shapes(model):
     """get_action_and_value 출력 shape 확인."""
     obs = torch.randn(2, OBS_DIM)
-    action, log_prob, value = model.get_action_and_value(obs)
+    action, log_prob, value, lp_heads = model.get_action_and_value(obs)
     assert action.shape   == (2, MAX_PLANETS, ACTION_DIM)
     assert log_prob.shape == (2,)
     assert value.shape    == (2, 1)
+    assert lp_heads.shape == (2, 3)
 
 
 def test_planet_gradient_does_not_flow_to_fleet_temporal(model):
