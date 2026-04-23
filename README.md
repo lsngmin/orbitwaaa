@@ -57,9 +57,9 @@ score = W_PRODUCTION * production
 - 서버 64코어 병렬 처리
 
 **prediction.py 주요 기능:**
-- `aim()`: 궤도 행성 도착 시점 위치 수렴 계산 (10회 반복)
-- `crosses_sun()`: 선분-원 교차 판정으로 태양 충돌 체크 (버퍼 반경 13)
-- `fleet_speed()`: ships 수 기반 로그 스케일 속도 계산
+- `aim()`: 궤도 행성 도착 시점 위치 수렴 계산 (10회 반복) — `(angle, tx, ty, turns)` 반환
+- `crosses_sun()`: 선분-원 교차 판정으로 태양 충돌 체크 (버퍼 반경 10.5, 룰 10 + 0.5 epsilon)
+- `fleet_speed()`: ships 수 기반 로그 스케일 속도 계산 (엔진 캡 `min(speed, MAX_SPEED)` 반영)
 
 ### Phase 2 — PPO + League Training (학습 중)
 

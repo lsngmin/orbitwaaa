@@ -38,7 +38,7 @@ def make_raw(id_, x, y, owner, ships=20, production=2):
 # ── Unit test 2: decode correctness ──────────────────────────────────────────
 
 @patch("train.Planet", FakePlanet)
-@patch("train.aim", return_value=math.pi / 4)
+@patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 def test_decode_no_launch(mock_sun, mock_aim):
     """launch < 0.5 → 빈 moves."""
@@ -50,7 +50,7 @@ def test_decode_no_launch(mock_sun, mock_aim):
 
 
 @patch("train.Planet", FakePlanet)
-@patch("train.aim", return_value=math.pi / 4)
+@patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 def test_decode_launch_to_enemy(mock_sun, mock_aim):
     """launch >= 0.5, enemy target → move 1개 생성."""
@@ -69,7 +69,7 @@ def test_decode_launch_to_enemy(mock_sun, mock_aim):
 
 
 @patch("train.Planet", FakePlanet)
-@patch("train.aim", return_value=math.pi / 4)
+@patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 def test_decode_own_planet_target_skipped(mock_sun, mock_aim):
     """target이 내 행성이면 move 생성 안 함."""
@@ -86,7 +86,7 @@ def test_decode_own_planet_target_skipped(mock_sun, mock_aim):
 
 
 @patch("train.Planet", FakePlanet)
-@patch("train.aim", return_value=math.pi / 4)
+@patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=True)  # 태양 차단
 def test_decode_sun_blocked(mock_sun, mock_aim):
     """crosses_sun=True → move 생성 안 함."""
@@ -137,7 +137,7 @@ def test_single_sample_per_step():
 # ── Trace integrity: action_t가 moves의 유일한 원천인지 확인 ─────────────────
 
 @patch("train.Planet", FakePlanet)
-@patch("train.aim", return_value=0.5)
+@patch("train.aim", return_value=(0.5, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 def test_decode_is_pure_function(mock_sun, mock_aim):
     """

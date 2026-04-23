@@ -97,17 +97,17 @@ def test_far_fleet_not_counted():
 
 # ── PLANET_DIM 상수 확인 ──────────────────────────────────────────────────────
 
-def test_planet_dim_is_13():
-    """PLANET_DIM이 13인지 확인 (ETA bin 추가 반영)."""
-    assert PLANET_DIM == 13
+def test_planet_dim_is_18():
+    """PLANET_DIM이 18인지 확인 (ETA + 궤도 예측 + 태양 위험도 feature 반영)."""
+    assert PLANET_DIM == 18
 
 
 def test_encode_planets_output_shape():
-    """encode_planets 출력이 (MAX_PLANETS, 13) shape인지 확인."""
+    """encode_planets 출력이 (MAX_PLANETS, 18) shape인지 확인."""
     from env_wrapper import MAX_PLANETS
     planet = make_planet(0, owner=PLAYER)
     arr = encode_planets([planet], [], player=PLAYER, comet_ids=set())
-    assert arr.shape == (MAX_PLANETS, 13)
+    assert arr.shape == (MAX_PLANETS, 18)
 
 
 # ── P1 회귀: fleet는 레이 상 첫 번째 행성에만 집계 ───────────────────────────

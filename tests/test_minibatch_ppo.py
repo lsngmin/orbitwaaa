@@ -2,7 +2,8 @@
 Minibatch PPO 검증 테스트.
 
 - n_epochs * ceil(N/minibatch_size) 횟수만큼 업데이트 발생
-- 반환값 5개 (p_loss, v_loss, e_loss, approx_kl, clip_frac) shape/type 확인
+- 반환값 9개 (p_loss, v_loss, e_loss, approx_kl, clip_frac,
+  epochs_done, ent_launch, ent_ships, ent_target) shape/type 확인
 - approx_kl >= 0, clip_frac in [0, 1]
 - 동일 데이터 single-pass 대비 weights가 실제로 달라지는지 확인
 - NaN/Inf 없는지 smoke test
@@ -39,21 +40,22 @@ def model_and_opt():
     return m, opt
 
 
-def test_ppo_update_returns_five_values(model_and_opt):
-    """ppo_update가 5개 값을 반환하는지 확인."""
+def test_ppo_update_returns_nine_values(model_and_opt):
+    """ppo_update가 9개 값을 반환하는지 확인."""
     m, opt = model_and_opt
     obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     result = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
                         n_epochs=1, minibatch_size=N)
-    assert len(result) == 5
+    assert len(result) == 9
 
 
 def test_approx_kl_nonnegative(model_and_opt):
     """approx_kl >= 0 (KL divergence 하한)."""
     m, opt = model_and_opt
     obs, actions, old_lp, rets, advs = make_dummy_batch(m)
-    _, _, _, approx_kl, _ = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
-                                        n_epochs=1, minibatch_size=N)
+    _, _, _, approx_kl, _, _, _, _, _ = ppo_update(
+        m, opt, obs, actions, old_lp, rets, advs,
+        n_epochs=1, minibatch_size=N)
     assert approx_kl >= 0, f"approx_kl={approx_kl} < 0"
 
 
@@ -61,8 +63,9 @@ def test_clip_frac_in_range(model_and_opt):
     """clip_frac in [0, 1]."""
     m, opt = model_and_opt
     obs, actions, old_lp, rets, advs = make_dummy_batch(m)
-    _, _, _, _, clip_frac = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
-                                        n_epochs=1, minibatch_size=N)
+    _, _, _, _, clip_frac, _, _, _, _ = ppo_update(
+        m, opt, obs, actions, old_lp, rets, advs,
+        n_epochs=1, minibatch_size=N)
     assert 0.0 <= clip_frac <= 1.0, f"clip_frac={clip_frac} out of range"
 
 

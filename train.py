@@ -177,9 +177,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player):
         if ships_needed <= 0:
             continue
 
-        angle = aim(p, target, av, ships_needed)
-        tx = p.x + math.cos(angle) * math.hypot(target.x - p.x, target.y - p.y)
-        ty = p.y + math.sin(angle) * math.hypot(target.x - p.x, target.y - p.y)
+        angle, tx, ty, _ = aim(p, target, av, ships_needed)
         if crosses_sun(p.x, p.y, tx, ty):
             continue
 

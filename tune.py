@@ -102,9 +102,7 @@ def make_agent(weights):
                 if available < ships_needed:
                     continue
 
-                a = aim(mine, t, av, ships_needed)
-                tx = mine.x + _math.cos(a) * _math.hypot(t.x - mine.x, t.y - mine.y)
-                ty = mine.y + _math.sin(a) * _math.hypot(t.x - mine.x, t.y - mine.y)
+                a, tx, ty, _ = aim(mine, t, av, ships_needed)
                 if crosses_sun(mine.x, mine.y, tx, ty):
                     continue
 

@@ -32,10 +32,11 @@ def predict_position(planet, angular_velocity, turns):
 
 
 def fleet_speed(num_ships):
-    """ships 수에 따른 fleet 속도."""
+    """ships 수에 따른 fleet 속도. 엔진은 min(speed, MAX_SPEED)로 캡."""
     if num_ships <= 1:
         return 1.0
-    return 1.0 + (MAX_SPEED - 1.0) * (math.log(num_ships) / math.log(1000)) ** 1.5
+    speed = 1.0 + (MAX_SPEED - 1.0) * (math.log(num_ships) / math.log(1000)) ** 1.5
+    return min(speed, MAX_SPEED)
 
 
 def estimate_arrival_turn(distance, num_ships):
@@ -44,7 +45,7 @@ def estimate_arrival_turn(distance, num_ships):
     return math.ceil(distance / speed)
 
 
-def crosses_sun(src_x, src_y, dst_x, dst_y, sun_radius=13.0):
+def crosses_sun(src_x, src_y, dst_x, dst_y, sun_radius=10.5):
     """fleet 직선 경로가 태양(중심 50,50)을 통과하는지 체크. 선분-원 교차 판정."""
     dx = dst_x - src_x
     dy = dst_y - src_y
@@ -52,6 +53,9 @@ def crosses_sun(src_x, src_y, dst_x, dst_y, sun_radius=13.0):
     fy = src_y - CENTER_Y
 
     a = dx * dx + dy * dy
+    if a == 0:
+        # 선분이 아닌 점 — 점과 태양 거리만 비교
+        return fx * fx + fy * fy <= sun_radius * sun_radius
     b = 2 * (fx * dx + fy * dy)
     c = fx * fx + fy * fy - sun_radius * sun_radius
 
@@ -85,13 +89,16 @@ def sun_approach_distance(src_x, src_y, dst_x, dst_y):
 
 def aim(src_planet, dst_planet, angular_velocity, num_ships):
     """
-    dst_planet에 fleet이 도착할 시점의 위치를 예측해서 각도 반환.
+    dst_planet에 fleet이 도착할 시점의 위치를 예측해서
+    (angle, arrival_x, arrival_y, turns) 반환.
     정적 행성은 현재 위치 그대로 조준.
     """
     if not is_orbiting(dst_planet):
         dx = dst_planet.x - src_planet.x
         dy = dst_planet.y - src_planet.y
-        return math.atan2(dy, dx)
+        dist = math.hypot(dx, dy)
+        turns = estimate_arrival_turn(dist, num_ships)
+        return math.atan2(dy, dx), dst_planet.x, dst_planet.y, turns
 
     dist = math.hypot(dst_planet.x - src_planet.x, dst_planet.y - src_planet.y)
     turns = estimate_arrival_turn(dist, num_ships)
@@ -105,4 +112,4 @@ def aim(src_planet, dst_planet, angular_velocity, num_ships):
         turns = new_turns
 
     tx, ty = predict_position(dst_planet, angular_velocity, turns)
-    return math.atan2(ty - src_planet.y, tx - src_planet.x)
+    return math.atan2(ty - src_planet.y, tx - src_planet.x), tx, ty, turns

@@ -61,14 +61,9 @@ def find_angle(src, dst, av, num_ships):
     조준 각도 반환. 태양이 막으면 None.
     fleet은 직선만 이동 가능 — 우회 불가.
     """
-    angle = aim(src, dst, av, num_ships)
-
-    # aim()이 수렴한 목표 위치로 태양 충돌 체크
-    tx = src.x + math.cos(angle) * math.hypot(dst.x - src.x, dst.y - src.y)
-    ty = src.y + math.sin(angle) * math.hypot(dst.x - src.x, dst.y - src.y)
+    angle, tx, ty, _ = aim(src, dst, av, num_ships)
     if crosses_sun(src.x, src.y, tx, ty):
         return None
-
     return angle
 
 

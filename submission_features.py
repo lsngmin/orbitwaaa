@@ -75,9 +75,12 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
         owner_neutral = 1.0 if p.owner == -1 else 0.0
 
         # ETA feature: 내 행성 중 가장 가까운 곳에서 이 행성까지의 최소 ETA
+        # 자기 자신은 스킵 (공격 대상이 아님 → 거리 0이면 feature 무의미)
         min_eta = 50.0
         if my_planets:
             for src in my_planets:
+                if src.id == p.id:
+                    continue
                 dist = math.hypot(p.x - src.x, p.y - src.y)
                 eta_to = estimate_arrival_turn(dist, 50)  # 50 ships 기준 근사
                 if eta_to < min_eta:
@@ -87,11 +90,13 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
         # 예상 도착 위치: min_eta 턴 후 이 행성의 위치
         pred_x, pred_y = predict_position(p, angular_velocity, int(min_eta))
 
-        # 태양 위험도: 내 행성 → 이 행성 경로 기준
+        # 태양 위험도: 내 행성 → 이 행성 경로 기준 (자기 자신은 스킵)
         sun_block = 0.0
         sun_dist_min = 50.0
         if my_planets:
             for src in my_planets:
+                if src.id == p.id:
+                    continue
                 sd = sun_approach_distance(src.x, src.y, pred_x, pred_y)
                 if sd < sun_dist_min:
                     sun_dist_min = sd
