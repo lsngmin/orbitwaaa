@@ -66,6 +66,23 @@ def crosses_sun(src_x, src_y, dst_x, dst_y, sun_radius=13.0):
     return (0 <= t1 <= 1) or (0 <= t2 <= 1)
 
 
+def sun_approach_distance(src_x, src_y, dst_x, dst_y):
+    """src → dst 경로에서 태양 중심(50, 50)까지의 최소 거리 반환.
+    선분과 점 사이의 최소 거리 (t를 [0,1] 클램핑)."""
+    dx = dst_x - src_x
+    dy = dst_y - src_y
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        return math.hypot(src_x - CENTER_X, src_y - CENTER_Y)
+    fx = src_x - CENTER_X
+    fy = src_y - CENTER_Y
+    t = -(fx * dx + fy * dy) / length_sq
+    t = max(0.0, min(1.0, t))
+    cx = src_x + t * dx
+    cy = src_y + t * dy
+    return math.hypot(cx - CENTER_X, cy - CENTER_Y)
+
+
 def aim(src_planet, dst_planet, angular_velocity, num_ships):
     """
     dst_planet에 fleet이 도착할 시점의 위치를 예측해서 각도 반환.

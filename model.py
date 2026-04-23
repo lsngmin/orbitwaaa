@@ -32,7 +32,7 @@ NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
-PLANET_DIM      = 16  # +3: min_eta_norm, pred_x, pred_y 추가
+PLANET_DIM      = 18  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
 FLEET_DIM       = 7
 ACTION_DIM      = MAX_PLANETS + 2  # 발사여부 + ships비율 + 타겟 logits
 

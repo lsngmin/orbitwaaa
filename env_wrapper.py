@@ -25,7 +25,7 @@ with open(_cfg_path) as f:
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
-PLANET_DIM   = 16  # +3: min_eta_norm, pred_x, pred_y 추가
+PLANET_DIM   = 18  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
 FLEET_DIM    = 7
 
 
@@ -36,7 +36,7 @@ ETA_MID  = 15  # 6~15턴: 중기 계획
 def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=0.0):
     """행성 목록을 (MAX_PLANETS, PLANET_DIM) 배열로 인코딩."""
     from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
-    from prediction import is_orbiting, estimate_arrival_turn, predict_position
+    from prediction import is_orbiting, estimate_arrival_turn, predict_position, crosses_sun, sun_approach_distance
 
     planets    = [Planet(*p) for p in raw_planets]
     fleets     = [Fleet(*f) for f in raw_fleets]
@@ -105,6 +105,18 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
         # 예상 도착 위치: min_eta 턴 후 이 행성의 위치
         pred_x, pred_y = predict_position(p, angular_velocity, int(min_eta))
 
+        # 태양 위험도: 내 행성 → 이 행성 경로 기준
+        sun_block = 0.0
+        sun_dist_min = 50.0
+        if my_planets:
+            for src in my_planets:
+                sd = sun_approach_distance(src.x, src.y, pred_x, pred_y)
+                if sd < sun_dist_min:
+                    sun_dist_min = sd
+                if crosses_sun(src.x, src.y, pred_x, pred_y):
+                    sun_block = 1.0
+        sun_dist_norm = min(sun_dist_min / 50.0, 1.0)
+
         arr[i] = [
             p.x / 100.0,
             p.y / 100.0,
@@ -119,10 +131,13 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
             min(enemy_mid[p.id]  / 1000.0, 1.0),
             min(mine_near[p.id]  / 1000.0, 1.0),
             min(mine_mid[p.id]   / 1000.0, 1.0),
-            # ── 신규 ──
+            # ── ETA / 궤도 ──
             min_eta_norm,
             pred_x / 100.0,
             pred_y / 100.0,
+            # ── 태양 위험도 ──
+            sun_block,
+            sun_dist_norm,
         ]
     return arr
 
