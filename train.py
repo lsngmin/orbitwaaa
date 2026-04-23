@@ -131,7 +131,12 @@ def neutral_capture_bonus(prev_map, curr_raw_obs, player):
 
     prev_map: _snapshot_planet_owners()로 미리 추출한 {pid: (owner, prod)}.
               env.step() 이후 참조 오염을 피하기 위해 raw_obs 직접 참조 대신 사용.
+
+    계수는 config.yaml의 training.cap_bonus_gain / cap_bonus_loss로 관리.
     """
+    gain_coef = T.get("cap_bonus_gain", 0.05)
+    loss_coef = T.get("cap_bonus_loss", 0.025)
+
     if isinstance(curr_raw_obs, dict):
         curr_planets = curr_raw_obs.get("planets", [])
     else:
@@ -143,9 +148,9 @@ def neutral_capture_bonus(prev_map, curr_raw_obs, player):
         owner = p[1] if isinstance(p, (list, tuple)) else p.owner
         prev_owner, prod = prev_map.get(pid, (-1, 0))
         if prev_owner == -1 and owner == player:        # 중립 → 내 것
-            bonus += prod * 0.1
+            bonus += prod * gain_coef
         elif prev_owner == player and owner != player:  # 내 것 → 잃음
-            bonus -= prod * 0.05
+            bonus -= prod * loss_coef
     return bonus
 
 

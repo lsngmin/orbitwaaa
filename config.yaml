@@ -23,6 +23,8 @@ training:
   vf_coef: 0.5          # Critic loss 가중치
   max_grad_norm: 0.5    # gradient clipping
   dense_reward_coef: 0.02   # dense reward 계수 (0이면 terminal-only)
+  cap_bonus_gain: 0.05      # 중립 → 내 점령 시 prod * 이 값 보너스 (0이면 비활성)
+  cap_bonus_loss: 0.025     # 내 → 상실 시 prod * 이 값 페널티 (0이면 비활성)
 
 env:
   max_planets: 40
