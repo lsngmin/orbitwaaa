@@ -177,10 +177,16 @@ def neutral_capture_bonus(prev_map, curr_raw_obs, player):
 
 # ── Action masking ───────────────────────────────────────────────────────────
 
-def build_action_masks(raw_planets, acting_player):
-    """구조적 불가능 action 마스크 (padding/own target/self-loop/ships=0).
+def build_action_masks(raw_planets, av, acting_player):
+    """구조적 + path viability action 마스크.
 
-    path viability는 포함하지 않음 (v1) — decode safety filter에서 계속 처리.
+    v2: sun cut + path viability까지 포함. 순차 cascade로 비용 최소화.
+      1. padding/self/own target 조기 컷 (O(1))
+      2. crosses_sun(src, tgt) 조기 컷 (O(1), aim 없음)
+      3. first_collision_on_path(ships_rep=src.ships) — 대표값 1회 sim
+
+    ships_rep 선택: src.ships (최대) — 빠른 속도/긴 세그먼트로 permissive 쪽.
+    decode safety filter는 유지 (mean_filtered_* 로 residual 검증).
 
     Returns:
         launch_mask: (MAX_PLANETS,) bool
@@ -191,22 +197,28 @@ def build_action_masks(raw_planets, acting_player):
     launch_mask  = torch.zeros(MAX_PLANETS, dtype=torch.bool)
     target_mask  = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
 
-    for i in range(num_real):
-        for j in range(num_real):
-            if i == j:
+    for i, src in enumerate(planets):
+        if src.owner != acting_player or src.ships <= 0:
+            continue
+        for j, tgt in enumerate(planets):
+            if i == j or tgt.owner == acting_player:
                 continue
-            if planets[j].owner == acting_player:
+            if crosses_sun(src.x, src.y, tgt.x, tgt.y):
                 continue
-            target_mask[i, j] = True
+            ships_rep = int(src.ships)
+            angle, tx, ty, turns = aim(src, tgt, av, ships_rep)
+            max_turns = min((turns or 0) + 2, 120) if turns else 120
+            cause, hit_pid = first_collision_on_path(
+                src, angle, ships_rep, planets, av, max_turns=max_turns,
+            )
+            if cause == "planet" and hit_pid == tgt.id:
+                target_mask[i, j] = True
 
     for i, src in enumerate(planets):
-        if src.owner != acting_player:
+        if src.owner != acting_player or src.ships <= 0:
             continue
-        if src.ships <= 0:
-            continue
-        if not target_mask[i].any():
-            continue
-        launch_mask[i] = True
+        if target_mask[i].any():
+            launch_mask[i] = True
 
     # All-false row fallback: Categorical NaN 방지용 self 허용
     # (launch_mask[i]=False이므로 launch=0으로 게이팅되어 학습 영향 없음)
@@ -291,7 +303,7 @@ def _opp_moves(opponent_model, obs_tensor, raw_planets, av, device):
     """상대(player 1) 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
     if opponent_model is None:
         return []
-    lm_opp, tm_opp = build_action_masks(raw_planets, acting_player=1)
+    lm_opp, tm_opp = build_action_masks(raw_planets, av, acting_player=1)
     with torch.no_grad():
         action, *_ = opponent_model.get_action_and_value(
             obs_tensor.unsqueeze(0).to(device),
@@ -348,7 +360,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         raw_obs_main = env.state[0].observation
         obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
-        launch_mask, target_mask = build_action_masks(raw_planets, acting_player=0)
+        launch_mask, target_mask = build_action_masks(raw_planets, av, acting_player=0)
         with torch.no_grad():
             action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
                 obs_t.unsqueeze(0).to(device),
@@ -416,8 +428,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
     # rollout 마지막 다음 상태의 critic value (non-terminal bootstrap용)
     last_raw = env.state[0].observation
-    last_obs_t, last_raw_planets, _ = get_obs_tensor(last_raw, 0, history_p, history_f)
-    last_lm, last_tm = build_action_masks(last_raw_planets, acting_player=0)
+    last_obs_t, last_raw_planets, last_av = get_obs_tensor(last_raw, 0, history_p, history_f)
+    last_lm, last_tm = build_action_masks(last_raw_planets, last_av, acting_player=0)
     with torch.no_grad():
         _, _, last_value, _ = main_model.get_action_and_value(
             last_obs_t.unsqueeze(0).to(device),
@@ -683,7 +695,7 @@ def evaluate(main_model, opponent_model, n_games=20):
         while not env.done:
             raw_main = env.state[0].observation
             obs_t, raw_p, av = get_obs_tensor(raw_main, 0, history_p, history_f)
-            lm_e, tm_e = build_action_masks(raw_p, acting_player=0)
+            lm_e, tm_e = build_action_masks(raw_p, av, acting_player=0)
             with torch.no_grad():
                 action_t, _, _, _ = main_model.get_action_and_value(
                     obs_t.unsqueeze(0).to(DEVICE),
