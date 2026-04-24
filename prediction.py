@@ -38,6 +38,47 @@ def predict_position(planet, angular_velocity, turns):
     return x, y
 
 
+class PositionCache:
+    """Step-local 캐시: planet-level 상수 + (pid, turn)→(x, y) 메모이즈.
+
+    같은 obs(같은 av)에서 mask/decode가 반복적으로 predict_position을 호출하는
+    핫스팟을 제거. step 시작에 만들고 step 끝에 폐기 (av가 step마다 바뀔 수 있고
+    planet.x/y도 step마다 obs로 새로 들어옴).
+
+    `predict()` 시그니처는 `predict_position(planet, av, turns)`와 동일한 결과.
+    """
+
+    __slots__ = ("av", "_meta", "_pos")
+
+    def __init__(self, planets, av):
+        self.av    = av
+        self._meta = {}   # pid -> (orbiting, r, init_angle, x, y)
+        self._pos  = {}   # (pid, turns) -> (x, y), 공전 행성만 캐시
+        for p in planets:
+            r        = math.hypot(p.x - CENTER_X, p.y - CENTER_Y)
+            orbiting = (r + p.radius < 50.0)
+            ia       = math.atan2(p.y - CENTER_Y, p.x - CENTER_X)
+            self._meta[p.id] = (orbiting, r, ia, p.x, p.y)
+
+    def predict(self, planet, turns):
+        meta = self._meta.get(planet.id)
+        if meta is None:
+            # planet not pre-registered (e.g. mid-step new entity) — fallback.
+            return predict_position(planet, self.av, turns)
+        orbiting, r, ia, px, py = meta
+        if not orbiting:
+            return px, py
+        key    = (planet.id, turns)
+        cached = self._pos.get(key)
+        if cached is not None:
+            return cached
+        angle = ia + self.av * turns
+        x = CENTER_X + r * math.cos(angle)
+        y = CENTER_Y + r * math.sin(angle)
+        self._pos[key] = (x, y)
+        return x, y
+
+
 def fleet_speed(num_ships):
     """ships 수에 따른 fleet 속도. 엔진은 min(speed, MAX_SPEED)로 캡."""
     if num_ships <= 1:
@@ -95,13 +136,15 @@ def sun_approach_distance(src_x, src_y, dst_x, dst_y):
 
 
 def first_collision_on_path(src_planet, angle, num_ships, planets, av,
-                            max_turns=120):
+                            max_turns=120, pos_cache=None):
     """launch 전 경로 유효성: 그 angle/ships로 날릴 때 첫 충돌을 예측.
 
     엔진과 동일 순서로 체크: out → sun → planet direct.
     각 flight turn t에서 planet 위치는 (t-1)번 회전한 상태로 본다
     (엔진은 fleet movement 시점에 아직 그 step의 planet rotation이 적용 안 됨).
     Sweep은 여기선 안 본다(첫 컷). Source 자기자신과의 충돌은 무시.
+
+    pos_cache: PositionCache. None이면 직접 predict_position 호출 (테스트/단발용).
 
     Returns:
         (cause, planet_id_or_None) — cause ∈ {"out", "sun", "planet", "none"}
@@ -127,7 +170,10 @@ def first_collision_on_path(src_planet, angle, num_ships, planets, av,
         for planet in planets:
             if planet.id == src_planet.id:
                 continue
-            px, py = predict_position(planet, av, t - 1)
+            if pos_cache is not None:
+                px, py = pos_cache.predict(planet, t - 1)
+            else:
+                px, py = predict_position(planet, av, t - 1)
             if point_to_segment_distance((px, py),
                                          (cur_x, cur_y), (new_x, new_y)) < planet.radius:
                 return ("planet", planet.id)
@@ -137,11 +183,13 @@ def first_collision_on_path(src_planet, angle, num_ships, planets, av,
     return ("none", None)
 
 
-def aim(src_planet, dst_planet, angular_velocity, num_ships):
+def aim(src_planet, dst_planet, angular_velocity, num_ships, pos_cache=None):
     """
     dst_planet에 fleet이 도착할 시점의 위치를 예측해서
     (angle, arrival_x, arrival_y, turns) 반환.
     정적 행성은 현재 위치 그대로 조준.
+
+    pos_cache: PositionCache. None이면 직접 predict_position 호출.
     """
     if not is_orbiting(dst_planet):
         dx = dst_planet.x - src_planet.x
@@ -153,13 +201,23 @@ def aim(src_planet, dst_planet, angular_velocity, num_ships):
     dist = math.hypot(dst_planet.x - src_planet.x, dst_planet.y - src_planet.y)
     turns = estimate_arrival_turn(dist, num_ships)
 
-    for _ in range(10):
+    if pos_cache is not None:
+        _predict = pos_cache.predict
+        for _ in range(10):
+            tx, ty = _predict(dst_planet, turns)
+            dist = math.hypot(tx - src_planet.x, ty - src_planet.y)
+            new_turns = estimate_arrival_turn(dist, num_ships)
+            if new_turns == turns:
+                break
+            turns = new_turns
+        tx, ty = _predict(dst_planet, turns)
+    else:
+        for _ in range(10):
+            tx, ty = predict_position(dst_planet, angular_velocity, turns)
+            dist = math.hypot(tx - src_planet.x, ty - src_planet.y)
+            new_turns = estimate_arrival_turn(dist, num_ships)
+            if new_turns == turns:
+                break
+            turns = new_turns
         tx, ty = predict_position(dst_planet, angular_velocity, turns)
-        dist = math.hypot(tx - src_planet.x, ty - src_planet.y)
-        new_turns = estimate_arrival_turn(dist, num_ships)
-        if new_turns == turns:
-            break
-        turns = new_turns
-
-    tx, ty = predict_position(dst_planet, angular_velocity, turns)
     return math.atan2(ty - src_planet.y, tx - src_planet.x), tx, ty, turns

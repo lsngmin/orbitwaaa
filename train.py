@@ -30,7 +30,7 @@ import multiprocessing as mp
 
 from model import OrbitWarsPolicy
 from env_wrapper import encode_planets, encode_fleets, MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY
-from prediction import aim, crosses_sun, first_collision_on_path
+from prediction import aim, crosses_sun, first_collision_on_path, PositionCache
 
 with open("config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -196,6 +196,7 @@ def build_action_masks(raw_planets, av, acting_player):
     num_real     = len(planets)
     launch_mask  = torch.zeros(MAX_PLANETS, dtype=torch.bool)
     target_mask  = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
+    pos_cache    = PositionCache(planets, av)
 
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
@@ -206,10 +207,11 @@ def build_action_masks(raw_planets, av, acting_player):
             if crosses_sun(src.x, src.y, tgt.x, tgt.y):
                 continue
             ships_rep = int(src.ships)
-            angle, tx, ty, turns = aim(src, tgt, av, ships_rep)
+            angle, tx, ty, turns = aim(src, tgt, av, ships_rep, pos_cache=pos_cache)
             max_turns = min((turns or 0) + 2, 120) if turns else 120
             cause, hit_pid = first_collision_on_path(
                 src, angle, ships_rep, planets, av, max_turns=max_turns,
+                pos_cache=pos_cache,
             )
             if cause == "planet" and hit_pid == tgt.id:
                 target_mask[i, j] = True
@@ -245,6 +247,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_cou
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
                "filtered_zero_ships": 0, "filtered_sun": 0,
                "filtered_path": 0, "launched": 0}
+    pos_cache = PositionCache(planets, av)
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
@@ -268,7 +271,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_cou
             counts["filtered_zero_ships"] += 1
             continue
 
-        angle, tx, ty, turns = aim(p, target, av, ships_needed)
+        angle, tx, ty, turns = aim(p, target, av, ships_needed, pos_cache=pos_cache)
         if crosses_sun(p.x, p.y, tx, ty):
             counts["filtered_sun"] += 1
             continue
@@ -276,6 +279,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_cou
         max_turns = min((turns or 0) + 2, 120) if turns else 120
         cause, hit_pid = first_collision_on_path(
             p, angle, ships_needed, planets, av, max_turns=max_turns,
+            pos_cache=pos_cache,
         )
         if cause != "planet" or hit_pid != target.id:
             counts["filtered_path"] += 1
