@@ -142,12 +142,19 @@ class OrbitWarsPolicy(nn.Module):
 
         return action_logits, value
 
-    def get_action_and_value(self, obs_flat):
-        """PPO 학습용: 행동 샘플링 + log_prob + value."""
+    def get_action_and_value(self, obs_flat, launch_mask=None, target_mask=None):
+        """PPO 학습용: 행동 샘플링 + log_prob + value.
+
+        launch_mask: (B, P) bool — False 위치의 launch=1 확률을 0으로 강제.
+        target_mask: (B, P, P) bool — False 위치의 target 선택 확률을 0으로 강제.
+        launch_active로 ships/target log_prob 게이팅.
+        """
         action_logits, value = self.forward(obs_flat)
 
-        # 발사 여부 (Bernoulli)
+        # 발사 여부 (Bernoulli) — mask 적용
         launch_logits = action_logits[:, :, 0]
+        if launch_mask is not None:
+            launch_logits = launch_logits.masked_fill(~launch_mask, -1e9)
         launch_dist   = torch.distributions.Bernoulli(logits=launch_logits)
         launch        = launch_dist.sample()
 
@@ -156,14 +163,16 @@ class OrbitWarsPolicy(nn.Module):
         ships_dist    = torch.distributions.Normal(ships_mean, 0.1)
         ships_ratio   = ships_dist.sample().clamp(0.0, 1.0)
 
-        # 타겟 선택 (Categorical)
+        # 타겟 선택 (Categorical) — mask 적용
         target_logits = action_logits[:, :, 2:]
+        if target_mask is not None:
+            target_logits = target_logits.masked_fill(~target_mask, -1e9)
         target_dist   = torch.distributions.Categorical(logits=target_logits)
         target        = target_dist.sample()
 
         lp_launch = launch_dist.log_prob(launch).sum(-1)
-        lp_ships  = ships_dist.log_prob(ships_ratio).sum(-1)
-        lp_target = target_dist.log_prob(target).sum(-1)
+        lp_ships  = (ships_dist.log_prob(ships_ratio) * launch).sum(-1)
+        lp_target = (target_dist.log_prob(target) * launch).sum(-1)
         log_prob  = lp_launch + lp_ships + lp_target
 
         # action 합치기: (B, P, P+2)
@@ -178,27 +187,38 @@ class OrbitWarsPolicy(nn.Module):
         lp_heads = torch.stack([lp_launch, lp_ships, lp_target], dim=-1)
         return action, log_prob, value, lp_heads
 
-    def evaluate_actions(self, obs_flat, actions):
-        """PPO 업데이트용: 주어진 행동의 log_prob + entropy + value."""
+    def evaluate_actions(self, obs_flat, actions, launch_mask=None, target_mask=None):
+        """PPO 업데이트용: 주어진 행동의 log_prob + entropy + value.
+
+        rollout 시 사용한 것과 동일한 mask를 전달해야 importance ratio가 유효함.
+        """
         action_logits, value = self.forward(obs_flat)
 
         launch      = actions[:, :, 0]
         ships_ratio = actions[:, :, 1]
         target      = actions[:, :, 2:].argmax(dim=-1)
 
-        launch_dist = torch.distributions.Bernoulli(logits=action_logits[:, :, 0])
+        launch_logits = action_logits[:, :, 0]
+        if launch_mask is not None:
+            launch_logits = launch_logits.masked_fill(~launch_mask, -1e9)
+        launch_dist = torch.distributions.Bernoulli(logits=launch_logits)
+
         ships_mean  = torch.sigmoid(action_logits[:, :, 1])
         ships_dist  = torch.distributions.Normal(ships_mean, 0.1)
-        target_dist = torch.distributions.Categorical(logits=action_logits[:, :, 2:])
+
+        target_logits = action_logits[:, :, 2:]
+        if target_mask is not None:
+            target_logits = target_logits.masked_fill(~target_mask, -1e9)
+        target_dist = torch.distributions.Categorical(logits=target_logits)
 
         lp_launch = launch_dist.log_prob(launch).sum(-1)
-        lp_ships  = ships_dist.log_prob(ships_ratio).sum(-1)
-        lp_target = target_dist.log_prob(target).sum(-1)
+        lp_ships  = (ships_dist.log_prob(ships_ratio) * launch).sum(-1)
+        lp_target = (target_dist.log_prob(target) * launch).sum(-1)
         log_prob  = lp_launch + lp_ships + lp_target
 
         ent_launch = launch_dist.entropy().sum(-1)
-        ent_ships  = ships_dist.entropy().sum(-1)
-        ent_target = target_dist.entropy().sum(-1)
+        ent_ships  = (ships_dist.entropy() * launch).sum(-1)
+        ent_target = (target_dist.entropy() * launch).sum(-1)
         entropy    = ent_launch + ent_ships + ent_target
 
         lp_heads = torch.stack([lp_launch, lp_ships, lp_target], dim=-1)

@@ -175,6 +175,48 @@ def neutral_capture_bonus(prev_map, curr_raw_obs, player):
     return bonus
 
 
+# ── Action masking ───────────────────────────────────────────────────────────
+
+def build_action_masks(raw_planets, acting_player):
+    """구조적 불가능 action 마스크 (padding/own target/self-loop/ships=0).
+
+    path viability는 포함하지 않음 (v1) — decode safety filter에서 계속 처리.
+
+    Returns:
+        launch_mask: (MAX_PLANETS,) bool
+        target_mask: (MAX_PLANETS, MAX_PLANETS) bool
+    """
+    planets      = [Planet(*p) for p in raw_planets[:MAX_PLANETS]]
+    num_real     = len(planets)
+    launch_mask  = torch.zeros(MAX_PLANETS, dtype=torch.bool)
+    target_mask  = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
+
+    for i in range(num_real):
+        for j in range(num_real):
+            if i == j:
+                continue
+            if planets[j].owner == acting_player:
+                continue
+            target_mask[i, j] = True
+
+    for i, src in enumerate(planets):
+        if src.owner != acting_player:
+            continue
+        if src.ships <= 0:
+            continue
+        if not target_mask[i].any():
+            continue
+        launch_mask[i] = True
+
+    # All-false row fallback: Categorical NaN 방지용 self 허용
+    # (launch_mask[i]=False이므로 launch=0으로 게이팅되어 학습 영향 없음)
+    for i in range(MAX_PLANETS):
+        if not target_mask[i].any():
+            target_mask[i, i] = True
+
+    return launch_mask, target_mask
+
+
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
 
 def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_counts=False):
@@ -249,8 +291,13 @@ def _opp_moves(opponent_model, obs_tensor, raw_planets, av, device):
     """상대(player 1) 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
     if opponent_model is None:
         return []
+    lm_opp, tm_opp = build_action_masks(raw_planets, acting_player=1)
     with torch.no_grad():
-        action, *_ = opponent_model.get_action_and_value(obs_tensor.unsqueeze(0).to(device))
+        action, *_ = opponent_model.get_action_and_value(
+            obs_tensor.unsqueeze(0).to(device),
+            launch_mask=lm_opp.unsqueeze(0).to(device),
+            target_mask=tm_opp.unsqueeze(0).to(device),
+        )
     return decode_action_to_moves(action.squeeze(0).cpu().numpy(), raw_planets, av, acting_player=1)
 
 
@@ -280,6 +327,7 @@ def get_obs_tensor(raw_obs, player, history_p, history_f):
 def _collect_single(main_model, opponent_model, n_steps, device):
     obs_list, act_list, rew_list, done_list, logp_list, val_list = [], [], [], [], [], []
     logp_heads_list = []
+    launch_mask_list, target_mask_list = [], []
     hit_tracker = HitRateTracker()
     sum_dense = sum_cap = sum_terminal = 0.0
 
@@ -300,8 +348,13 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         raw_obs_main = env.state[0].observation
         obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
+        launch_mask, target_mask = build_action_masks(raw_planets, acting_player=0)
         with torch.no_grad():
-            action_t, log_prob, value, lp_heads = main_model.get_action_and_value(obs_t.unsqueeze(0).to(device))
+            action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
+                obs_t.unsqueeze(0).to(device),
+                launch_mask=launch_mask.unsqueeze(0).to(device),
+                target_mask=target_mask.unsqueeze(0).to(device),
+            )
         action_np  = action_t.squeeze(0).cpu().numpy()
         moves_main, decode_counts, launches_main = decode_action_to_moves(
             action_np, raw_planets, av, acting_player=0, return_counts=True,
@@ -346,6 +399,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         logp_list.append(log_prob.squeeze(0).cpu())
         logp_heads_list.append(lp_heads.squeeze(0).cpu())
         val_list.append(value.squeeze(0).cpu())
+        launch_mask_list.append(launch_mask)
+        target_mask_list.append(target_mask)
 
         step += 1
         if done:
@@ -361,9 +416,14 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
     # rollout 마지막 다음 상태의 critic value (non-terminal bootstrap용)
     last_raw = env.state[0].observation
-    last_obs_t, _, _ = get_obs_tensor(last_raw, 0, history_p, history_f)
+    last_obs_t, last_raw_planets, _ = get_obs_tensor(last_raw, 0, history_p, history_f)
+    last_lm, last_tm = build_action_masks(last_raw_planets, acting_player=0)
     with torch.no_grad():
-        _, _, last_value, _ = main_model.get_action_and_value(last_obs_t.unsqueeze(0).to(device))
+        _, _, last_value, _ = main_model.get_action_and_value(
+            last_obs_t.unsqueeze(0).to(device),
+            launch_mask=last_lm.unsqueeze(0).to(device),
+            target_mask=last_tm.unsqueeze(0).to(device),
+        )
     last_value = last_value.squeeze().cpu()
 
     rewards = torch.stack(rew_list)
@@ -384,6 +444,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         returns,
         torch.stack(logp_list),
         torch.stack(logp_heads_list),
+        torch.stack(launch_mask_list),
+        torch.stack(target_mask_list),
         reward_stats,
     )
 
@@ -436,10 +498,10 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
 
     results = pool.map(_rollout_worker, worker_args)
 
-    # reward_stats: worker별 평균을 다시 평균
-    keys = results[0][6].keys()
+    # reward_stats: worker별 평균을 다시 평균 (index 8)
+    keys = results[0][8].keys()
     merged_stats = {
-        k: sum(r[6][k] for r in results) / len(results) for k in keys
+        k: sum(r[8][k] for r in results) / len(results) for k in keys
     }
     return (
         torch.cat([r[0] for r in results]),
@@ -448,6 +510,8 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
         torch.cat([r[3] for r in results]),
         torch.cat([r[4] for r in results]),
         torch.cat([r[5] for r in results]),
+        torch.cat([r[6] for r in results]),
+        torch.cat([r[7] for r in results]),
         merged_stats,
     )
 
@@ -496,7 +560,7 @@ def compute_gae(rewards, dones, values, last_value=0.0, gamma=T["gamma"], lam=T[
 
 
 def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantages,
-               old_logp_heads=None,
+               old_logp_heads=None, launch_masks=None, target_masks=None,
                clip_range=T["clip_range"], n_epochs=T["n_epochs"], minibatch_size=T["minibatch_size"],
                target_kl=T.get("target_kl")):
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -508,6 +572,10 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
     returns       = returns.to(DEVICE)
     if old_logp_heads is not None:
         old_logp_heads = old_logp_heads.to(DEVICE)
+    if launch_masks is not None:
+        launch_masks = launch_masks.to(DEVICE)
+    if target_masks is not None:
+        target_masks = target_masks.to(DEVICE)
 
     N = len(obs)
     p_losses, v_losses, e_losses = [], [], []
@@ -523,7 +591,11 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
         for start in range(0, N, minibatch_size):
             mb = idx[start:start + minibatch_size]
 
-            log_probs, entropy, values, ent_l, ent_s, ent_t, lp_heads = model.evaluate_actions(obs[mb], actions[mb])
+            lm_mb = launch_masks[mb] if launch_masks is not None else None
+            tm_mb = target_masks[mb] if target_masks is not None else None
+            log_probs, entropy, values, ent_l, ent_s, ent_t, lp_heads = model.evaluate_actions(
+                obs[mb], actions[mb], launch_mask=lm_mb, target_mask=tm_mb,
+            )
 
             ratio        = (log_probs - old_log_probs[mb]).exp()
             adv_mb       = advantages[mb]
@@ -611,8 +683,13 @@ def evaluate(main_model, opponent_model, n_games=20):
         while not env.done:
             raw_main = env.state[0].observation
             obs_t, raw_p, av = get_obs_tensor(raw_main, 0, history_p, history_f)
+            lm_e, tm_e = build_action_masks(raw_p, acting_player=0)
             with torch.no_grad():
-                action_t, _, _, _ = main_model.get_action_and_value(obs_t.unsqueeze(0).to(DEVICE))
+                action_t, _, _, _ = main_model.get_action_and_value(
+                    obs_t.unsqueeze(0).to(DEVICE),
+                    launch_mask=lm_e.unsqueeze(0).to(DEVICE),
+                    target_mask=tm_e.unsqueeze(0).to(DEVICE),
+                )
             moves_main = decode_action_to_moves(action_t.squeeze(0).cpu().numpy(), raw_p, av, acting_player=0)
 
             raw_opp = env.state[1].observation
@@ -685,22 +762,22 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 opponent   = league.sample_opponent()
                 match_type = "league"
 
-            obs, actions, advantages, returns, log_probs, logp_heads, rew_stats = collect_rollout(
+            obs, actions, advantages, returns, log_probs, logp_heads, lmasks, tmasks, rew_stats = collect_rollout(
                 main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
             )
             p_loss, v_loss, e_loss, approx_kl, clip_frac, epochs_done, ent_l, ent_s, ent_t, head_metrics = ppo_update(
                 main_model, optimizer, obs, actions, log_probs, returns, advantages,
-                old_logp_heads=logp_heads,
+                old_logp_heads=logp_heads, launch_masks=lmasks, target_masks=tmasks,
             )
             total_steps += len(obs)
 
             exp_opp = copy.deepcopy(main_model)
             exp_opp.eval()
-            obs_e, act_e, adv_e, ret_e, logp_e, logp_heads_e, _ = collect_rollout(
+            obs_e, act_e, adv_e, ret_e, logp_e, logp_heads_e, lmasks_e, tmasks_e, _ = collect_rollout(
                 exploiter, exp_opp, n_steps=max(1, rollout_steps // 2), n_envs=max(1, n_envs // 2), pool=pool
             )
             ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e,
-                       old_logp_heads=logp_heads_e)
+                       old_logp_heads=logp_heads_e, launch_masks=lmasks_e, target_masks=tmasks_e)
 
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
