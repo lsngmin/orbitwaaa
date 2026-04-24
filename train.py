@@ -43,6 +43,13 @@ with open("config.yaml") as f:
 T  = CFG["training"]
 SP = CFG["selfplay"]
 
+# opponent_mix 합 검증 — fallthrough 설계 버그(마지막 분기 unconditional) 방지.
+# 합이 1 미만이면 남은 확률이 전부 exploiter로 쏠리고, 초과면 exploiter가 squeeze됨.
+_mix_sum = sum(SP["opponent_mix"].values())
+assert abs(_mix_sum - 1.0) < 1e-3, (
+    f"config.yaml opponent_mix 합이 1이 아님: {SP['opponent_mix']} → sum={_mix_sum:.4f}"
+)
+
 # 기본값 — __main__ 에서 CLI 인자로 덮어씀
 DEVICE   = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 SAVE_DIR = "checkpoints"
@@ -704,21 +711,28 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
 
 # ── Phase 기반 self-play 비율 ─────────────────────────────────────────────────
 
-def _self_play_prob(total_steps: int, league_size: int) -> float:
-    """total_steps + league_size 기준으로 self-play 확률 반환.
+def _sample_opponent(main_model, exploiter, league):
+    """opponent_mix 비율로 self/league/exploiter 중 하나 샘플.
 
-    league_size < phase_min_league : early 강제 (pool 다양성 부족)
-    total_steps < phase_early_steps: early  — self 0.8 / league 0.2
-    total_steps < phase_mid_steps  : mid    — self 0.6 / league 0.4
-    그 이후                         : late   — self 0.4 / league 0.6
+    league.sample_opponent()이 None(비어 있음)이면 그 턴의 league 몫을 self로
+    재할당 — 초반 pool 빌 때 분포가 main 자신과 완전히 동떨어지지 않도록.
+    fallback은 "self"와 구분되는 별도 라벨("self_fallback")로 기록해
+    "초반 self 비율이 높다"는 오해를 방지한다.
+    반환: (opponent_model, match_type) — match_type ∈ {self, self_fallback, league, exploiter}.
     """
-    if league_size == 0:
-        return 1.0
-    if league_size < SP["phase_min_league"] or total_steps < SP["phase_early_steps"]:
-        return 0.8
-    if total_steps < SP["phase_mid_steps"]:
-        return 0.6
-    return 0.4
+    mix = SP["opponent_mix"]
+    r   = random.random()
+    if r < mix["self"]:
+        opp = copy.deepcopy(main_model); opp.eval()
+        return opp, "self"
+    if r < mix["self"] + mix["league"]:
+        opp = league.sample_opponent()
+        if opp is None:
+            opp = copy.deepcopy(main_model); opp.eval()
+            return opp, "self_fallback"
+        return opp, "league"
+    opp = copy.deepcopy(exploiter); opp.eval()
+    return opp, "exploiter"
 
 
 # ── PPO 업데이트 ──────────────────────────────────────────────────────────────
@@ -954,6 +968,177 @@ def evaluate(main_model, opponent_model, n_games=20):
     return wins / n_games, split
 
 
+def _run_eval_game(p0_model, p1_model, tracker):
+    """한 게임 실행 — p0 시점 action을 tracker(HitRateTracker, player_id=0)에 누적.
+
+    rollout-style stats(under/sr/cap/by_tgt/combo …)를 모으기 위해 rollout과 동일한
+    pattern: decode.record → register_launches → env.step → resolve_step.
+    동시에 win/loss split용 per-game counter도 함께 반환.
+
+    evaluate_pair에서 같은 seed를 두 번 쓰면서 양쪽 모델을 p0 자리에 번갈아 세움.
+
+    return: (p0_reward ∈ {-1,0,1}, per_game_counters)
+    """
+    env = make("orbit_wars", debug=False)
+    env.reset()
+    tracker.reset_episode(env.state[0].observation)
+
+    history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+    history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+    history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+    history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+
+    game_launched = 0
+    game_under    = 0
+    game_sr_sum   = 0.0
+    game_under_e  = 0
+    game_enemy_l  = 0
+
+    while not env.done:
+        raw_obs_p0 = env.state[0].observation
+        obs_t, raw_p, av = get_obs_tensor(raw_obs_p0, 0, history_p, history_f)
+        analysis = analyze_action_space(raw_p, av, acting_player=0)
+        with torch.no_grad():
+            action_t, _, _, _ = p0_model.get_action_and_value(
+                obs_t.unsqueeze(0).to(DEVICE),
+                launch_mask=analysis.launch_mask.unsqueeze(0).to(DEVICE),
+                target_mask=analysis.target_mask.unsqueeze(0).to(DEVICE),
+            )
+        moves_p0, counts, launches = decode_action_to_moves(
+            action_t.squeeze(0).cpu().numpy(), raw_p, av,
+            acting_player=0, analysis=analysis, return_counts=True,
+        )
+        tracker.record(counts)
+
+        game_launched += counts.get("launched", 0)
+        game_under    += counts.get("under_invested_count", 0)
+        game_sr_sum   += counts.get("send_required_ratio_sum", 0.0)
+        game_under_e  += counts.get("under_invested_count_enemy", 0)
+        for l in launches:
+            if l.get("target_owner", -1) != -1:
+                game_enemy_l += 1
+
+        raw_obs_p1 = env.state[1].observation
+        obs_o, raw_po, avo = get_obs_tensor(raw_obs_p1, 1, history_p_opp, history_f_opp)
+        moves_p1 = _opp_moves(p1_model, obs_o, raw_po, avo, DEVICE)
+
+        prev_obs_snap = _snapshot_obs_for_resolve(raw_obs_p0)
+        tracker.register_launches(launches, prev_obs_snap["next_fleet_id"])
+        env.step([moves_p0, moves_p1])
+
+        curr_obs  = env.state[0].observation
+        max_speed = env.configuration.shipSpeed
+        tracker.resolve_step(prev_obs_snap, curr_obs, max_speed)
+
+    return env.state[0].reward, {
+        "launched":       game_launched,
+        "under":          game_under,
+        "sr_sum":         game_sr_sum,
+        "under_enemy":    game_under_e,
+        "enemy_launched": game_enemy_l,
+    }
+
+
+def evaluate_pair(model_a, model_b, n_pairs=10):
+    """Paired seat-swap eval: 같은 seed로 2게임씩 돌려 map-variance 제거.
+
+    각 pair:
+      Game 1: A=p0, B=p1 → A의 rollout-style stats 기록
+      Game 2: B=p0, A=p1 (같은 seed로 같은 맵 재생성) → B의 stats 기록
+    즉 A와 B 모두 "p0 자리에서 같은 맵"을 상대. win_rate/stats 비교가 깔끔.
+
+    orbit_wars env는 global `random` 모듈로 맵 생성하므로, env.reset() 직전
+    random.seed(...)를 고정하면 동일 맵이 나온다. random 상태는 호출 후 풀어줌
+    (외부 self-play loop의 샘플링에 영향 없게).
+
+    return dict:
+      a_win_rate, b_win_rate  — 각 모델의 seat-평균 승률 (p0+p1 양쪽 자리 결과 반영).
+                                모델 i의 WR = (i가 p0일 때 win) + (i가 p1일 때, 즉 상대가 p0
+                                이고 졌을 때)를 game 수로 나눈 값. 두 값은 draw 제외 시
+                                합이 1.0이 되도록 정의 (win_rate 컬럼 semantic 통일).
+      a_p0_win_rate, b_p0_win_rate — 각 모델의 p0 시점 승률 (first-player 편향 디버그용).
+      a_stats, b_stats        — HitRateTracker.summary() (rollout schema, p0 시점 수집).
+      a_split, b_split        — win/loss split (eval_under_* / eval_sr_*, p0 시점 수집).
+    """
+    tracker_a = HitRateTracker(player_id=0)
+    tracker_b = HitRateTracker(player_id=0)
+    # seat-평균 승률용(전 게임 합산)과 p0-only 승률(debug)을 분리해서 추적.
+    a_wins_total = b_wins_total = 0.0   # 양쪽 seat 전체 wins (2*n_pairs 게임 기준)
+    a_p0_wins    = b_p0_wins    = 0.0   # 각자 p0일 때 wins (n_pairs 게임 기준)
+
+    def _new_bucket():
+        return {
+            "under_cnt":       {"win": 0, "loss": 0},
+            "launched":        {"win": 0, "loss": 0},
+            "sr_sum":          {"win": 0.0, "loss": 0.0},
+            "under_enemy":     {"win": 0, "loss": 0},
+            "enemy_launched": {"win": 0, "loss": 0},
+        }
+
+    def _bucket_add(bucket, reward, pg):
+        if reward == 1:    key = "win"
+        elif reward == -1: key = "loss"
+        else:              return    # draw 제외 (noise)
+        bucket["under_cnt"][key]      += pg["under"]
+        bucket["launched"][key]       += pg["launched"]
+        bucket["sr_sum"][key]         += pg["sr_sum"]
+        bucket["under_enemy"][key]    += pg["under_enemy"]
+        bucket["enemy_launched"][key] += pg["enemy_launched"]
+
+    def _to_wins(reward):
+        if reward == 1:  return 1.0
+        if reward == 0:  return 0.5
+        return 0.0
+
+    def _split_from(b):
+        def _rate(n, d): return n / d if d > 0 else 0.0
+        return {
+            "eval_under_win":        _rate(b["under_cnt"]["win"],      b["launched"]["win"]),
+            "eval_under_loss":       _rate(b["under_cnt"]["loss"],     b["launched"]["loss"]),
+            "eval_sr_win":           _rate(b["sr_sum"]["win"],         b["launched"]["win"]),
+            "eval_sr_loss":          _rate(b["sr_sum"]["loss"],        b["launched"]["loss"]),
+            "eval_under_enemy_win":  _rate(b["under_enemy"]["win"],    b["enemy_launched"]["win"]),
+            "eval_under_enemy_loss": _rate(b["under_enemy"]["loss"],   b["enemy_launched"]["loss"]),
+        }
+
+    a_bucket = _new_bucket()
+    b_bucket = _new_bucket()
+    rng_state = random.getstate()
+    try:
+        for _ in range(n_pairs):
+            seed = random.randint(0, 2**31 - 1)
+
+            # Game 1: A=p0, B=p1. r_a는 A(p0)의 reward; B는 p1이므로 reward=-r_a.
+            random.seed(seed)
+            r_a, pg_a = _run_eval_game(model_a, model_b, tracker_a)
+            a_p0_wins    += _to_wins(r_a)
+            a_wins_total += _to_wins(r_a)     # A as p0
+            b_wins_total += _to_wins(-r_a)    # B as p1 (zero-sum 역수)
+            _bucket_add(a_bucket, r_a, pg_a)
+
+            # Game 2: B=p0, A=p1. 같은 seed → 같은 맵. r_b는 B(p0)의 reward.
+            random.seed(seed)
+            r_b, pg_b = _run_eval_game(model_b, model_a, tracker_b)
+            b_p0_wins    += _to_wins(r_b)
+            b_wins_total += _to_wins(r_b)     # B as p0
+            a_wins_total += _to_wins(-r_b)    # A as p1
+            _bucket_add(b_bucket, r_b, pg_b)
+    finally:
+        random.setstate(rng_state)
+
+    total_games = 2 * max(n_pairs, 1)   # 모델당 p0 + p1 각 n_pairs 게임
+    return {
+        "a_win_rate":    a_wins_total / total_games,    # seat-평균 (2*n_pairs 게임 기준)
+        "b_win_rate":    b_wins_total / total_games,    # a_win_rate + b_win_rate ≈ 1.0
+        "a_p0_win_rate": a_p0_wins / max(n_pairs, 1),   # p0-only (first-player 편향 확인용)
+        "b_p0_win_rate": b_p0_wins / max(n_pairs, 1),
+        "a_stats":       tracker_a.summary(),
+        "b_stats":       tracker_b.summary(),
+        "a_split":       _split_from(a_bucket),
+        "b_split":       _split_from(b_bucket),
+    }
+
+
 # ── Main Training Loop ────────────────────────────────────────────────────────
 
 def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, rollout_steps=None):
@@ -1002,14 +1187,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
             generation += 1
             gen_t0 = time.time()
 
-            self_prob  = _self_play_prob(total_steps, len(league))
-            if random.random() < self_prob:
-                opponent   = copy.deepcopy(main_model)
-                opponent.eval()
-                match_type = "self"
-            else:
-                opponent   = league.sample_opponent()
-                match_type = "league"
+            opponent, match_type = _sample_opponent(main_model, exploiter, league)
 
             obs, actions, advantages, returns, log_probs, logp_heads, lmasks, tmasks, rew_stats = collect_rollout(
                 main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
@@ -1120,6 +1298,38 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                     eval_wall_s=eval_wall_s,
                     gen_wall_s=gen_wall_s,
                     **eval_split,
+                )
+
+                # exploiter_eval: main vs exploiter 전용 모니터링.
+                #   exploiter_eval_main: main의 seat-평균 승률 + main 시점(p0) stats
+                #   exploiter_eval_opp : exploiter의 seat-평균 승률 + exploiter 시점(p0) stats
+                # win_rate 컬럼 semantic 통일 — 각 row의 win_rate는 "그 row 주체의
+                # 양쪽 seat 평균 승률 vs 상대". 두 값 합 ≈ 1.0 (draw 제외).
+                # stats/split는 여전히 "그 주체가 p0일 때" 수집 — 한쪽 seat stats지만
+                # 같은 맵이라 두 row 비교는 공정.
+                # evaluate_pair로 같은 seed에서 seat-swap paired 실행 → map-variance 제거.
+                # rollout-style stats(HitRateTracker) 포함 → training row(self/league/exploiter)와
+                # 같은 schema로 under/sr/cap/by_tgt/combo 직접 비교 가능.
+                # exploiter_reset 직전에 수행 — fresh exploiter 찍는 것 방지.
+                # n_pairs 절반: eval 비용 제한 (노이즈는 이동평균으로 읽을 것).
+                ee_pairs = max(2, n_games // 2)
+                ee_t0 = time.time()
+                pair = evaluate_pair(main_model, exploiter, n_pairs=ee_pairs)
+                ee_wall_s = time.time() - ee_t0
+                # eval_wall_s: pair 전체(2×n_pairs 게임) 총 시간을 _main row에만 1회 기록.
+                # _opp row는 비워둠 — 같은 값을 두 row에 찍으면 SUM/AVG 집계가 2배로 왜곡됨.
+                logger.log(
+                    generation=generation, total_steps=total_steps,
+                    match_type="exploiter_eval_main",
+                    win_rate=pair["a_win_rate"], league_size=len(league),
+                    eval_wall_s=ee_wall_s,
+                    **pair["a_stats"], **pair["a_split"],
+                )
+                logger.log(
+                    generation=generation, total_steps=total_steps,
+                    match_type="exploiter_eval_opp",
+                    win_rate=pair["b_win_rate"], league_size=len(league),
+                    **pair["b_stats"], **pair["b_split"],
                 )
 
                 exploiter_reset += 1

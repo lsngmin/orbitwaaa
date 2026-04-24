@@ -46,6 +46,13 @@ selfplay:
   eval_interval: 25     # N세대마다 main vs pool 승률 측정 — log/csv만, pool 편입엔 영향 없음
   win_threshold: 0.55   # (A policy 이후 gate 아님) log 비교용 reference로만 유지
   pool_size: 10         # 매 gen 편입 방식 — 시간 창 확보 위해 5→10 (pool이 덮는 gen 범위 2배)
-  phase_early_steps: 500000    # early → mid 전환 기준 total_steps
+  phase_early_steps: 500000    # early → mid 전환 기준 total_steps (phase_* 는 opponent_mix 도입 후 unused — 제거 예정)
   phase_mid_steps: 2000000     # mid → late 전환 기준 total_steps
   phase_min_league: 2          # early로 강제하는 최소 league 크기
+  # 3-way 상대 분포 (2026-04): main rollout 상대를 self/league/exploiter에서 샘플.
+  # league 비었거나 sample 실패 시 그 턴의 league 몫은 self로 재할당 (fallback).
+  # exploiter 효용은 exploiter_eval 로그로 관찰 후 비율 재조정.
+  opponent_mix:
+    self: 0.3333
+    league: 0.3333
+    exploiter: 0.3334
