@@ -92,53 +92,96 @@ def _history(player):
     return _HIST[player]
 
 
-# ── Action decoder (학습 decode 와 parity) ────────────────────────────────────
+# ── Action masks (학습 analyze_action_space 와 parity) ───────────────────────
 
-def _decode(action_logits_np, raw_planets, av, player):
-    """
-    action_logits_np: (MAX_PLANETS, ACTION_DIM) numpy, already on CPU.
-    학습 decode_action_to_moves 와 같은 필터 순서:
-      1) own planet + ships>0 아니면 skip
-      2) launch logit ≤ 0 → skip  (Bernoulli threshold 0.5 ≡ logit 0)
-      3) target argmax — 자기/아군은 사전 mask (argmax 에서 -inf 처리)
-      4) resolve_ships_for_capture → ships_needed
-      5) ships_needed <= 0 → skip
-      6) crosses_sun → skip
-    argmax (deterministic) — sample 대비 안정적.
-    """
-    from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
-    planets = [Planet(*p) for p in raw_planets]
-    moves = []
+def _build_masks(planets, player):
+    """학습 analyze_action_space 의 경량 버전.
 
-    # target mask: 자기(i==j) + 아군 행성 → -inf, 나머지는 그대로.
-    # crosses_sun 은 resolver 이후에 한 번 더 체크 (target 중심이 아닌 실제 aim 지점 기준).
-    n_planets = len(planets)
+    동일:
+      - target_mask[i,j]: i 가 own + j 가 non-own + crosses_sun 아님
+      - launch_mask[i]:   target_mask[i].any()
+      - all-false row fallback: target_mask[i,i]=True (Categorical NaN 방지)
+
+    생략: first_collision_on_path (aim 경로가 다른 행성을 먼저 맞을 가능성).
+    → 실제 launch 시 resolve_ships_for_capture + crosses_sun 필터로 2차 검증.
+      학습 mask 보다 살짝 permissive 하지만 decode 단계에서 걸러짐.
+    """
+    target_mask = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
+    launch_mask = torch.zeros(MAX_PLANETS, dtype=torch.bool)
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != player or p.ships <= 0:
             continue
-
-        launch_logit = float(action_logits_np[i, 0])
-        if launch_logit <= 0.0:
-            continue   # Bernoulli threshold — 학습 시 sample 이지만 inference 는 mode
-
-        # ships bin (K bins 중 argmax)
-        ships_bin = int(np.argmax(action_logits_np[i, 1:1 + NUM_SHIPS_BINS]))
-        multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
-
-        # target argmax — 아군/자기 는 -inf 로 masking
-        tgt_logits = action_logits_np[i, 1 + NUM_SHIPS_BINS:1 + NUM_SHIPS_BINS + n_planets].copy()
-        for j, tp in enumerate(planets):
+        for j, tp in enumerate(planets[:MAX_PLANETS]):
             if i == j or tp.owner == player:
-                tgt_logits[j] = -1e9
-        if not np.isfinite(tgt_logits).any() or tgt_logits.max() <= -1e8:
-            continue   # 전부 masked (단독 생존 등)
-        target_idx = int(np.argmax(tgt_logits))
-        target = planets[target_idx]
+                continue
+            if crosses_sun(p.x, p.y, tp.x, tp.y):
+                continue
+            target_mask[i, j] = True
+        if target_mask[i].any():
+            launch_mask[i] = True
 
-        # 고정점 resolver — 학습과 동일 구현
+    # All-false row fallback — 학습 analyze_action_space 와 동일 처리
+    for i in range(MAX_PLANETS):
+        if not target_mask[i].any():
+            target_mask[i, i] = True
+
+    return launch_mask, target_mask
+
+
+# ── Action decoder (학습 decode 와 parity: mask + sample) ────────────────────
+
+def _decode(action_logits, raw_planets, av, player):
+    """action_logits: (1, MAX_PLANETS, ACTION_DIM) torch on CPU.
+
+    학습 rollout 과 동일 흐름:
+      1) mask 계산 (launch/target)
+      2) logit 에 mask 적용 (-1e9 masked_fill)
+      3) Bernoulli(launch) / Categorical(ships_bin) / Categorical(target) 샘플
+      4) launch=1 인 own planet 마다 resolve_ships_for_capture → crosses_sun 필터
+    argmax 대신 샘플링 쓰는 이유: 초기 학습 logit 이 0 근처라 argmax 가
+    false negative 대량 발생. 학습 rollout 이 샘플링이므로 inference 도 동일.
+    """
+    from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+    planets = [Planet(*p) for p in raw_planets]
+
+    launch_mask, target_mask = _build_masks(planets, player)
+
+    launch_logits    = action_logits[0, :, 0].clone()                      # (P,)
+    ships_bin_logits = action_logits[0, :, 1:1 + NUM_SHIPS_BINS]           # (P, K)
+    target_logits    = action_logits[0, :, 1 + NUM_SHIPS_BINS:].clone()    # (P, P)
+
+    # Mask 적용 — 학습과 동일
+    launch_logits = launch_logits.masked_fill(~launch_mask, -1e9)
+    target_logits = target_logits.masked_fill(~target_mask, -1e9)
+
+    # Sampling (no_grad 는 caller 에서)
+    launch    = torch.distributions.Bernoulli(logits=launch_logits).sample()         # (P,)
+    ships_bin = torch.distributions.Categorical(logits=ships_bin_logits).sample()    # (P,)
+    target    = torch.distributions.Categorical(logits=target_logits).sample()       # (P,)
+
+    launch_np    = launch.numpy()
+    ships_bin_np = ships_bin.numpy()
+    target_np    = target.numpy()
+
+    moves = []
+    for i, p in enumerate(planets[:MAX_PLANETS]):
+        if p.owner != player or p.ships <= 0:
+            continue
+        if launch_np[i] < 0.5:
+            continue
+
+        target_idx = int(target_np[i])
+        if target_idx >= len(planets) or target_idx == i:
+            continue
+        tgt_planet = planets[target_idx]
+        if tgt_planet.owner == player:
+            continue   # 자기편 샘플 fallback 방어
+
+        multiplier = float(SHIPS_MULTIPLIER_BINS[int(ships_bin_np[i])])
+
         ships_needed, angle, tx, ty, _turns, _required, _conv = resolve_ships_for_capture(
-            p, target, av, multiplier, p.ships,
+            p, tgt_planet, av, multiplier, p.ships,
         )
         if ships_needed <= 0:
             continue
@@ -182,10 +225,9 @@ def agent(obs):
     obs_t   = torch.from_numpy(flat).unsqueeze(0).to(_DEVICE)   # (1, ...)
 
     with torch.no_grad():
-        action_logits = model(obs_t)                     # (1, P, ACTION_DIM)
-    action_logits_np = action_logits[0].cpu().numpy()
+        action_logits = model(obs_t).cpu()               # (1, P, ACTION_DIM)
 
-    moves = _decode(action_logits_np, raw_planets, av, player)
+    moves = _decode(action_logits, raw_planets, av, player)
 
     dt = time.time() - t0
     # 첫 턴은 모델 로드 포함이라 큼. 이후 turn time 이 Kaggle overageTime 소진 페이스.
