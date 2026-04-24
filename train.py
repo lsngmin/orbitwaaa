@@ -281,7 +281,9 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     launches = []
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
                "filtered_zero_ships": 0, "filtered_sun": 0,
-               "filtered_path": 0, "launched": 0}
+               "filtered_path": 0, "launched": 0, "launched_high_prod": 0}
+    target_prods = [t.production for t in planets if t.owner != acting_player]
+    high_prod_threshold = np.quantile(target_prods, 0.75) if target_prods else None
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
@@ -320,6 +322,8 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             continue
 
         counts["launched"] += 1
+        if high_prod_threshold is not None and target.production >= high_prod_threshold:
+            counts["launched_high_prod"] += 1
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
         start_y = p.y + math.sin(angle) * (p.radius + 0.1)
@@ -386,6 +390,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
     env = make("orbit_wars", debug=False)
     env.reset()
+    hit_tracker.reset_episode(env.state[0].observation)
 
     history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
     history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
@@ -461,7 +466,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         if done:
             env = make("orbit_wars", debug=False)
             env.reset()
-            hit_tracker.pending.clear()  # fleet id는 env 단위로 리셋됨
+            hit_tracker.reset_episode(env.state[0].observation)
             prev_score    = (state_score(env.state[0].observation, player=0)
                            - state_score(env.state[1].observation, player=1))
             history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
@@ -863,6 +868,15 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_captured_exclusive=rew_stats.get("mean_captured_exclusive", 0.0),
                 mean_captured_ambiguous=rew_stats.get("mean_captured_ambiguous", 0.0),
                 mean_unknown_removal=rew_stats.get("mean_unknown_removal", 0.0),
+                mean_launched_high_prod=rew_stats.get("mean_launched_high_prod", 0.0),
+                mean_captured_neutral=rew_stats.get("mean_captured_neutral", 0.0),
+                mean_captured_enemy=rew_stats.get("mean_captured_enemy", 0.0),
+                mean_early_home_expand=rew_stats.get("mean_early_home_expand", 0.0),
+                noop_rate=rew_stats.get("noop_rate", 0.0),
+                high_prod_target_rate=rew_stats.get("high_prod_target_rate", 0.0),
+                neutral_capture_rate=rew_stats.get("neutral_capture_rate", 0.0),
+                enemy_capture_rate=rew_stats.get("enemy_capture_rate", 0.0),
+                early_home_expand_per_episode=rew_stats.get("early_home_expand_per_episode", 0.0),
                 **head_metrics,
             )
 

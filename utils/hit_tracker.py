@@ -38,24 +38,48 @@ class HitRateTracker:
 
     METRIC_KEYS = (
         "attempts", "filtered_invalid_target", "filtered_zero_ships",
-        "filtered_sun", "filtered_path", "launched",
+        "filtered_sun", "filtered_path", "launched", "launched_high_prod",
+        "noop_steps",
         "out", "sun_crash",
         "target_hit_exclusive", "target_hit_ambiguous",
         "hit_other_exclusive", "hit_other_ambiguous",
         "captured_exclusive", "captured_ambiguous",
+        "captured_neutral", "captured_enemy",
+        "early_home_expand",
         "unknown_removal",
     )
+    HOME_EXPAND_TURNS = 20
+    HOME_EXPAND_RADIUS = 25.0
 
     def __init__(self, player_id=0):
         self.counters = defaultdict(int)
         self.n_steps  = 0
         self.player_id = player_id
         self.pending = {}  # fleet_id -> meta
+        self.episodes = 0
+        self.episode_turn = 0
+        self.home_positions = []
+
+    def reset_episode(self, obs):
+        self.pending.clear()
+        self.episodes += 1
+        self.episode_turn = 0
+        self.home_positions = []
+        for p in _get(obs, "planets", []):
+            owner = p[1] if isinstance(p, (list, tuple)) else p.owner
+            if owner != self.player_id:
+                continue
+            x = p[2] if isinstance(p, (list, tuple)) else p.x
+            y = p[3] if isinstance(p, (list, tuple)) else p.y
+            self.home_positions.append((x, y))
 
     # ── V1 ──────────────────────────────────────────────────────────────────
     def record(self, counts):
         for k, v in counts.items():
             self.counters[k] += v
+        # "noop"은 디코드 후 발사 0회가 아니라, 정책이 launch 시도 자체를 안 한 step으로 본다.
+        if counts.get("attempts", 0) == 0:
+            self.counters["noop_steps"] += 1
         self.n_steps += 1
 
     # ── V2: 등록 ────────────────────────────────────────────────────────────
@@ -119,6 +143,7 @@ class HitRateTracker:
                 enemy_hits_by_planet[planet_id] += 1
 
         # 3. exclusive/ambiguous 판정 + 카운트
+        counted_capture_planets = set()
         for fid, meta, cause, planet_id in removed_mine:
             if cause == "out":
                 self.counters["out"] += 1
@@ -137,10 +162,27 @@ class HitRateTracker:
                 if prev_planet and curr_planet:
                     prev_owner = prev_planet[1]
                     curr_owner = curr_planet[1]
-                    if prev_owner != self.player_id and curr_owner == self.player_id:
+                    if (
+                        prev_owner != self.player_id
+                        and curr_owner == self.player_id
+                        and planet_id not in counted_capture_planets
+                    ):
+                        counted_capture_planets.add(planet_id)
                         self.counters[f"captured_{suffix}"] += 1
+                        if prev_owner == -1:
+                            self.counters["captured_neutral"] += 1
+                            if self.episode_turn < self.HOME_EXPAND_TURNS:
+                                px, py = prev_planet[2], prev_planet[3]
+                                if any(
+                                    math.hypot(px - hx, py - hy) <= self.HOME_EXPAND_RADIUS
+                                    for hx, hy in self.home_positions
+                                ):
+                                    self.counters["early_home_expand"] += 1
+                        else:
+                            self.counters["captured_enemy"] += 1
             else:
                 self.counters["unknown_removal"] += 1
+        self.episode_turn += 1
 
     # ── 요약 ────────────────────────────────────────────────────────────────
     def summary(self):
@@ -149,6 +191,11 @@ class HitRateTracker:
         attempts = self.counters.get("attempts", 0)
         launched = self.counters.get("launched", 0)
         out["launch_rate"] = launched / max(attempts, 1)
+        out["noop_rate"] = self.counters.get("noop_steps", 0) / steps
+        out["high_prod_target_rate"] = self.counters.get("launched_high_prod", 0) / max(launched, 1)
+        out["neutral_capture_rate"] = self.counters.get("captured_neutral", 0) / max(launched, 1)
+        out["enemy_capture_rate"] = self.counters.get("captured_enemy", 0) / max(launched, 1)
+        out["early_home_expand_per_episode"] = self.counters.get("early_home_expand", 0) / max(self.episodes, 1)
         return out
 
 

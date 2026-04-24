@@ -16,6 +16,7 @@ class TrainingLogger:
         timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path   = os.path.join(log_dir, f"train_{timestamp}.csv")
         self.fields = [
+            "timestamp",
             "generation", "total_steps", "match_type",
             "policy_loss", "value_loss", "entropy_loss",
             "approx_kl", "clip_frac", "epochs_done",
@@ -30,6 +31,12 @@ class TrainingLogger:
             "mean_target_hit_exclusive", "mean_target_hit_ambiguous",
             "mean_hit_other_exclusive", "mean_hit_other_ambiguous",
             "mean_captured_exclusive", "mean_captured_ambiguous",
+            "mean_launched_high_prod",
+            "mean_captured_neutral", "mean_captured_enemy",
+            "mean_early_home_expand",
+            "noop_rate", "high_prod_target_rate",
+            "neutral_capture_rate", "enemy_capture_rate",
+            "early_home_expand_per_episode",
             "mean_unknown_removal",
             "win_rate", "league_size",
         ]
@@ -39,7 +46,9 @@ class TrainingLogger:
         print(f"Logger: {self.path}")
 
     def log(self, **kwargs):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         row = {k: kwargs.get(k, "") for k in self.fields}
+        row["timestamp"] = now
         with open(self.path, "a", newline="") as f:
             csv.DictWriter(f, fieldnames=self.fields).writerow(row)
 
@@ -89,18 +98,53 @@ class TrainingLogger:
         mean_ho_am      = kwargs.get("mean_hit_other_ambiguous", "")
         mean_cap_ex     = kwargs.get("mean_captured_exclusive", "")
         mean_cap_am     = kwargs.get("mean_captured_ambiguous", "")
+        noop_rate        = kwargs.get("noop_rate", "")
+        high_prod_rate   = kwargs.get("high_prod_target_rate", "")
+        neutral_cap_rate = kwargs.get("neutral_capture_rate", "")
+        enemy_cap_rate   = kwargs.get("enemy_capture_rate", "")
+        home20_per_ep    = kwargs.get("early_home_expand_per_episode", "")
         hit_str = (
             f" | hit=[out={mean_out:.2f}/sun={mean_sun_crash:.2f}"
             f"/th={mean_th_ex:.2f}+{mean_th_am:.2f}"
             f"/ho={mean_ho_ex:.2f}+{mean_ho_am:.2f}"
             f"/cap={mean_cap_ex:.2f}+{mean_cap_am:.2f}]"
         ) if _is_num(mean_out) else ""
-        print(
+        line1 = (
+            f"{now} | "
             f"Gen {kwargs.get('generation', '?'):04d} | "
             f"steps={kwargs.get('total_steps', 0):,} | "
             f"match={kwargs.get('match_type', '?')} | "
             f"p_loss={kwargs.get('policy_loss', 0):.4f} | "
             f"v_loss={kwargs.get('value_loss', 0):.4f} | "
             f"e_loss={kwargs.get('entropy_loss', 0):.4f}"
-            f"{kl_str}{ent_str}{rew_str}{head_str}{decode_str}{hit_str}{win_str}"
+            f"{kl_str}{ent_str}{rew_str}{head_str}{win_str}"
         )
+        print(line1)
+
+        if _is_num(mean_attempts) and _is_num(mean_out):
+            launched = mean_launched if mean_launched > 0 else 0.0
+            attempts = mean_attempts if mean_attempts > 0 else 0.0
+            th_total = mean_th_ex + mean_th_am
+            ho_total = mean_ho_ex + mean_ho_am
+            cap_total = mean_cap_ex + mean_cap_am
+            th_rate = (th_total / launched) if launched > 0 else 0.0
+            ho_rate = (ho_total / launched) if launched > 0 else 0.0
+            out_rate = (mean_out / launched) if launched > 0 else 0.0
+            sun_rate = (mean_sun_crash / launched) if launched > 0 else 0.0
+            cap_rate = (cap_total / launched) if launched > 0 else 0.0
+            path_rate = (mean_filtered_path / attempts) if attempts > 0 else 0.0
+
+            line2 = (
+                f"{decode_str}{hit_str}"
+                f" | rate=[th={th_rate:.0%}/ho={ho_rate:.0%}/out={out_rate:.0%}"
+                f"/sun={sun_rate:.0%}/cap={cap_rate:.0%}/path={path_rate:.0%}]"
+            )
+            print(line2.lstrip())
+
+        if _is_num(noop_rate):
+            line3 = (
+                f"strat=[ncap={neutral_cap_rate:.0%}/ecap={enemy_cap_rate:.0%}"
+                f"/home20={home20_per_ep:.2f}/noop={noop_rate:.0%}"
+                f"/hprod={high_prod_rate:.0%}]"
+            )
+            print(line3)
