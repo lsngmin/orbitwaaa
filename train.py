@@ -463,6 +463,9 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     launch_mask_list, target_mask_list = [], []
     hit_tracker = HitRateTracker()
     sum_dense = sum_cap = sum_terminal = 0.0
+    # win_rate 계측: episode 종료 시 main(player=0) reward로 win/draw/loss 집계.
+    # draw는 0.5 가중치 (eval과 동일 규약).
+    sum_wins = 0.0
 
     env = make("orbit_wars", debug=False)
     env.reset()
@@ -533,6 +536,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
                     -terminal_win_reward if r == -1 else 0.0
                 )
                 reward    += terminal_r
+                sum_wins  += 1.0 if r == 1 else (0.5 if r == 0 else 0.0)
 
             sum_dense    += dense_r
             sum_cap      += cap_bonus
@@ -589,6 +593,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "sum_dense":    sum_dense,
         "sum_cap":      sum_cap,
         "sum_terminal": sum_terminal,
+        "sum_wins":     sum_wins,
     }
     return (
         torch.stack(obs_list),
@@ -651,6 +656,7 @@ def _finalize_reward_stats(raw_list):
     total_n_steps = 0
     total_episodes = 0
     total_dense = total_cap = total_terminal = 0.0
+    total_wins = 0.0
     for r in raw_list:
         for k, v in r["counters"].items():
             total_counters[k] += v
@@ -659,6 +665,7 @@ def _finalize_reward_stats(raw_list):
         total_dense    += r["sum_dense"]
         total_cap      += r["sum_cap"]
         total_terminal += r["sum_terminal"]
+        total_wins     += r.get("sum_wins", 0.0)
 
     stats = HitRateTracker.summary_from_counters(
         total_counters, total_n_steps, total_episodes,
@@ -667,6 +674,9 @@ def _finalize_reward_stats(raw_list):
     stats["mean_dense"]    = total_dense    / steps_safe
     stats["mean_cap"]      = total_cap      / steps_safe
     stats["mean_terminal"] = total_terminal / steps_safe
+    # rollout 내 main(player=0) 승률. on-policy sampling이라 eval보다 noisy지만,
+    # match_type별 log로 분포별 성능을 바로 볼 수 있는 이점.
+    stats["win_rate"]      = total_wins / max(total_episodes, 1)
     # Episode-grained collection에서 generation마다 실제 수집량이 달라지므로
     # target_steps 대비 초과량으로 "unusually 길었던 generation" 감지 가능.
     stats["actual_steps"]  = total_n_steps
@@ -1212,6 +1222,8 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 approx_kl=approx_kl, clip_frac=clip_frac, epochs_done=epochs_done,
                 ent_launch=ent_l, ent_ships=ent_s, ent_target=ent_t,
                 league_size=len(league),
+                # rollout 내 승률 (on-policy, noisy지만 match_type별로 분포별 성능 확인 가능).
+                win_rate=rew_stats.get("win_rate", 0.0),
                 mean_dense_rew=rew_stats["mean_dense"],
                 mean_cap_bonus=rew_stats["mean_cap"],
                 mean_terminal_rew=rew_stats["mean_terminal"],
