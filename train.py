@@ -330,6 +330,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         launches.append({
             "source_id": p.id,
             "target_id": target.id,
+            "target_owner": target.owner,   # -1: neutral, 그 외: 적 (우리는 self 마스킹됨)
             "ships": ships_needed,
             "angle": angle,
             "start_x": start_x,

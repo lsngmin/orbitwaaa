@@ -269,6 +269,67 @@ def test_resolve_ambiguous_when_enemy_fleet_hits_same_planet():
     assert tracker.counters["target_hit_exclusive"] == 0
 
 
+def test_target_owner_counters_split_neutral_and_enemy():
+    """register_launches가 target_owner 기반으로 전체 launched 분포를 분류."""
+    tracker = HitRateTracker(player_id=0)
+    launches = [
+        {**_make_launch(0, 5, 10, 0.0, 10.0, 10.0), "target_owner": -1},   # 중립
+        {**_make_launch(1, 6, 10, 0.0, 20.0, 20.0), "target_owner": 1},    # 적
+        {**_make_launch(2, 7, 10, 0.0, 30.0, 30.0), "target_owner": 1},    # 적
+    ]
+    tracker.register_launches(launches, next_fleet_id=1)
+    assert tracker.counters["target_neutral"] == 1
+    assert tracker.counters["target_enemy"] == 2
+    # 초반 20턴이라 early_* attempts 도 집계되어야 함
+    assert tracker.counters["early_neutral_attempts"] == 1
+    assert tracker.counters["early_enemy_attempts"] == 2
+
+
+def test_early_attempts_only_in_first_20_turns():
+    """episode_turn >= 20이면 early_*_attempts 집계 안 함."""
+    tracker = HitRateTracker(player_id=0)
+    tracker.episode_turn = 20  # 초반 phase 벗어남
+    launches = [
+        {**_make_launch(0, 5, 10, 0.0, 10.0, 10.0), "target_owner": -1},
+        {**_make_launch(1, 6, 10, 0.0, 20.0, 20.0), "target_owner": 1},
+    ]
+    tracker.register_launches(launches, next_fleet_id=1)
+    # 전체 분포는 여전히 집계
+    assert tracker.counters["target_neutral"] == 1
+    assert tracker.counters["target_enemy"] == 1
+    # 초반 attempts는 0
+    assert tracker.counters["early_neutral_attempts"] == 0
+    assert tracker.counters["early_enemy_attempts"] == 0
+
+
+def test_early_neutral_captured_counts_within_first_20_turns():
+    """초반 20턴 내 중립 점령은 거리 무관하게 early_neutral_captured 집계."""
+    tracker = HitRateTracker(player_id=0)
+    # home 설정은 멀리 (90, 90) — target 거리 멀게 해서 home20 영역 밖임을 보장
+    tracker.reset_episode(_obs(
+        planets=[_planet(99, 0, 90.0, 90.0)],   # my home
+        fleets=[],
+    ))
+    # 원거리 중립 (20, 50) 공격
+    tracker.register_launches(
+        [{**_make_launch(0, 5, 10, 0.0, 20.0, 50.0), "target_owner": -1}],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(planets=[
+        _planet(99, 0, 90.0, 90.0),
+        _planet(5, -1, 22.0, 50.0, ships=1),
+    ])
+    curr_obs = _obs(planets=[
+        _planet(99, 0, 90.0, 90.0),
+        _planet(5, 0, 22.0, 50.0, ships=9),   # 점령 성공
+    ])
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+    assert tracker.counters["captured_neutral"] == 1
+    assert tracker.counters["early_neutral_captured"] == 1
+    # home 영역 밖 → early_home_expand 는 올라가면 안 됨
+    assert tracker.counters["early_home_expand"] == 0
+
+
 def test_resolve_keeps_alive_fleet_in_pending():
     tracker = HitRateTracker(player_id=0)
     tracker.register_launches(

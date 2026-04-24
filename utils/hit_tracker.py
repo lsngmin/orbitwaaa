@@ -46,6 +46,12 @@ class HitRateTracker:
         "captured_exclusive", "captured_ambiguous",
         "captured_neutral", "captured_enemy",
         "early_home_expand",
+        # ── 타겟 분포 / 초반 확장 계측 ───────────────────────────────────────
+        "target_neutral",         # rollout 전체 중립 타겟 launched 수
+        "target_enemy",           # rollout 전체 적 타겟 launched 수
+        "early_neutral_attempts", # 초반 20턴 내 중립 타겟 launched 수
+        "early_enemy_attempts",   # 초반 20턴 내 적 타겟 launched 수
+        "early_neutral_captured", # 초반 20턴 내 중립 점령 성공 수 (거리 무관)
         "unknown_removal",
     )
     HOME_EXPAND_TURNS = 20
@@ -88,7 +94,10 @@ class HitRateTracker:
 
         engine이 유효 move마다 next_fleet_id를 1씩 증가시키고, decode는 엔진이
         수용하는 조건(상위집합)만 통과시키므로 moves[i]는 fleet_id = next_fleet_id+i.
+
+        동시에 target_owner 기반 launch 분포/초반 attempt 계측도 여기서 수행.
         """
+        is_early = self.episode_turn < self.HOME_EXPAND_TURNS
         for i, meta in enumerate(launches):
             fid = next_fleet_id + i
             self.pending[fid] = {
@@ -96,6 +105,15 @@ class HitRateTracker:
                 "last_x": meta["start_x"],
                 "last_y": meta["start_y"],
             }
+            target_owner = meta.get("target_owner")
+            if target_owner == -1:
+                self.counters["target_neutral"] += 1
+                if is_early:
+                    self.counters["early_neutral_attempts"] += 1
+            elif target_owner is not None and target_owner != self.player_id:
+                self.counters["target_enemy"] += 1
+                if is_early:
+                    self.counters["early_enemy_attempts"] += 1
 
     # ── V2: 해소 ────────────────────────────────────────────────────────────
     def resolve_step(self, prev_obs, curr_obs, max_speed):
@@ -172,6 +190,7 @@ class HitRateTracker:
                         if prev_owner == -1:
                             self.counters["captured_neutral"] += 1
                             if self.episode_turn < self.HOME_EXPAND_TURNS:
+                                self.counters["early_neutral_captured"] += 1
                                 px, py = prev_planet[2], prev_planet[3]
                                 if any(
                                     math.hypot(px - hx, py - hy) <= self.HOME_EXPAND_RADIUS
@@ -196,6 +215,13 @@ class HitRateTracker:
         out["neutral_capture_rate"] = self.counters.get("captured_neutral", 0) / max(launched, 1)
         out["enemy_capture_rate"] = self.counters.get("captured_enemy", 0) / max(launched, 1)
         out["early_home_expand_per_episode"] = self.counters.get("early_home_expand", 0) / max(self.episodes, 1)
+        # ── 타겟 분포 / 초반 확장 파생 지표 ─────────────────────────────────
+        eps = max(self.episodes, 1)
+        out["target_neutral_rate"] = self.counters.get("target_neutral", 0) / max(launched, 1)
+        out["target_enemy_rate"]   = self.counters.get("target_enemy", 0)   / max(launched, 1)
+        out["early_neutral_attempts_per_episode"] = self.counters.get("early_neutral_attempts", 0) / eps
+        out["early_enemy_attempts_per_episode"]   = self.counters.get("early_enemy_attempts", 0)   / eps
+        out["early_neutral_captured_per_episode"] = self.counters.get("early_neutral_captured", 0) / eps
         return out
 
 
