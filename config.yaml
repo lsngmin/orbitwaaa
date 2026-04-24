@@ -27,9 +27,10 @@ training:
   ent_coef: 0.005       # 탐험 장려 엔트로피 계수
   vf_coef: 0.5          # Critic loss 가중치
   max_grad_norm: 0.5    # gradient clipping
-  dense_reward_coef: 0.02   # dense reward 계수 (0이면 terminal-only)
-  cap_bonus_gain: 0.05      # 중립 → 내 점령 시 prod * 이 값 보너스 (0이면 비활성)
-  cap_bonus_loss: 0.025     # 내 → 상실 시 prod * 이 값 페널티 (0이면 비활성)
+  terminal_win_reward: 5.0  # 최종 승패 보상 절대값 (승=+v, 패=-v)
+  dense_reward_coef: 0.004  # 중간 shaping은 약한 힌트만 주도록 축소
+  cap_bonus_gain: 0.008     # 중립 → 내 점령 시 prod * 이 값 보너스
+  cap_bonus_loss: 0.012     # 내 → 상실 시 prod * 이 값 페널티 (수비 신호는 gain보다 조금 강하게)
 
 env:
   max_planets: 40

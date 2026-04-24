@@ -438,6 +438,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
 
     dense_coef = T["dense_reward_coef"]
+    terminal_win_reward = float(T.get("terminal_win_reward", 1.0))
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
@@ -485,7 +486,9 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
         if done:
             r          = env.state[0].reward
-            terminal_r = 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
+            terminal_r = terminal_win_reward if r == 1 else (
+                -terminal_win_reward if r == -1 else 0.0
+            )
             reward    += terminal_r
 
         sum_dense    += dense_r

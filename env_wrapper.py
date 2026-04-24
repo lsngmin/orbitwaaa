@@ -21,6 +21,7 @@ except ImportError:
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 with open(_cfg_path) as f:
     CONFIG = yaml.safe_load(f)
+TRAIN_CONFIG = CONFIG["training"]
 
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
@@ -334,7 +335,10 @@ class OrbitWarsEnv(gym.Env):
         reward   = 0.0
         if done:
             r = state[self._player].reward
-            reward = 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
+            terminal_win_reward = float(TRAIN_CONFIG.get("terminal_win_reward", 1.0))
+            reward = terminal_win_reward if r == 1 else (
+                -terminal_win_reward if r == -1 else 0.0
+            )
 
         return obs, reward, done, False, {}
 
