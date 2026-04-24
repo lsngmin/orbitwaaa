@@ -34,7 +34,14 @@ MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
 PLANET_DIM      = 18  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
 FLEET_DIM       = 7
-ACTION_DIM      = MAX_PLANETS + 2  # 발사여부 + ships비율 + 타겟 logits
+
+# ships head: required_ships 배수 Categorical (commit 2)
+# decode: ships_to_send = min(int(required × multiplier), src.ships)
+SHIPS_MULTIPLIER_BINS = tuple(M.get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
+NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
+
+# Action layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
+ACTION_DIM      = 1 + NUM_SHIPS_BINS + MAX_PLANETS
 
 
 def make_transformer(layers):
@@ -142,77 +149,93 @@ class OrbitWarsPolicy(nn.Module):
 
         return action_logits, value
 
-    def get_action_and_value(self, obs_flat, launch_mask=None, target_mask=None):
+    def _split_logits(self, action_logits):
+        """action_logits: (B, P, ACTION_DIM) → (launch, ships_bin, target) 분리.
+
+        Layout: [launch(1), ships_bin(K), target(P)]
+        """
+        launch_logits    = action_logits[..., 0]
+        ships_bin_logits = action_logits[..., 1:1 + NUM_SHIPS_BINS]
+        target_logits    = action_logits[..., 1 + NUM_SHIPS_BINS:]
+        return launch_logits, ships_bin_logits, target_logits
+
+    def get_action_and_value(self, obs_flat, launch_mask=None, target_mask=None,
+                              ships_bin_mask=None):
         """PPO 학습용: 행동 샘플링 + log_prob + value.
 
         launch_mask: (B, P) bool — False 위치의 launch=1 확률을 0으로 강제.
         target_mask: (B, P, P) bool — False 위치의 target 선택 확률을 0으로 강제.
+        ships_bin_mask: (B, P, K) bool — False 위치의 ships_bin 확률을 0으로 강제.
+                        None이면 전체 허용 (기본값).
         launch_active로 ships/target log_prob 게이팅.
         """
         action_logits, value = self.forward(obs_flat)
+        launch_logits, ships_bin_logits, target_logits = self._split_logits(action_logits)
 
         # 발사 여부 (Bernoulli) — mask 적용
-        launch_logits = action_logits[:, :, 0]
         if launch_mask is not None:
             launch_logits = launch_logits.masked_fill(~launch_mask, -1e9)
         launch_dist   = torch.distributions.Bernoulli(logits=launch_logits)
         launch        = launch_dist.sample()
 
-        # ships 비율 (Beta distribution을 Normal로 근사)
-        ships_mean    = torch.sigmoid(action_logits[:, :, 1])
-        ships_dist    = torch.distributions.Normal(ships_mean, 0.1)
-        ships_ratio   = ships_dist.sample().clamp(0.0, 1.0)
+        # ships 배수 (Categorical over K bins) — mask 적용
+        if ships_bin_mask is not None:
+            ships_bin_logits = ships_bin_logits.masked_fill(~ships_bin_mask, -1e9)
+        ships_dist    = torch.distributions.Categorical(logits=ships_bin_logits)
+        ships_bin     = ships_dist.sample()          # (B, P) long
 
         # 타겟 선택 (Categorical) — mask 적용
-        target_logits = action_logits[:, :, 2:]
         if target_mask is not None:
             target_logits = target_logits.masked_fill(~target_mask, -1e9)
         target_dist   = torch.distributions.Categorical(logits=target_logits)
         target        = target_dist.sample()
 
         lp_launch = launch_dist.log_prob(launch).sum(-1)
-        lp_ships  = (ships_dist.log_prob(ships_ratio) * launch).sum(-1)
+        lp_ships  = (ships_dist.log_prob(ships_bin) * launch).sum(-1)
         lp_target = (target_dist.log_prob(target) * launch).sum(-1)
         log_prob  = lp_launch + lp_ships + lp_target
 
-        # action 합치기: (B, P, P+2)
+        # action 합치기: (B, P, 1 + K + P)
+        ships_onehot  = torch.zeros(*ships_bin_logits.shape, device=obs_flat.device)
+        ships_onehot.scatter_(-1, ships_bin.unsqueeze(-1), 1.0)
         target_onehot = torch.zeros(*target_logits.shape, device=obs_flat.device)
         target_onehot.scatter_(-1, target.unsqueeze(-1), 1.0)
         action = torch.cat([
             launch.unsqueeze(-1),
-            ships_ratio.unsqueeze(-1),
+            ships_onehot,
             target_onehot,
         ], dim=-1)
 
         lp_heads = torch.stack([lp_launch, lp_ships, lp_target], dim=-1)
         return action, log_prob, value, lp_heads
 
-    def evaluate_actions(self, obs_flat, actions, launch_mask=None, target_mask=None):
+    def evaluate_actions(self, obs_flat, actions, launch_mask=None, target_mask=None,
+                          ships_bin_mask=None):
         """PPO 업데이트용: 주어진 행동의 log_prob + entropy + value.
 
         rollout 시 사용한 것과 동일한 mask를 전달해야 importance ratio가 유효함.
         """
         action_logits, value = self.forward(obs_flat)
+        launch_logits, ships_bin_logits, target_logits = self._split_logits(action_logits)
 
-        launch      = actions[:, :, 0]
-        ships_ratio = actions[:, :, 1]
-        target      = actions[:, :, 2:].argmax(dim=-1)
+        launch    = actions[..., 0]
+        ships_bin = actions[..., 1:1 + NUM_SHIPS_BINS].argmax(dim=-1)
+        target    = actions[..., 1 + NUM_SHIPS_BINS:].argmax(dim=-1)
 
-        launch_logits = action_logits[:, :, 0]
         if launch_mask is not None:
             launch_logits = launch_logits.masked_fill(~launch_mask, -1e9)
         launch_dist = torch.distributions.Bernoulli(logits=launch_logits)
 
-        ships_mean  = torch.sigmoid(action_logits[:, :, 1])
-        ships_dist  = torch.distributions.Normal(ships_mean, 0.1)
+        if ships_bin_mask is not None:
+            ships_bin_logits = ships_bin_logits.masked_fill(~ships_bin_mask, -1e9)
+        ships_dist  = torch.distributions.Categorical(logits=ships_bin_logits)
 
-        target_logits = action_logits[:, :, 2:]
         if target_mask is not None:
             target_logits = target_logits.masked_fill(~target_mask, -1e9)
         target_dist = torch.distributions.Categorical(logits=target_logits)
 
         lp_launch = launch_dist.log_prob(launch).sum(-1)
-        lp_ships  = (ships_dist.log_prob(ships_ratio) * launch).sum(-1)
+        lp_ships  = (ships_dist.log_prob(ships_bin) * launch).sum(-1)
         lp_target = (target_dist.log_prob(target) * launch).sum(-1)
         log_prob  = lp_launch + lp_ships + lp_target
 

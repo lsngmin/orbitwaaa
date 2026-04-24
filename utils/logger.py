@@ -3,9 +3,19 @@ import os
 import numbers
 from datetime import datetime
 
+import yaml
+
 
 def _is_num(x):
     return isinstance(x, numbers.Real) and not isinstance(x, bool)
+
+
+# ships_multiplier_bins 로드 (ships_bin_rate_k 필드명 생성용)
+_cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+with open(_cfg_path) as _f:
+    _CFG = yaml.safe_load(_f)
+_SHIPS_BINS     = tuple(_CFG["model"].get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
+_NUM_SHIPS_BINS = len(_SHIPS_BINS)
 
 
 class TrainingLogger:
@@ -47,10 +57,12 @@ class TrainingLogger:
             "early_neutral_captured_per_episode",
             "early_launch_neutral_captured_per_episode",
             "early_neutral_launch_to_cap_rate",
-            # ── ships 분포 실측 (commit 1: Categorical head 전 스냅샷) ──────
-            "ships_ratio_mean", "ships_ratio_std",
+            # ── ships 분포 실측 (commit 2: Categorical multiplier head) ─────
+            "chosen_multiplier_mean", "chosen_multiplier_std",
             "ships_to_send_mean", "required_ships_mean",
             "send_required_ratio_mean", "under_invested_rate",
+            # ships_bin 히스토그램 (launched 대비 비율)
+            *(f"ships_bin_rate_{k}" for k in range(_NUM_SHIPS_BINS)),
             "mean_unknown_removal",
             "win_rate", "league_size",
         ]
@@ -179,16 +191,24 @@ class TrainingLogger:
             )
             print(line4)
 
-        sr_mean   = kwargs.get("ships_ratio_mean", "")
-        sr_std    = kwargs.get("ships_ratio_std", "")
+        cm_mean   = kwargs.get("chosen_multiplier_mean", "")
+        cm_std    = kwargs.get("chosen_multiplier_std", "")
         sts_mean  = kwargs.get("ships_to_send_mean", "")
         req_mean  = kwargs.get("required_ships_mean", "")
         srr_mean  = kwargs.get("send_required_ratio_mean", "")
         under     = kwargs.get("under_invested_rate", "")
-        if _is_num(sr_mean):
+        if _is_num(cm_mean):
+            # bin 히스토그램: launched 대비 각 bin의 선택 비율
+            bin_rates = []
+            for k in range(_NUM_SHIPS_BINS):
+                r = kwargs.get(f"ships_bin_rate_{k}", "")
+                if _is_num(r):
+                    bin_rates.append(f"{_SHIPS_BINS[k]:.2f}={r:.0%}")
+            bin_str = " | bins=[" + "/".join(bin_rates) + "]" if bin_rates else ""
             line5 = (
-                f"ships=[ratio={sr_mean:.3f}±{sr_std:.3f}"
+                f"ships=[mult={cm_mean:.2f}±{cm_std:.2f}"
                 f" | send={sts_mean:.1f}/req={req_mean:.1f}"
                 f" | s/r={srr_mean:.2f}/under={under:.0%}]"
+                f"{bin_str}"
             )
             print(line5)

@@ -7,9 +7,19 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from env_wrapper import MAX_PLANETS
+from env_wrapper import MAX_PLANETS, NUM_SHIPS_BINS
 from train import decode_action_to_moves
 from utils.hit_tracker import HitRateTracker
+
+# Action layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
+ACTION_DIM = 1 + NUM_SHIPS_BINS + MAX_PLANETS
+
+
+def _set_action(action_np, src_idx, ships_bin, target_idx, launch=1.0):
+    """테스트 헬퍼: (launch, ships_bin, target) 조합을 새 layout으로 설정."""
+    action_np[src_idx, 0] = launch
+    action_np[src_idx, 1 + ships_bin] = 1.0
+    action_np[src_idx, 1 + NUM_SHIPS_BINS + target_idx] = 1.0
 
 
 class FakePlanet:
@@ -30,24 +40,24 @@ def make_raw(id_, x, y, owner, ships=20, production=2, radius=3.0):
 @patch("train.Planet", FakePlanet)
 @patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 def test_decode_action_counts_cover_filters_and_launch(mock_aim):
-    action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
+    """commit 2: Categorical multiplier head.
+    ships_bin=0 (1.10배) 기준 시나리오:
+      - target(enemy) ships=5, prod=2, turns=10 → required = 5 + 2×10 + 1 = 26
+      - ships_needed = min(int(26 × 1.10), src.ships) = min(28, src.ships)
+    """
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
 
     # planet 0 -> invalid target (self-owned)
-    action_np[0, 0] = 1.0
-    action_np[0, 3] = 10.0  # target_idx=1
+    _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)
 
-    # planet 2 -> zero ships after clipping/min
-    action_np[2, 0] = 1.0
-    action_np[2, 7] = 10.0  # target_idx=5
+    # planet 2 -> zero ships after clipping (src.ships=0)
+    _set_action(action_np, src_idx=2, ships_bin=0, target_idx=5)
 
     # planet 3 -> sun filtered
-    action_np[3, 0] = 1.0
-    action_np[3, 7] = 10.0  # target_idx=5
+    _set_action(action_np, src_idx=3, ships_bin=0, target_idx=5)
 
-    # planet 4 -> valid launch
-    action_np[4, 0] = 1.0
-    action_np[4, 7] = 10.0  # target_idx=5
-    action_np[4, 1] = 0.5
+    # planet 4 -> valid launch (ships_bin=0 → 1.10x)
+    _set_action(action_np, src_idx=4, ships_bin=0, target_idx=5)
 
     raw_planets = [
         make_raw(0, 10.0, 10.0, owner=0, ships=20),
@@ -55,7 +65,7 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
         make_raw(2, 30.0, 30.0, owner=0, ships=0),    # zero-ships source
         make_raw(3, 40.0, 40.0, owner=0, ships=20),
         make_raw(4, 50.0, 50.0, owner=0, ships=20),
-        make_raw(5, 80.0, 80.0, owner=1, ships=5),    # enemy for valid launch
+        make_raw(5, 80.0, 80.0, owner=1, ships=5, production=2),
     ]
 
     def fake_crosses_sun(x1, y1, x2, y2):
@@ -72,7 +82,8 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     assert len(launches) == 1
     assert launches[0]["source_id"] == 4
     assert launches[0]["target_id"] == 5
-    assert launches[0]["ships"] == 10
+    # required = 5 + 2×10 + 1 = 26, int(26×1.10) = 28, clip to src.ships=20
+    assert launches[0]["ships"] == 20
     assert math.isclose(launches[0]["angle"], math.pi / 4)
     expected_core = {
         "attempts": 4,
@@ -85,9 +96,17 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     for k, v in expected_core.items():
         assert counts[k] == v, f"{k}: expected {v}, got {counts[k]}"
     # ships 실측 필드 존재 확인 (값 검증은 별도 테스트)
-    for k in ("ships_ratio_sum", "ships_to_send_sum", "required_ships_sum",
+    for k in ("chosen_multiplier_sum", "chosen_multiplier_sq_sum",
+              "ships_to_send_sum", "required_ships_sum",
               "send_required_ratio_sum", "under_invested_count"):
         assert k in counts, f"missing ships field: {k}"
+    # ships_bin 히스토그램 필드 존재 확인
+    for k in range(NUM_SHIPS_BINS):
+        assert f"ships_bin_hist_{k}" in counts, f"missing bin hist field: ships_bin_hist_{k}"
+    # bin 0 선택 1회, 다른 bin 0회
+    assert counts["ships_bin_hist_0"] == 1
+    for k in range(1, NUM_SHIPS_BINS):
+        assert counts[f"ships_bin_hist_{k}"] == 0
 
 
 def test_hit_rate_tracker_summary_returns_per_step_means():
@@ -399,28 +418,39 @@ def test_early_launch_neutral_captured_zero_when_launched_late():
 
 def test_ships_distribution_metrics_computed_from_launched_aggregates():
     """
-    decode counts에 누적한 ships_ratio_sum/ships_to_send_sum/required_ships_sum/
-    send_required_ratio_sum를 summary()가 launched로 나눠 평균/표준편차로 환산.
+    commit 2: decode counts에 누적한 chosen_multiplier_sum/ships_to_send_sum/
+    required_ships_sum/send_required_ratio_sum/ships_bin_hist_*를
+    summary()가 launched로 나눠 평균/표준편차/히스토그램으로 환산.
     """
     tracker = HitRateTracker()
-    # 2번의 launch 시뮬: ratio 0.2 & 0.4, ships 10 & 20, required 50 & 40
-    tracker.record({
+    # 2번의 launch 시뮬: multiplier 1.10 & 1.60, ships 28 & 40, required 26 & 25
+    record = {
         "attempts": 2,
         "launched": 2,
-        "ships_ratio_sum": 0.2 + 0.4,         # mean 0.3
-        "ships_ratio_sq_sum": 0.04 + 0.16,    # E[X²] 0.10 → std = sqrt(0.10 - 0.09) = 0.1
-        "ships_to_send_sum": 10 + 20,         # mean 15
-        "required_ships_sum": 50 + 40,        # mean 45
-        "send_required_ratio_sum": 0.2 + 0.5, # mean 0.35
-        "under_invested_count": 2,            # 둘 다 srr<1 → rate 100%
-    })
+        "chosen_multiplier_sum": 1.10 + 1.60,         # mean 1.35
+        "chosen_multiplier_sq_sum": 1.21 + 2.56,      # E[X²]=1.885 → std=sqrt(1.885-1.8225)=0.25
+        "ships_to_send_sum": 28 + 40,                 # mean 34
+        "required_ships_sum": 26 + 25,                # mean 25.5
+        "send_required_ratio_sum": 1.08 + 1.60,       # mean 1.34 (둘 다 srr≥1 → under 0)
+        "under_invested_count": 0,
+        # bin 0 (1.10) 1회, bin 2 (1.60) 1회
+        "ships_bin_hist_0": 1,
+        "ships_bin_hist_2": 1,
+    }
+    tracker.record(record)
     s = tracker.summary()
-    assert abs(s["ships_ratio_mean"] - 0.3) < 1e-6
-    assert abs(s["ships_ratio_std"] - 0.1) < 1e-6
-    assert abs(s["ships_to_send_mean"] - 15.0) < 1e-6
-    assert abs(s["required_ships_mean"] - 45.0) < 1e-6
-    assert abs(s["send_required_ratio_mean"] - 0.35) < 1e-6
-    assert abs(s["under_invested_rate"] - 1.0) < 1e-6
+    assert abs(s["chosen_multiplier_mean"] - 1.35) < 1e-6
+    assert abs(s["chosen_multiplier_std"] - 0.25) < 1e-6
+    assert abs(s["ships_to_send_mean"] - 34.0) < 1e-6
+    assert abs(s["required_ships_mean"] - 25.5) < 1e-6
+    assert abs(s["send_required_ratio_mean"] - 1.34) < 1e-6
+    assert abs(s["under_invested_rate"] - 0.0) < 1e-6
+    # bin 히스토그램 비율 (launched=2 기준)
+    assert abs(s["ships_bin_rate_0"] - 0.5) < 1e-6
+    assert abs(s["ships_bin_rate_2"] - 0.5) < 1e-6
+    # 선택 안 된 bin들은 0
+    assert s["ships_bin_rate_1"] == 0.0
+    assert s["ships_bin_rate_3"] == 0.0
 
 
 def test_ships_distribution_metrics_zero_when_no_launches():
@@ -428,9 +458,11 @@ def test_ships_distribution_metrics_zero_when_no_launches():
     tracker = HitRateTracker()
     tracker.record({"attempts": 1, "launched": 0})
     s = tracker.summary()
-    for k in ("ships_ratio_mean", "ships_ratio_std", "ships_to_send_mean",
+    for k in ("chosen_multiplier_mean", "chosen_multiplier_std", "ships_to_send_mean",
               "required_ships_mean", "send_required_ratio_mean", "under_invested_rate"):
         assert s[k] == 0.0, f"{k} should be 0 when launched=0, got {s[k]}"
+    for k in range(NUM_SHIPS_BINS):
+        assert s[f"ships_bin_rate_{k}"] == 0.0, f"ships_bin_rate_{k} should be 0"
 
 
 def test_resolve_keeps_alive_fleet_in_pending():

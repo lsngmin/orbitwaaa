@@ -7,6 +7,11 @@ model:
   global_layers: 4
   num_heads: 8
   temporal_window: 20
+  # ── ships head: required_ships 배수 Categorical ──────────────────────────────
+  # ships_to_send = min(int(required × multiplier), src.ships)
+  # required = target.ships + target.production × turns + 1
+  # 1.00 미포함 (필연적 실패) — 1.10부터 시작 (margin 최소 10%)
+  ships_multiplier_bins: [1.10, 1.30, 1.60, 2.00]
 
 training:
   batch_size: 256

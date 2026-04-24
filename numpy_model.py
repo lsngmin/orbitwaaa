@@ -13,7 +13,10 @@ MAX_PLANETS            = 40
 MAX_FLEETS             = 100
 PLANET_DIM             = 18
 FLEET_DIM              = 7
-ACTION_DIM             = MAX_PLANETS + 2   # 42
+# ships head: required_ships 배수 Categorical (commit 2)
+SHIPS_MULTIPLIER_BINS  = (1.10, 1.30, 1.60, 2.00)
+NUM_SHIPS_BINS         = len(SHIPS_MULTIPLIER_BINS)
+ACTION_DIM             = 1 + NUM_SHIPS_BINS + MAX_PLANETS   # 1 + 4 + 40 = 45
 PLANET_TEMPORAL_LAYERS = 2
 FLEET_TEMPORAL_LAYERS  = 1
 FLEET_TEMPORAL         = True
@@ -147,24 +150,31 @@ def get_action(obs_flat, w):
     """
     obs_flat : (1, obs_dim) float32 numpy array
     returns  : (MAX_PLANETS, ACTION_DIM) float32 numpy array
+
+    Layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
     """
     logits = forward(obs_flat, w)[0]   # (P, ACTION_DIM)
 
     # Launch: Bernoulli
     launch = (np.random.random(MAX_PLANETS) < _sigmoid(logits[:, 0])).astype(np.float32)
 
-    # Ships ratio: Normal(sigmoid(logit), 0.1)
-    ships_ratio = np.clip(
-        _sigmoid(logits[:, 1]) + 0.1 * np.random.standard_normal(MAX_PLANETS),
-        0.0, 1.0,
-    ).astype(np.float32)
+    # Ships bin: Categorical over K bins
+    ships_bin = np.array([
+        _sample_categorical(logits[i, 1:1 + NUM_SHIPS_BINS])
+        for i in range(MAX_PLANETS)
+    ])
+    ships_oh = np.zeros((MAX_PLANETS, NUM_SHIPS_BINS), dtype=np.float32)
+    ships_oh[np.arange(MAX_PLANETS), ships_bin] = 1.0
 
     # Target: Categorical
-    target = np.array([_sample_categorical(logits[i, 2:]) for i in range(MAX_PLANETS)])
+    target = np.array([
+        _sample_categorical(logits[i, 1 + NUM_SHIPS_BINS:])
+        for i in range(MAX_PLANETS)
+    ])
     target_oh = np.zeros((MAX_PLANETS, MAX_PLANETS), dtype=np.float32)
     target_oh[np.arange(MAX_PLANETS), target] = 1.0
 
-    return np.concatenate([launch[:, None], ships_ratio[:, None], target_oh], axis=-1)
+    return np.concatenate([launch[:, None], ships_oh, target_oh], axis=-1)
 
 
 # ── Weight loading ────────────────────────────────────────────────────────────

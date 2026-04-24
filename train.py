@@ -29,7 +29,11 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 import multiprocessing as mp
 
 from model import OrbitWarsPolicy
-from env_wrapper import encode_planets, encode_fleets, MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY
+from env_wrapper import (
+    encode_planets, encode_fleets,
+    MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
+    SHIPS_MULTIPLIER_BINS, NUM_SHIPS_BINS,
+)
 from prediction import aim, crosses_sun, first_collision_on_path, PositionCache
 
 with open("config.yaml") as f:
@@ -282,22 +286,28 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
                "filtered_zero_ships": 0, "filtered_sun": 0,
                "filtered_path": 0, "launched": 0, "launched_high_prod": 0,
-               # ── ships 분포 실측 (commit 1: Categorical head 도입 전 스냅샷) ──
-               "ships_ratio_sum": 0.0,       # 정책 출력 ships_ratio 평균
-               "ships_ratio_sq_sum": 0.0,    # std 계산용
-               "ships_to_send_sum": 0,       # 실제 발사 ships 수 평균
-               "required_ships_sum": 0.0,    # 필요 병력 추정치 평균
-               "send_required_ratio_sum": 0.0,  # ships_to_send / required 평균
-               "under_invested_count": 0}    # send_required_ratio < 1.0 횟수
+               # ── ships 분포 실측 (commit 2: Categorical multiplier head) ──
+               "chosen_multiplier_sum": 0.0,     # 선택된 배수 평균 (1.10~2.00)
+               "chosen_multiplier_sq_sum": 0.0,  # std 계산용
+               "ships_to_send_sum": 0,           # 실제 발사 ships 수 평균
+               "required_ships_sum": 0.0,        # 필요 병력 추정치 평균
+               "send_required_ratio_sum": 0.0,   # ships_to_send / required 평균
+               "under_invested_count": 0}        # send_required_ratio < 1.0 횟수 (src.ships로 clip된 경우)
+    # ships_bin 선택 히스토그램 (K bins): counts["ships_bin_hist_k"] = count
+    for k in range(NUM_SHIPS_BINS):
+        counts[f"ships_bin_hist_{k}"] = 0
     target_prods = [t.production for t in planets if t.owner != acting_player]
     high_prod_threshold = np.quantile(target_prods, 0.75) if target_prods else None
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
             continue
-        launch      = action_np[i, 0]
-        ships_ratio = float(np.clip(action_np[i, 1], 0.0, 1.0))
-        target_idx  = int(np.argmax(action_np[i, 2:2 + len(planets)]))
+        launch     = action_np[i, 0]
+        # Action layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
+        ships_bin  = int(np.argmax(action_np[i, 1:1 + NUM_SHIPS_BINS]))
+        target_idx = int(np.argmax(action_np[i, 1 + NUM_SHIPS_BINS:
+                                              1 + NUM_SHIPS_BINS + len(planets)]))
+        multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
 
         if launch < 0.5:
             continue
@@ -307,13 +317,21 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             counts["filtered_invalid_target"] += 1
             continue
 
-        target       = planets[target_idx]
-        ships_needed = max(1, int(p.ships * ships_ratio))
+        target = planets[target_idx]
+
+        # 1-pass required 추정: ships_rep=p.ships로 aim() 호출 → turns 획득
+        # turns로 required 계산 후 multiplier 적용. src.ships로 clip.
+        # turns=None 엣지 케이스는 보수적으로 1 사용.
+        _, _, _, est_turns = aim(p, target, av, int(p.ships), pos_cache=pos_cache)
+        eff_turns    = est_turns if est_turns else 1
+        required     = target.ships + target.production * eff_turns + 1
+        ships_needed = max(1, int(required * multiplier))
         ships_needed = min(ships_needed, p.ships)
         if ships_needed <= 0:
             counts["filtered_zero_ships"] += 1
             continue
 
+        # ships_needed 확정 후 aim 재호출 — 속도가 달라지면 실제 path도 달라짐.
         angle, tx, ty, turns = aim(p, target, av, ships_needed, pos_cache=pos_cache)
         if crosses_sun(p.x, p.y, tx, ty):
             counts["filtered_sun"] += 1
@@ -332,17 +350,16 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         if high_prod_threshold is not None and target.production >= high_prod_threshold:
             counts["launched_high_prod"] += 1
 
-        # ── ships 실측 (required = target.ships + prod × turns + 1) ─────────
-        # 1-pass 추정: 정확도는 margin이 흡수. turns는 aim()이 반환한 값 사용.
-        # turns=None 인 엣지 케이스는 보수적으로 1 사용 (과소추정 방지는 multiplier 역할).
-        eff_turns = turns if turns else 1
-        required = target.ships + target.production * eff_turns + 1
+        # ── ships 실측 (launched 기준 집계) ──────────────────────────────────
+        # send_required_ratio는 actual ships_needed(clip 후) / required.
+        # under_invested: src.ships가 부족해 required × multiplier에 못 미친 경우.
         srr = ships_needed / max(required, 1)
-        counts["ships_ratio_sum"]       += ships_ratio
-        counts["ships_ratio_sq_sum"]    += ships_ratio ** 2
-        counts["ships_to_send_sum"]     += ships_needed
-        counts["required_ships_sum"]    += required
-        counts["send_required_ratio_sum"] += srr
+        counts["chosen_multiplier_sum"]    += multiplier
+        counts["chosen_multiplier_sq_sum"] += multiplier ** 2
+        counts["ships_to_send_sum"]        += ships_needed
+        counts["required_ships_sum"]       += required
+        counts["send_required_ratio_sum"]  += srr
+        counts[f"ships_bin_hist_{ships_bin}"] += 1
         if srr < 1.0:
             counts["under_invested_count"] += 1
 
@@ -913,12 +930,14 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_early_launch_neutral_captured=rew_stats.get("mean_early_launch_neutral_captured", 0.0),
                 early_launch_neutral_captured_per_episode=rew_stats.get("early_launch_neutral_captured_per_episode", 0.0),
                 early_neutral_launch_to_cap_rate=rew_stats.get("early_neutral_launch_to_cap_rate", 0.0),
-                ships_ratio_mean=rew_stats.get("ships_ratio_mean", 0.0),
-                ships_ratio_std=rew_stats.get("ships_ratio_std", 0.0),
+                chosen_multiplier_mean=rew_stats.get("chosen_multiplier_mean", 0.0),
+                chosen_multiplier_std=rew_stats.get("chosen_multiplier_std", 0.0),
                 ships_to_send_mean=rew_stats.get("ships_to_send_mean", 0.0),
                 required_ships_mean=rew_stats.get("required_ships_mean", 0.0),
                 send_required_ratio_mean=rew_stats.get("send_required_ratio_mean", 0.0),
                 under_invested_rate=rew_stats.get("under_invested_rate", 0.0),
+                **{f"ships_bin_rate_{k}": rew_stats.get(f"ships_bin_rate_{k}", 0.0)
+                   for k in range(NUM_SHIPS_BINS)},
                 **head_metrics,
             )
 
