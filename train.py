@@ -281,7 +281,14 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     launches = []
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
                "filtered_zero_ships": 0, "filtered_sun": 0,
-               "filtered_path": 0, "launched": 0, "launched_high_prod": 0}
+               "filtered_path": 0, "launched": 0, "launched_high_prod": 0,
+               # ── ships 분포 실측 (commit 1: Categorical head 도입 전 스냅샷) ──
+               "ships_ratio_sum": 0.0,       # 정책 출력 ships_ratio 평균
+               "ships_ratio_sq_sum": 0.0,    # std 계산용
+               "ships_to_send_sum": 0,       # 실제 발사 ships 수 평균
+               "required_ships_sum": 0.0,    # 필요 병력 추정치 평균
+               "send_required_ratio_sum": 0.0,  # ships_to_send / required 평균
+               "under_invested_count": 0}    # send_required_ratio < 1.0 횟수
     target_prods = [t.production for t in planets if t.owner != acting_player]
     high_prod_threshold = np.quantile(target_prods, 0.75) if target_prods else None
 
@@ -324,6 +331,21 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         counts["launched"] += 1
         if high_prod_threshold is not None and target.production >= high_prod_threshold:
             counts["launched_high_prod"] += 1
+
+        # ── ships 실측 (required = target.ships + prod × turns + 1) ─────────
+        # 1-pass 추정: 정확도는 margin이 흡수. turns는 aim()이 반환한 값 사용.
+        # turns=None 인 엣지 케이스는 보수적으로 1 사용 (과소추정 방지는 multiplier 역할).
+        eff_turns = turns if turns else 1
+        required = target.ships + target.production * eff_turns + 1
+        srr = ships_needed / max(required, 1)
+        counts["ships_ratio_sum"]       += ships_ratio
+        counts["ships_ratio_sq_sum"]    += ships_ratio ** 2
+        counts["ships_to_send_sum"]     += ships_needed
+        counts["required_ships_sum"]    += required
+        counts["send_required_ratio_sum"] += srr
+        if srr < 1.0:
+            counts["under_invested_count"] += 1
+
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
         start_y = p.y + math.sin(angle) * (p.radius + 0.1)
@@ -891,6 +913,12 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_early_launch_neutral_captured=rew_stats.get("mean_early_launch_neutral_captured", 0.0),
                 early_launch_neutral_captured_per_episode=rew_stats.get("early_launch_neutral_captured_per_episode", 0.0),
                 early_neutral_launch_to_cap_rate=rew_stats.get("early_neutral_launch_to_cap_rate", 0.0),
+                ships_ratio_mean=rew_stats.get("ships_ratio_mean", 0.0),
+                ships_ratio_std=rew_stats.get("ships_ratio_std", 0.0),
+                ships_to_send_mean=rew_stats.get("ships_to_send_mean", 0.0),
+                required_ships_mean=rew_stats.get("required_ships_mean", 0.0),
+                send_required_ratio_mean=rew_stats.get("send_required_ratio_mean", 0.0),
+                under_invested_rate=rew_stats.get("under_invested_rate", 0.0),
                 **head_metrics,
             )
 

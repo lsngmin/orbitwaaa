@@ -74,7 +74,7 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     assert launches[0]["target_id"] == 5
     assert launches[0]["ships"] == 10
     assert math.isclose(launches[0]["angle"], math.pi / 4)
-    assert counts == {
+    expected_core = {
         "attempts": 4,
         "filtered_invalid_target": 1,
         "filtered_zero_ships": 1,
@@ -82,6 +82,12 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
         "filtered_path": 0,
         "launched": 1,
     }
+    for k, v in expected_core.items():
+        assert counts[k] == v, f"{k}: expected {v}, got {counts[k]}"
+    # ships 실측 필드 존재 확인 (값 검증은 별도 테스트)
+    for k in ("ships_ratio_sum", "ships_to_send_sum", "required_ships_sum",
+              "send_required_ratio_sum", "under_invested_count"):
+        assert k in counts, f"missing ships field: {k}"
 
 
 def test_hit_rate_tracker_summary_returns_per_step_means():
@@ -389,6 +395,42 @@ def test_early_launch_neutral_captured_zero_when_launched_late():
 
     assert tracker.counters["captured_neutral"] == 1
     assert tracker.counters["early_launch_neutral_captured"] == 0
+
+
+def test_ships_distribution_metrics_computed_from_launched_aggregates():
+    """
+    decode counts에 누적한 ships_ratio_sum/ships_to_send_sum/required_ships_sum/
+    send_required_ratio_sum를 summary()가 launched로 나눠 평균/표준편차로 환산.
+    """
+    tracker = HitRateTracker()
+    # 2번의 launch 시뮬: ratio 0.2 & 0.4, ships 10 & 20, required 50 & 40
+    tracker.record({
+        "attempts": 2,
+        "launched": 2,
+        "ships_ratio_sum": 0.2 + 0.4,         # mean 0.3
+        "ships_ratio_sq_sum": 0.04 + 0.16,    # E[X²] 0.10 → std = sqrt(0.10 - 0.09) = 0.1
+        "ships_to_send_sum": 10 + 20,         # mean 15
+        "required_ships_sum": 50 + 40,        # mean 45
+        "send_required_ratio_sum": 0.2 + 0.5, # mean 0.35
+        "under_invested_count": 2,            # 둘 다 srr<1 → rate 100%
+    })
+    s = tracker.summary()
+    assert abs(s["ships_ratio_mean"] - 0.3) < 1e-6
+    assert abs(s["ships_ratio_std"] - 0.1) < 1e-6
+    assert abs(s["ships_to_send_mean"] - 15.0) < 1e-6
+    assert abs(s["required_ships_mean"] - 45.0) < 1e-6
+    assert abs(s["send_required_ratio_mean"] - 0.35) < 1e-6
+    assert abs(s["under_invested_rate"] - 1.0) < 1e-6
+
+
+def test_ships_distribution_metrics_zero_when_no_launches():
+    """launched=0이면 0으로 나누지 않고 모든 ships 지표를 0.0으로."""
+    tracker = HitRateTracker()
+    tracker.record({"attempts": 1, "launched": 0})
+    s = tracker.summary()
+    for k in ("ships_ratio_mean", "ships_ratio_std", "ships_to_send_mean",
+              "required_ships_mean", "send_required_ratio_mean", "under_invested_rate"):
+        assert s[k] == 0.0, f"{k} should be 0 when launched=0, got {s[k]}"
 
 
 def test_resolve_keeps_alive_fleet_in_pending():

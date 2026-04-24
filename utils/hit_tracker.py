@@ -54,6 +54,10 @@ class HitRateTracker:
         "early_neutral_captured", # 초반 20턴 내 (resolve 시점) 중립 점령 성공 수
         "early_launch_neutral_captured",  # 초반 20턴 내 발사된 중립 타겟의 실제 점령 수
                                           # (resolve 시점 무관 — fleet 비행시간 영향 X)
+        # ── ships 분포 실측 (commit 1: Categorical head 도입 전 스냅샷) ────
+        "ships_ratio_sum", "ships_ratio_sq_sum",
+        "ships_to_send_sum", "required_ships_sum",
+        "send_required_ratio_sum", "under_invested_count",
         "unknown_removal",
     )
     HOME_EXPAND_TURNS = 20
@@ -237,6 +241,27 @@ class HitRateTracker:
         out["early_neutral_launch_to_cap_rate"] = (
             self.counters.get("early_launch_neutral_captured", 0) / max(early_n_att, 1)
         )
+        # ── ships 분포 실측 파생 지표 ──────────────────────────────────────
+        # 모든 통계는 "launched" 기준 평균 (filter 통과한 valid launch만 집계)
+        sr_sum   = self.counters.get("ships_ratio_sum", 0.0)
+        sr_sq    = self.counters.get("ships_ratio_sq_sum", 0.0)
+        sts_sum  = self.counters.get("ships_to_send_sum", 0)
+        req_sum  = self.counters.get("required_ships_sum", 0.0)
+        srr_sum  = self.counters.get("send_required_ratio_sum", 0.0)
+        under    = self.counters.get("under_invested_count", 0)
+        if launched > 0:
+            sr_mean = sr_sum / launched
+            sr_var  = max(sr_sq / launched - sr_mean ** 2, 0.0)
+            out["ships_ratio_mean"]         = sr_mean
+            out["ships_ratio_std"]          = math.sqrt(sr_var)
+            out["ships_to_send_mean"]       = sts_sum / launched
+            out["required_ships_mean"]      = req_sum / launched
+            out["send_required_ratio_mean"] = srr_sum / launched
+            out["under_invested_rate"]      = under / launched
+        else:
+            for k in ("ships_ratio_mean", "ships_ratio_std", "ships_to_send_mean",
+                      "required_ships_mean", "send_required_ratio_mean", "under_invested_rate"):
+                out[k] = 0.0
         return out
 
 

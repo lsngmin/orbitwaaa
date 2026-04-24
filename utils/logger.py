@@ -47,6 +47,10 @@ class TrainingLogger:
             "early_neutral_captured_per_episode",
             "early_launch_neutral_captured_per_episode",
             "early_neutral_launch_to_cap_rate",
+            # ── ships 분포 실측 (commit 1: Categorical head 전 스냅샷) ──────
+            "ships_ratio_mean", "ships_ratio_std",
+            "ships_to_send_mean", "required_ships_mean",
+            "send_required_ratio_mean", "under_invested_rate",
             "mean_unknown_removal",
             "win_rate", "league_size",
         ]
@@ -174,3 +178,17 @@ class TrainingLogger:
                 f" | launch20→cap={early_lnc:.2f}(={early_l2c:.0%})]"
             )
             print(line4)
+
+        sr_mean   = kwargs.get("ships_ratio_mean", "")
+        sr_std    = kwargs.get("ships_ratio_std", "")
+        sts_mean  = kwargs.get("ships_to_send_mean", "")
+        req_mean  = kwargs.get("required_ships_mean", "")
+        srr_mean  = kwargs.get("send_required_ratio_mean", "")
+        under     = kwargs.get("under_invested_rate", "")
+        if _is_num(sr_mean):
+            line5 = (
+                f"ships=[ratio={sr_mean:.3f}±{sr_std:.3f}"
+                f" | send={sts_mean:.1f}/req={req_mean:.1f}"
+                f" | s/r={srr_mean:.2f}/under={under:.0%}]"
+            )
+            print(line5)
