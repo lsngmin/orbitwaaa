@@ -31,6 +31,9 @@ training:
   dense_reward_coef: 0.004  # 중간 shaping은 약한 힌트만 주도록 축소
   cap_bonus_gain: 0.008     # 중립 → 내 점령 시 prod * 이 값 보너스
   cap_bonus_loss: 0.012     # 내 → 상실 시 prod * 이 값 페널티 (수비 신호는 gain보다 조금 강하게)
+  state_score_ship_weight: 0.1    # timeout 승자 판정(total ships)에 더 가깝게 정렬
+  state_score_prod_weight: 0.5    # 생산력은 ships로 이어지는 간접 힌트만 유지
+  state_score_planet_weight: 0.5  # planet_count 편향 완화 (기존 2.0에서 축소)
 
 env:
   max_planets: 40

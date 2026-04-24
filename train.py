@@ -84,8 +84,8 @@ class LeaguePool:
 def state_score(raw_obs, player):
     """행성 경제 상태를 단일 스칼라로 요약.
 
-    (planet_ships + fleet_ships) * 0.01 + production * 1.0 + planet_count * 2.0
-    production / planet_count 가중치 상향: 초반 영토 확장의 학습 신호 강화.
+    timeout 승자 판정(total ships)과 더 가깝게 정렬하되,
+    production / planet_count는 약한 shaping 힌트로만 유지한다.
     """
     if isinstance(raw_obs, dict):
         planets = raw_obs.get("planets", [])
@@ -110,7 +110,10 @@ def state_score(raw_obs, player):
         if owner == player:
             total_ships += ships
 
-    return total_ships * 0.01 + total_prod * 1.0 + planet_count * 2.0
+    ship_w   = float(T.get("state_score_ship_weight", 0.01))
+    prod_w   = float(T.get("state_score_prod_weight", 1.0))
+    planet_w = float(T.get("state_score_planet_weight", 2.0))
+    return total_ships * ship_w + total_prod * prod_w + planet_count * planet_w
 
 
 def _snapshot_planet_owners(raw_obs):
