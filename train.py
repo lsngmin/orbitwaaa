@@ -848,7 +848,21 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
 # ── 평가 ──────────────────────────────────────────────────────────────────────
 
 def evaluate(main_model, opponent_model, n_games=20):
+    """Eval: win rate + win/loss split summary (under_invested, s/r per game).
+
+    가설: under-invest가 패배와 상관 있다면 loss 게임의 under/sr이 win 게임보다 나쁨.
+    - 전체 평균(rollout)은 노이즈가 많아서 인과 분석 어려움
+    - 승패 split이 더 날카로운 신호 (같은 policy에서 win vs loss 차이)
+    """
     wins = 0
+    # 게임별 decode 카운트 누적 (평균을 내기 위해 합계 + launched 저장)
+    # bucket: "win" / "loss" (draw는 버림)
+    bucket_under_cnt  = {"win": 0, "loss": 0}
+    bucket_launched   = {"win": 0, "loss": 0}
+    bucket_sr_sum     = {"win": 0.0, "loss": 0.0}
+    bucket_under_enm  = {"win": 0, "loss": 0}
+    bucket_enemy_lch  = {"win": 0, "loss": 0}
+
     for _ in range(n_games):
         env = make("orbit_wars", debug=False)
         env.reset()
@@ -856,6 +870,13 @@ def evaluate(main_model, opponent_model, n_games=20):
         history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
         history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
         history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+
+        # per-game 카운터 (승패 분류 후 bucket에 합산)
+        game_launched = 0
+        game_under    = 0
+        game_sr_sum   = 0.0
+        game_under_e  = 0
+        game_enemy_l  = 0
 
         while not env.done:
             raw_main = env.state[0].observation
@@ -867,10 +888,25 @@ def evaluate(main_model, opponent_model, n_games=20):
                     launch_mask=analysis_e.launch_mask.unsqueeze(0).to(DEVICE),
                     target_mask=analysis_e.target_mask.unsqueeze(0).to(DEVICE),
                 )
-            moves_main = decode_action_to_moves(
+            moves_main, counts, _launches = decode_action_to_moves(
                 action_t.squeeze(0).cpu().numpy(), raw_p, av,
-                acting_player=0, analysis=analysis_e,
+                acting_player=0, analysis=analysis_e, return_counts=True,
             )
+            game_launched += counts.get("launched", 0)
+            game_under    += counts.get("under_invested_count", 0)
+            game_sr_sum   += counts.get("send_required_ratio_sum", 0.0)
+            game_under_e  += counts.get("under_invested_count_enemy", 0)
+            # enemy launch 수 = 전체 launched − neutral — 여기서는 직접 계산.
+            # target_neutral/enemy counter가 decode counts에 없으므로 launches 순회는
+            # 이미 소비됨. 대신 under_invested_count_enemy + (enemy에 대한 not-under)
+            # 를 알 길이 없으므로, ships_to_send_sum_enemy>0 여부 등으로는 부정확.
+            # 가장 단순: enemy launches = launched - neutral_launches. neutral 카운트 하자.
+            # (counts dict에 직접 접근해서 enemy 분모 카운트)
+            # → 실제로는 counts에 target_{neutral,enemy}가 없어서 별도 계산 필요.
+            # 대안: launches 리스트에서 target_owner로 센다.
+            for l in _launches:
+                if l.get("target_owner", -1) != -1:
+                    game_enemy_l += 1
 
             raw_opp = env.state[1].observation
             obs_o, raw_po, avo = get_obs_tensor(raw_opp, 1, history_p_opp, history_f_opp)
@@ -881,9 +917,32 @@ def evaluate(main_model, opponent_model, n_games=20):
         r = env.state[0].reward
         if r == 1:
             wins += 1
+            key = "win"
         elif r == 0:
             wins += 0.5
-    return wins / n_games
+            key = None   # draw는 분석에서 제외 (noise만 추가)
+        else:
+            key = "loss"
+
+        if key is not None:
+            bucket_under_cnt[key] += game_under
+            bucket_launched[key]  += game_launched
+            bucket_sr_sum[key]    += game_sr_sum
+            bucket_under_enm[key] += game_under_e
+            bucket_enemy_lch[key] += game_enemy_l
+
+    def _rate(num, den):
+        return num / den if den > 0 else 0.0
+
+    split = {
+        "eval_under_win":        _rate(bucket_under_cnt["win"],  bucket_launched["win"]),
+        "eval_under_loss":       _rate(bucket_under_cnt["loss"], bucket_launched["loss"]),
+        "eval_sr_win":           _rate(bucket_sr_sum["win"],     bucket_launched["win"]),
+        "eval_sr_loss":          _rate(bucket_sr_sum["loss"],    bucket_launched["loss"]),
+        "eval_under_enemy_win":  _rate(bucket_under_enm["win"],  bucket_enemy_lch["win"]),
+        "eval_under_enemy_loss": _rate(bucket_under_enm["loss"], bucket_enemy_lch["loss"]),
+    }
+    return wins / n_games, split
 
 
 # ── Main Training Loop ────────────────────────────────────────────────────────
@@ -1022,6 +1081,10 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 ships_to_send_mean_enemy=rew_stats.get("ships_to_send_mean_enemy", 0.0),
                 required_ships_mean_neutral=rew_stats.get("required_ships_mean_neutral", 0.0),
                 required_ships_mean_enemy=rew_stats.get("required_ships_mean_enemy", 0.0),
+                # 연계 공격: 단발 실패 vs 계획된 연속 압박 구분
+                repeat_target_rate=rew_stats.get("repeat_target_rate", 0.0),
+                launch_to_cap_rate_neutral=rew_stats.get("launch_to_cap_rate_neutral", 0.0),
+                launch_to_cap_rate_enemy=rew_stats.get("launch_to_cap_rate_enemy", 0.0),
                 **{f"ships_bin_rate_{k}": rew_stats.get(f"ships_bin_rate_{k}", 0.0)
                    for k in range(NUM_SHIPS_BINS)},
                 **head_metrics,
@@ -1030,7 +1093,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
             if generation % eval_interval == 0:
                 opp_eval = league.sample_opponent() or exploiter
                 eval_t0  = time.time()
-                win_rate = evaluate(main_model, opp_eval, n_games=n_games)
+                win_rate, eval_split = evaluate(main_model, opp_eval, n_games=n_games)
                 eval_wall_s = time.time() - eval_t0
 
                 gen_wall_s = time.time() - gen_t0
@@ -1040,6 +1103,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                     win_rate=win_rate, league_size=len(league),
                     eval_wall_s=eval_wall_s,
                     gen_wall_s=gen_wall_s,
+                    **eval_split,
                 )
 
                 if win_rate >= SP["win_threshold"]:

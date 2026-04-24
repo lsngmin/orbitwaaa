@@ -66,6 +66,13 @@ class TrainingLogger:
             "under_invested_rate_neutral", "under_invested_rate_enemy",
             "ships_to_send_mean_neutral", "ships_to_send_mean_enemy",
             "required_ships_mean_neutral", "required_ships_mean_enemy",
+            # 연계 공격 (단발 실패 vs 연속 압박 구분)
+            "repeat_target_rate",
+            "launch_to_cap_rate_neutral", "launch_to_cap_rate_enemy",
+            # eval 전용: 승리/패배 게임 분리 (under-invest ↔ 패배 상관관계)
+            "eval_under_win", "eval_under_loss",
+            "eval_sr_win", "eval_sr_loss",
+            "eval_under_enemy_win", "eval_under_enemy_loss",
             # ships_bin 히스토그램 (launched 대비 비율)
             *(f"ships_bin_rate_{k}" for k in range(_NUM_SHIPS_BINS)),
             "mean_unknown_removal",
@@ -234,3 +241,32 @@ class TrainingLogger:
                 f" | enm: s/r={srr_e:.2f}/under={und_e:.0%}/send={sts_e:.1f}]"
             )
             print(line6)
+
+        # 연계 공격 지표: 단발 실패인지 계획된 연속 압박인지 구분.
+        # repeat_target_rate: 같은 target에 K턴 내 재발사 비율
+        # launch_to_cap_rate_{neu,enm}: launch 후 K턴 내 target 점령된 비율
+        # (under 높지만 launch_to_cap_rate도 높으면 연계 성공 — 건강한 지표)
+        rpt_rate  = kwargs.get("repeat_target_rate", "")
+        l2c_neu   = kwargs.get("launch_to_cap_rate_neutral", "")
+        l2c_enm   = kwargs.get("launch_to_cap_rate_enemy", "")
+        if _is_num(rpt_rate):
+            line7 = (
+                f"combo=[repeat={rpt_rate:.0%}"
+                f" | l2c_neu={l2c_neu:.0%}/l2c_enm={l2c_enm:.0%}]"
+            )
+            print(line7)
+
+        # eval win/loss split: 승리 게임 vs 패배 게임의 under/sr 차이
+        # (under-invest 가설이 맞다면 loss > win이어야 함)
+        e_uw = kwargs.get("eval_under_win", "")
+        e_ul = kwargs.get("eval_under_loss", "")
+        e_sw = kwargs.get("eval_sr_win", "")
+        e_sl = kwargs.get("eval_sr_loss", "")
+        e_uew = kwargs.get("eval_under_enemy_win", "")
+        e_uel = kwargs.get("eval_under_enemy_loss", "")
+        if _is_num(e_uw):
+            line8 = (
+                f"eval_split=[win: under={e_uw:.0%}(enm={e_uew:.0%})/sr={e_sw:.2f}"
+                f" | loss: under={e_ul:.0%}(enm={e_uel:.0%})/sr={e_sl:.2f}]"
+            )
+            print(line8)

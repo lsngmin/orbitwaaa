@@ -73,10 +73,18 @@ class HitRateTracker:
         "required_ships_sum_neutral", "required_ships_sum_enemy",
         "send_required_ratio_sum_neutral", "send_required_ratio_sum_enemy",
         "under_invested_count_neutral", "under_invested_count_enemy",
+        # ── 연계 공격 계측 (단발 실패 vs 계획된 연속 압박 구분) ──────────────
+        # repeat_target: 같은 target에 REPEAT_K턴 내 2회 이상 발사 (현재 발사가 N≥2번째)
+        # launch_to_cap_k_{neu,enm}: 발사 후 LAUNCH_TO_CAP_K턴 내 그 target이 결국 점령된 launch 수
+        "repeat_target",
+        "launch_to_cap_k_neutral", "launch_to_cap_k_enemy",
         "unknown_removal",
     ) + tuple(f"ships_bin_hist_{k}" for k in range(NUM_SHIPS_BINS))
     HOME_EXPAND_TURNS = 20
     HOME_EXPAND_RADIUS = 25.0
+    # 연계 공격 윈도우 (평균 flight time이 대략 10~15턴 이므로 20턴이면 fleet 도착 커버)
+    REPEAT_K = 20
+    LAUNCH_TO_CAP_K = 20
 
     def __init__(self, player_id=0):
         self.counters = defaultdict(int)
@@ -86,12 +94,20 @@ class HitRateTracker:
         self.episodes = 0
         self.episode_turn = 0
         self.home_positions = []
+        # 연계 공격 추적:
+        # last_launch_turn[target_id] = 마지막 발사 turn  (repeat_target 검출)
+        # launches_by_target[target_id] = [(launch_turn, target_owner_at_launch), ...]
+        #                                  (launch_to_cap_k 검출 — 윈도우 만료 시 제거)
+        self.last_launch_turn = {}
+        self.launches_by_target = defaultdict(list)
 
     def reset_episode(self, obs):
         self.pending.clear()
         self.episodes += 1
         self.episode_turn = 0
         self.home_positions = []
+        self.last_launch_turn = {}
+        self.launches_by_target = defaultdict(list)
         for p in _get(obs, "planets", []):
             owner = p[1] if isinstance(p, (list, tuple)) else p.owner
             if owner != self.player_id:
@@ -128,6 +144,7 @@ class HitRateTracker:
                 "launched_at_turn": self.episode_turn,
             }
             target_owner = meta.get("target_owner")
+            target_id    = meta.get("target_id")
             if target_owner == -1:
                 self.counters["target_neutral"] += 1
                 if is_early:
@@ -136,6 +153,16 @@ class HitRateTracker:
                 self.counters["target_enemy"] += 1
                 if is_early:
                     self.counters["early_enemy_attempts"] += 1
+
+            # 연계 공격 계측: 같은 target에 REPEAT_K턴 내 재발사인가?
+            # 현재 발사가 N≥2번째일 때 repeat_target += 1 (첫 발사는 아직 "연계" 아님).
+            if target_id is not None:
+                last = self.last_launch_turn.get(target_id)
+                if last is not None and (self.episode_turn - last) <= self.REPEAT_K:
+                    self.counters["repeat_target"] += 1
+                self.last_launch_turn[target_id] = self.episode_turn
+                # launch_to_cap_k 추적용 (target 점령 시점에 역조회)
+                self.launches_by_target[target_id].append((self.episode_turn, target_owner))
 
     # ── V2: 해소 ────────────────────────────────────────────────────────────
     def resolve_step(self, prev_obs, curr_obs, max_speed):
@@ -228,6 +255,33 @@ class HitRateTracker:
                             self.counters["captured_enemy"] += 1
             else:
                 self.counters["unknown_removal"] += 1
+
+        # launch_to_cap_k: 이번 턴에 "내 행성이 된" planet을 찾아,
+        # LAUNCH_TO_CAP_K턴 내 그 planet을 target으로 쏜 launch들을 successful로 카운트.
+        # 기존 captured_{suffix}는 fleet 충돌 attribution에 의존 (한 캡처당 1회만)
+        # 여기서는 연계 launch 전부 카운트 → "지금은 부족해 보여도 결국 먹었나?" 분석용.
+        for pid, curr_planet in curr_planet_map.items():
+            prev_planet = prev_planet_map.get(pid)
+            if prev_planet is None:
+                continue
+            if prev_planet[1] == self.player_id or curr_planet[1] != self.player_id:
+                continue
+            launches = self.launches_by_target.pop(pid, [])
+            for l_turn, l_owner in launches:
+                if self.episode_turn - l_turn > self.LAUNCH_TO_CAP_K:
+                    continue
+                kind = "neutral" if l_owner == -1 else "enemy"
+                self.counters[f"launch_to_cap_k_{kind}"] += 1
+
+        # 윈도우 만료 launch 정리 (메모리는 작지만 일관성 위해)
+        for pid in list(self.launches_by_target.keys()):
+            self.launches_by_target[pid] = [
+                (t, o) for (t, o) in self.launches_by_target[pid]
+                if self.episode_turn - t <= self.LAUNCH_TO_CAP_K
+            ]
+            if not self.launches_by_target[pid]:
+                del self.launches_by_target[pid]
+
         self.episode_turn += 1
 
     # ── 요약 ────────────────────────────────────────────────────────────────
@@ -296,6 +350,10 @@ class HitRateTracker:
         #   under_invested_rate_{neutral,enemy}:
         #     nominal margin 미달 비율 (= src.ships clip). under-invest가 enemy 쪽에
         #     많으면 prod 재생산으로 장기 waste, 패배 상관 높음.
+        #   launch_to_cap_rate_{neutral,enemy}:
+        #     launch 후 LAUNCH_TO_CAP_K턴 내 target이 결국 점령됐나.
+        #     under-invest가 많아도 이 값이 높으면 "연계 공격 성공" 패턴,
+        #     낮으면 단순 waste 패턴.
         for kind in ("neutral", "enemy"):
             n_launch = counters.get(f"target_{kind}", 0)
             if n_launch > 0:
@@ -303,11 +361,18 @@ class HitRateTracker:
                 out[f"required_ships_mean_{kind}"]      = counters.get(f"required_ships_sum_{kind}", 0.0) / n_launch
                 out[f"send_required_ratio_mean_{kind}"] = counters.get(f"send_required_ratio_sum_{kind}", 0.0) / n_launch
                 out[f"under_invested_rate_{kind}"]      = counters.get(f"under_invested_count_{kind}", 0) / n_launch
+                out[f"launch_to_cap_rate_{kind}"]       = counters.get(f"launch_to_cap_k_{kind}", 0) / n_launch
             else:
                 out[f"ships_to_send_mean_{kind}"]       = 0.0
                 out[f"required_ships_mean_{kind}"]      = 0.0
                 out[f"send_required_ratio_mean_{kind}"] = 0.0
                 out[f"under_invested_rate_{kind}"]      = 0.0
+                out[f"launch_to_cap_rate_{kind}"]       = 0.0
+
+        # repeat_target_rate: 같은 target에 REPEAT_K턴 내 재발사 비율.
+        # (첫 발사는 repeat 아니므로 최대값 ≈ (launched-unique_targets)/launched)
+        # 높으면 계획된 연속 압박, 낮으면 산발적 단발 시도.
+        out["repeat_target_rate"] = counters.get("repeat_target", 0) / max(launched, 1)
         return out
 
     def summary(self):
