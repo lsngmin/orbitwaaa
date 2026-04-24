@@ -15,8 +15,8 @@ from submission_features import (
     encode_planets, encode_fleets,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
 )
-from prediction import aim, crosses_sun
-from numpy_model import get_action, load_weights
+from prediction import crosses_sun, resolve_ships_for_capture
+from numpy_model import get_action, load_weights, SHIPS_MULTIPLIER_BINS, NUM_SHIPS_BINS
 
 # ── 가중치 로드 ───────────────────────────────────────────────────────────────
 
@@ -61,8 +61,12 @@ def _decode(action_np, raw_planets, av, acting_player):
         if action_np[i, 0] < 0.5:
             continue
 
-        ships_ratio = float(action_np[i, 1])
-        target_idx  = int(np.argmax(action_np[i, 2:2 + len(planets)]))
+        # Layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
+        ships_bin  = int(np.argmax(action_np[i, 1:1 + NUM_SHIPS_BINS]))
+        target_idx = int(np.argmax(action_np[i, 1 + NUM_SHIPS_BINS:
+                                              1 + NUM_SHIPS_BINS + len(planets)]))
+        multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
+
         if target_idx >= len(planets):
             continue
 
@@ -70,12 +74,14 @@ def _decode(action_np, raw_planets, av, acting_player):
         if target.owner == acting_player:
             continue
 
-        ships_needed = max(1, int(p.ships * ships_ratio))
-        ships_needed = min(ships_needed, p.ships)
+        # 고정점 반복으로 (ships_needed, required) 동시 해결 (commit 3).
+        # 학습 decode와 정확히 동일한 resolver를 사용해 정책 간 불일치 제거.
+        ships_needed, angle, tx, ty, _, _, _ = resolve_ships_for_capture(
+            p, target, av, multiplier, p.ships,
+        )
         if ships_needed <= 0:
             continue
 
-        angle, tx, ty, _ = aim(p, target, av, ships_needed)
         if crosses_sun(p.x, p.y, tx, ty):
             continue
 

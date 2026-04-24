@@ -1,5 +1,8 @@
 import math
+import os
 from collections import defaultdict
+
+import yaml
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import (
     BOARD_SIZE,
@@ -7,6 +10,13 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import (
     SUN_RADIUS,
     point_to_segment_distance,
 )
+
+# ships head: required_ships 배수 Categorical (commit 2)
+_cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+with open(_cfg_path) as _f:
+    _CFG = yaml.safe_load(_f)
+SHIPS_MULTIPLIER_BINS = tuple(_CFG["model"].get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
+NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
 
 
 def _get(obs, key, default=None):
@@ -54,12 +64,12 @@ class HitRateTracker:
         "early_neutral_captured", # 초반 20턴 내 (resolve 시점) 중립 점령 성공 수
         "early_launch_neutral_captured",  # 초반 20턴 내 발사된 중립 타겟의 실제 점령 수
                                           # (resolve 시점 무관 — fleet 비행시간 영향 X)
-        # ── ships 분포 실측 (commit 1: Categorical head 도입 전 스냅샷) ────
-        "ships_ratio_sum", "ships_ratio_sq_sum",
+        # ── ships 분포 실측 (commit 2: Categorical multiplier head) ───────
+        "chosen_multiplier_sum", "chosen_multiplier_sq_sum",
         "ships_to_send_sum", "required_ships_sum",
         "send_required_ratio_sum", "under_invested_count",
         "unknown_removal",
-    )
+    ) + tuple(f"ships_bin_hist_{k}" for k in range(NUM_SHIPS_BINS))
     HOME_EXPAND_TURNS = 20
     HOME_EXPAND_RADIUS = 25.0
 
@@ -216,53 +226,66 @@ class HitRateTracker:
         self.episode_turn += 1
 
     # ── 요약 ────────────────────────────────────────────────────────────────
-    def summary(self):
-        steps = max(self.n_steps, 1)
-        out = {f"mean_{k}": self.counters.get(k, 0) / steps for k in self.METRIC_KEYS}
-        attempts = self.counters.get("attempts", 0)
-        launched = self.counters.get("launched", 0)
+    @staticmethod
+    def summary_from_counters(counters, n_steps, episodes):
+        """Raw counters dict + n_steps + episodes에서 normalized summary 구성.
+
+        병렬 worker에서 받은 raw state를 합산한 뒤 정확한 분모(step/episode/
+        launched/attempts)로 한 번에 정규화할 수 있게 separate function으로 분리.
+        단순 worker-평균은 episode 길이가 worker마다 다를 때 편향됨.
+        """
+        steps = max(n_steps, 1)
+        out = {f"mean_{k}": counters.get(k, 0) / steps for k in HitRateTracker.METRIC_KEYS}
+        attempts = counters.get("attempts", 0)
+        launched = counters.get("launched", 0)
         out["launch_rate"] = launched / max(attempts, 1)
-        out["noop_rate"] = self.counters.get("noop_steps", 0) / steps
-        out["high_prod_target_rate"] = self.counters.get("launched_high_prod", 0) / max(launched, 1)
-        out["neutral_capture_rate"] = self.counters.get("captured_neutral", 0) / max(launched, 1)
-        out["enemy_capture_rate"] = self.counters.get("captured_enemy", 0) / max(launched, 1)
-        out["early_home_expand_per_episode"] = self.counters.get("early_home_expand", 0) / max(self.episodes, 1)
-        # ── 타겟 분포 / 초반 확장 파생 지표 ─────────────────────────────────
-        eps = max(self.episodes, 1)
-        out["target_neutral_rate"] = self.counters.get("target_neutral", 0) / max(launched, 1)
-        out["target_enemy_rate"]   = self.counters.get("target_enemy", 0)   / max(launched, 1)
-        out["early_neutral_attempts_per_episode"] = self.counters.get("early_neutral_attempts", 0) / eps
-        out["early_enemy_attempts_per_episode"]   = self.counters.get("early_enemy_attempts", 0)   / eps
-        out["early_neutral_captured_per_episode"] = self.counters.get("early_neutral_captured", 0) / eps
-        out["early_launch_neutral_captured_per_episode"] = self.counters.get("early_launch_neutral_captured", 0) / eps
+        out["noop_rate"] = counters.get("noop_steps", 0) / steps
+        out["high_prod_target_rate"] = counters.get("launched_high_prod", 0) / max(launched, 1)
+        out["neutral_capture_rate"] = counters.get("captured_neutral", 0) / max(launched, 1)
+        out["enemy_capture_rate"] = counters.get("captured_enemy", 0) / max(launched, 1)
+        eps = max(episodes, 1)
+        out["early_home_expand_per_episode"] = counters.get("early_home_expand", 0) / eps
+        out["target_neutral_rate"] = counters.get("target_neutral", 0) / max(launched, 1)
+        out["target_enemy_rate"]   = counters.get("target_enemy", 0)   / max(launched, 1)
+        out["early_neutral_attempts_per_episode"] = counters.get("early_neutral_attempts", 0) / eps
+        out["early_enemy_attempts_per_episode"]   = counters.get("early_enemy_attempts", 0)   / eps
+        out["early_neutral_captured_per_episode"] = counters.get("early_neutral_captured", 0) / eps
+        out["early_launch_neutral_captured_per_episode"] = counters.get("early_launch_neutral_captured", 0) / eps
         # 발사대비 점령율: 초반에 쏜 중립 타겟 중 몇 %가 점령으로 이어졌는가
-        # (fleet 비행시간 영향 없는 순수 실행 성공률)
-        early_n_att = self.counters.get("early_neutral_attempts", 0)
+        early_n_att = counters.get("early_neutral_attempts", 0)
         out["early_neutral_launch_to_cap_rate"] = (
-            self.counters.get("early_launch_neutral_captured", 0) / max(early_n_att, 1)
+            counters.get("early_launch_neutral_captured", 0) / max(early_n_att, 1)
         )
-        # ── ships 분포 실측 파생 지표 ──────────────────────────────────────
-        # 모든 통계는 "launched" 기준 평균 (filter 통과한 valid launch만 집계)
-        sr_sum   = self.counters.get("ships_ratio_sum", 0.0)
-        sr_sq    = self.counters.get("ships_ratio_sq_sum", 0.0)
-        sts_sum  = self.counters.get("ships_to_send_sum", 0)
-        req_sum  = self.counters.get("required_ships_sum", 0.0)
-        srr_sum  = self.counters.get("send_required_ratio_sum", 0.0)
-        under    = self.counters.get("under_invested_count", 0)
+        # ── ships 분포 실측 파생 지표 (Categorical multiplier) ──────────────
+        # pooled variance: var = E[X²] - E[X]² 는 counter 합산에도 유효.
+        cm_sum   = counters.get("chosen_multiplier_sum", 0.0)
+        cm_sq    = counters.get("chosen_multiplier_sq_sum", 0.0)
+        sts_sum  = counters.get("ships_to_send_sum", 0)
+        req_sum  = counters.get("required_ships_sum", 0.0)
+        srr_sum  = counters.get("send_required_ratio_sum", 0.0)
+        under    = counters.get("under_invested_count", 0)
         if launched > 0:
-            sr_mean = sr_sum / launched
-            sr_var  = max(sr_sq / launched - sr_mean ** 2, 0.0)
-            out["ships_ratio_mean"]         = sr_mean
-            out["ships_ratio_std"]          = math.sqrt(sr_var)
+            cm_mean = cm_sum / launched
+            cm_var  = max(cm_sq / launched - cm_mean ** 2, 0.0)
+            out["chosen_multiplier_mean"]   = cm_mean
+            out["chosen_multiplier_std"]    = math.sqrt(cm_var)
             out["ships_to_send_mean"]       = sts_sum / launched
             out["required_ships_mean"]      = req_sum / launched
             out["send_required_ratio_mean"] = srr_sum / launched
             out["under_invested_rate"]      = under / launched
+            for k in range(NUM_SHIPS_BINS):
+                out[f"ships_bin_rate_{k}"] = counters.get(f"ships_bin_hist_{k}", 0) / launched
         else:
-            for k in ("ships_ratio_mean", "ships_ratio_std", "ships_to_send_mean",
+            for k in ("chosen_multiplier_mean", "chosen_multiplier_std", "ships_to_send_mean",
                       "required_ships_mean", "send_required_ratio_mean", "under_invested_rate"):
                 out[k] = 0.0
+            for k in range(NUM_SHIPS_BINS):
+                out[f"ships_bin_rate_{k}"] = 0.0
         return out
+
+    def summary(self):
+        """본인의 counters/n_steps/episodes로 summary 구성."""
+        return self.summary_from_counters(self.counters, self.n_steps, self.episodes)
 
 
 def _classify_removal(old_pos, new_pos, prev_planets, curr_planet_map):

@@ -221,3 +221,57 @@ def aim(src_planet, dst_planet, angular_velocity, num_ships, pos_cache=None):
             turns = new_turns
         tx, ty = predict_position(dst_planet, angular_velocity, turns)
     return math.atan2(ty - src_planet.y, tx - src_planet.x), tx, ty, turns
+
+
+def resolve_ships_for_capture(src, dst, angular_velocity, multiplier, src_ships,
+                               pos_cache=None, max_iter=5):
+    """
+    `ships_needed`와 `required`를 고정점 반복으로 동시에 해결.
+
+    관계식:
+      required     = dst.ships + dst.production × turns(ships_needed) + 1
+      ships_needed = min(max(1, int(required × multiplier)), src_ships)
+
+    반복 특성:
+      req(s)는 s에 대해 monotone 비증가 (ships↑ → speed↑ → turns↓ → req↓).
+      하지만 int(req × mult)의 이산성 때문에 정확한 고정점이 없고 두 값 사이를
+      왕복 oscillate할 수 있음. 이 경우 "지금까지 본 최대" ships_needed를 채택해
+      under-investment를 방지 (margin ≥ multiplier 보장).
+
+    returns: (ships_needed, angle, tx, ty, turns, required, converged)
+      - converged=True : 엄밀 고정점 도달
+      - converged=False: oscillation으로 max_iter 소진 → best_ships (conservative)
+    """
+    src_ships = int(src_ships)
+    if src_ships <= 0:
+        # degenerate: 호출자가 ships<=0 filter에서 거른다
+        angle, tx, ty, turns = aim(src, dst, angular_velocity, 1, pos_cache=pos_cache)
+        return 0, angle, tx, ty, turns, dst.ships + 1, True
+
+    ships_rep = src_ships
+    angle = tx = ty = None
+    turns = 0
+    required = 0
+    best_ships = 0
+    converged = False
+    for _ in range(max_iter):
+        angle, tx, ty, turns = aim(src, dst, angular_velocity, ships_rep, pos_cache=pos_cache)
+        eff_turns = turns if turns else 1
+        required  = dst.ships + dst.production * eff_turns + 1
+        new_needed = max(1, int(required * multiplier))
+        new_needed = min(new_needed, src_ships)
+        if new_needed > best_ships:
+            best_ships = new_needed
+        if new_needed == ships_rep:
+            converged = True
+            break
+        ships_rep = new_needed
+
+    # 비수렴(oscillation) 시 best_ships 채택 + angle/required 재계산.
+    if not converged and best_ships != ships_rep:
+        ships_rep = best_ships
+        angle, tx, ty, turns = aim(src, dst, angular_velocity, ships_rep, pos_cache=pos_cache)
+        eff_turns = turns if turns else 1
+        required  = dst.ships + dst.production * eff_turns + 1
+
+    return ships_rep, angle, tx, ty, turns, required, converged

@@ -21,12 +21,17 @@ except ImportError:
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 with open(_cfg_path) as f:
     CONFIG = yaml.safe_load(f)
+TRAIN_CONFIG = CONFIG["training"]
 
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
 PLANET_DIM   = 18  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
 FLEET_DIM    = 7
+
+# ships head: required_ships 배수 Categorical (commit 2)
+SHIPS_MULTIPLIER_BINS = tuple(CONFIG["model"].get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
+NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
 
 
 ETA_NEAR = 5   # 1~5턴: 즉각 위협
@@ -173,10 +178,15 @@ class OrbitWarsEnv(gym.Env):
       fleets_history:  (HISTORY, MAX_FLEETS,  FLEET_DIM)
 
     행동 공간:
-      (MAX_PLANETS, MAX_PLANETS + 2)
-      action[i, 0]    = 발사 여부 (0~1, 0.5 이상이면 발사)
-      action[i, 1]    = ships 비율 (0~1)
-      action[i, 2:]   = 타겟 logits (argmax로 선택)
+      (MAX_PLANETS, 1 + NUM_SHIPS_BINS + MAX_PLANETS)
+      action[i, 0]                        = 발사 여부 (0~1, 0.5 이상이면 발사)
+      action[i, 1:1+NUM_SHIPS_BINS]       = ships_bin one-hot (required 배수 선택)
+      action[i, 1+NUM_SHIPS_BINS:]        = 타겟 one-hot (argmax로 선택)
+
+    ships 계산 (decode 시):
+      multiplier   = SHIPS_MULTIPLIER_BINS[ships_bin]
+      required     = target.ships + target.production × turns + 1
+      ships_needed = min(max(int(required × multiplier), 1), src.ships)
     """
 
     metadata = {"render_modes": []}
@@ -193,7 +203,7 @@ class OrbitWarsEnv(gym.Env):
 
         self.action_space = spaces.Box(
             low=-1.0, high=1.0,
-            shape=(MAX_PLANETS, MAX_PLANETS + 2),
+            shape=(MAX_PLANETS, 1 + NUM_SHIPS_BINS + MAX_PLANETS),
             dtype=np.float32
         )
 
@@ -260,7 +270,7 @@ class OrbitWarsEnv(gym.Env):
 
     def step(self, action):
         from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
-        from prediction import aim, crosses_sun
+        from prediction import aim, crosses_sun, resolve_ships_for_capture
 
         raw_planets, raw_fleets, comet_ids = self._current_obs()
         planets = [Planet(*p) for p in raw_planets]
@@ -275,9 +285,9 @@ class OrbitWarsEnv(gym.Env):
             if p.owner != self._player:
                 continue
 
-            launch_prob  = float(action[i, 0])
-            ships_ratio  = float(action[i, 1])
-            target_logits = action[i, 2:]
+            launch_prob      = float(action[i, 0])
+            ships_bin_logits = action[i, 1:1 + NUM_SHIPS_BINS]
+            target_logits    = action[i, 1 + NUM_SHIPS_BINS:]
 
             if launch_prob < 0.5:
                 continue
@@ -293,13 +303,17 @@ class OrbitWarsEnv(gym.Env):
             target_idx = int(np.argmax(target_probs))
             target     = planets[target_idx]
 
-            ships_ratio  = float(np.clip(ships_ratio, 0.0, 1.0))
-            ships_needed = max(1, int(p.ships * ships_ratio))
-            ships_needed = min(ships_needed, p.ships)
+            # ships_bin → multiplier → ships_needed
+            ships_bin  = int(np.argmax(ships_bin_logits))
+            multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
+
+            # 고정점 반복으로 (ships_needed, required) 동시 해결 (commit 3).
+            ships_needed, angle, tx, ty, _, _, _ = resolve_ships_for_capture(
+                p, target, av, multiplier, p.ships,
+            )
             if ships_needed <= 0:
                 continue
 
-            angle, tx, ty, _ = aim(p, target, av, ships_needed)
             if crosses_sun(p.x, p.y, tx, ty):
                 continue
 
@@ -321,7 +335,10 @@ class OrbitWarsEnv(gym.Env):
         reward   = 0.0
         if done:
             r = state[self._player].reward
-            reward = 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
+            terminal_win_reward = float(TRAIN_CONFIG.get("terminal_win_reward", 1.0))
+            reward = terminal_win_reward if r == 1 else (
+                -terminal_win_reward if r == -1 else 0.0
+            )
 
         return obs, reward, done, False, {}
 

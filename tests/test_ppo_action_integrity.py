@@ -16,7 +16,17 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from train import decode_action_to_moves
-from env_wrapper import MAX_PLANETS
+from env_wrapper import MAX_PLANETS, NUM_SHIPS_BINS
+
+# Action layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
+ACTION_DIM = 1 + NUM_SHIPS_BINS + MAX_PLANETS
+
+
+def _set_action(action_np, src_idx, ships_bin, target_idx, launch=1.0):
+    """테스트 헬퍼: (launch, ships_bin, target) 조합을 새 layout으로 설정."""
+    action_np[src_idx, 0] = launch
+    action_np[src_idx, 1 + ships_bin] = 1.0
+    action_np[src_idx, 1 + NUM_SHIPS_BINS + target_idx] = 1.0
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -43,7 +53,7 @@ def make_raw(id_, x, y, owner, ships=20, production=2, radius=3.0):
 @patch("train.crosses_sun", return_value=False)
 def test_decode_no_launch(mock_sun, mock_aim):
     """launch < 0.5 → 빈 moves."""
-    action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
     raw_planets = [make_raw(0, 10.0, 10.0, 0)]
     moves = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
     assert moves == []
@@ -56,10 +66,8 @@ def test_decode_no_launch(mock_sun, mock_aim):
 @patch("train.first_collision_on_path", return_value=("planet", 1))
 def test_decode_launch_to_enemy(mock_path, mock_sun, mock_aim):
     """launch >= 0.5, enemy target → move 1개 생성."""
-    action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
-    action_np[0, 0] = 1.0   # launch
-    action_np[0, 1] = 0.0   # ships_ratio = 0.5
-    action_np[0, 3] = 10.0  # argmax → target_idx=1
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
+    _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)
 
     raw_planets = [
         make_raw(0, 10.0, 10.0, owner=0, ships=20),
@@ -75,9 +83,8 @@ def test_decode_launch_to_enemy(mock_path, mock_sun, mock_aim):
 @patch("train.crosses_sun", return_value=False)
 def test_decode_own_planet_target_skipped(mock_sun, mock_aim):
     """target이 내 행성이면 move 생성 안 함."""
-    action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
-    action_np[0, 0] = 1.0
-    action_np[0, 3] = 10.0  # target_idx=1 (내 행성)
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
+    _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)
 
     raw_planets = [
         make_raw(0, 10.0, 10.0, owner=0, ships=20),
@@ -92,9 +99,8 @@ def test_decode_own_planet_target_skipped(mock_sun, mock_aim):
 @patch("train.crosses_sun", return_value=True)  # 태양 차단
 def test_decode_sun_blocked(mock_sun, mock_aim):
     """crosses_sun=True → move 생성 안 함."""
-    action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
-    action_np[0, 0] = 1.0
-    action_np[0, 3] = 10.0
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
+    _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)
 
     raw_planets = [
         make_raw(0, 10.0, 10.0, owner=0, ships=20),
@@ -109,7 +115,10 @@ def test_decode_sun_blocked(mock_sun, mock_aim):
 def test_single_sample_per_step():
     """
     _collect_single에서 main agent의 get_action_and_value가
-    스텝당 정확히 1회 + 마지막에 GAE bootstrap용 1회 호출되는지 확인.
+    각 step당 정확히 1회 호출되는지 확인 (double-sampling 회귀 방지).
+
+    Full-episode collection에서는 bootstrap 호출이 없으므로:
+      call_count == len(collected_actions)  (정확히 step당 1회)
     """
     from train import _collect_single
     from model import OrbitWarsPolicy
@@ -128,12 +137,16 @@ def test_single_sample_per_step():
     model.get_action_and_value = counting_fn
 
     N_STEPS = 3
-    _collect_single(model, None, n_steps=N_STEPS, device=device)
+    result = _collect_single(model, None, n_steps=N_STEPS, device=device)
+    collected_actions = result[1]   # (obs, act, adv, ret, ...) — index 1은 actions
 
-    expected = N_STEPS + 1  # +1: last_value bootstrap for GAE truncation
-    assert call_count[0] == expected, (
-        f"get_action_and_value called {call_count[0]} times for {N_STEPS} steps "
-        f"(expected {expected} = steps + bootstrap — double sampling bug re-introduced?)"
+    assert call_count[0] == len(collected_actions), (
+        f"get_action_and_value called {call_count[0]} times, but "
+        f"{len(collected_actions)} actions stored — double sampling bug re-introduced?"
+    )
+    # full-episode collection은 target_steps 이상 수집 보장
+    assert len(collected_actions) >= N_STEPS, (
+        f"collected {len(collected_actions)} steps < target {N_STEPS}"
     )
 
 
@@ -148,10 +161,8 @@ def test_decode_is_pure_function(mock_path, mock_sun, mock_aim):
     동일한 action_np 입력 → 동일한 moves 출력.
     decode_action_to_moves가 외부 상태에 의존하지 않음을 확인.
     """
-    action_np = np.zeros((MAX_PLANETS, MAX_PLANETS + 2), dtype=np.float32)
-    action_np[0, 0] = 1.0
-    action_np[0, 1] = 0.5
-    action_np[0, 3] = 5.0
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
+    _set_action(action_np, src_idx=0, ships_bin=1, target_idx=1)
 
     raw_planets = [
         make_raw(0, 20.0, 20.0, owner=0, ships=30),
@@ -208,12 +219,14 @@ def test_collect_single_stored_action_matches_decoded_moves():
     with patch.object(train, "decode_action_to_moves", side_effect=tracing_decode):
         _collect_single(model, None, n_steps=N_STEPS, device=device)
 
-    # sampled: N_STEPS + 1 (마지막은 GAE bootstrap용, decode와 무관)
-    # decoded: N_STEPS
-    assert len(sampled_actions) == N_STEPS + 1
-    assert len(decoded_actions) == N_STEPS
+    # Full-episode collection: bootstrap 호출이 없음 → sampled == decoded 개수.
+    assert len(sampled_actions) == len(decoded_actions), (
+        f"sampled({len(sampled_actions)}) ≠ decoded({len(decoded_actions)}) — "
+        f"double sampling bug re-introduced?"
+    )
+    assert len(decoded_actions) >= N_STEPS
 
-    for step, (sampled, decoded) in enumerate(zip(sampled_actions[:N_STEPS], decoded_actions)):
+    for step, (sampled, decoded) in enumerate(zip(sampled_actions, decoded_actions)):
         np.testing.assert_array_equal(
             sampled, decoded,
             err_msg=f"Step {step}: stored action_t ≠ decoded action (double-sampling bug)"

@@ -29,8 +29,12 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 import multiprocessing as mp
 
 from model import OrbitWarsPolicy
-from env_wrapper import encode_planets, encode_fleets, MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY
-from prediction import aim, crosses_sun, first_collision_on_path, PositionCache
+from env_wrapper import (
+    encode_planets, encode_fleets,
+    MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
+    SHIPS_MULTIPLIER_BINS, NUM_SHIPS_BINS,
+)
+from prediction import aim, crosses_sun, first_collision_on_path, PositionCache, resolve_ships_for_capture
 
 with open("config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -80,8 +84,8 @@ class LeaguePool:
 def state_score(raw_obs, player):
     """행성 경제 상태를 단일 스칼라로 요약.
 
-    (planet_ships + fleet_ships) * 0.01 + production * 1.0 + planet_count * 2.0
-    production / planet_count 가중치 상향: 초반 영토 확장의 학습 신호 강화.
+    timeout 승자 판정(total ships)과 더 가깝게 정렬하되,
+    production / planet_count는 약한 shaping 힌트로만 유지한다.
     """
     if isinstance(raw_obs, dict):
         planets = raw_obs.get("planets", [])
@@ -106,7 +110,10 @@ def state_score(raw_obs, player):
         if owner == player:
             total_ships += ships
 
-    return total_ships * 0.01 + total_prod * 1.0 + planet_count * 2.0
+    ship_w   = float(T.get("state_score_ship_weight", 0.01))
+    prod_w   = float(T.get("state_score_prod_weight", 1.0))
+    planet_w = float(T.get("state_score_planet_weight", 2.0))
+    return total_ships * ship_w + total_prod * prod_w + planet_count * planet_w
 
 
 def _snapshot_planet_owners(raw_obs):
@@ -282,22 +289,28 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
                "filtered_zero_ships": 0, "filtered_sun": 0,
                "filtered_path": 0, "launched": 0, "launched_high_prod": 0,
-               # ── ships 분포 실측 (commit 1: Categorical head 도입 전 스냅샷) ──
-               "ships_ratio_sum": 0.0,       # 정책 출력 ships_ratio 평균
-               "ships_ratio_sq_sum": 0.0,    # std 계산용
-               "ships_to_send_sum": 0,       # 실제 발사 ships 수 평균
-               "required_ships_sum": 0.0,    # 필요 병력 추정치 평균
-               "send_required_ratio_sum": 0.0,  # ships_to_send / required 평균
-               "under_invested_count": 0}    # send_required_ratio < 1.0 횟수
+               # ── ships 분포 실측 (commit 2: Categorical multiplier head) ──
+               "chosen_multiplier_sum": 0.0,     # 선택된 배수 평균 (1.10~2.00)
+               "chosen_multiplier_sq_sum": 0.0,  # std 계산용
+               "ships_to_send_sum": 0,           # 실제 발사 ships 수 평균
+               "required_ships_sum": 0.0,        # 필요 병력 추정치 평균
+               "send_required_ratio_sum": 0.0,   # ships_to_send / required 평균
+               "under_invested_count": 0}        # ships_needed < int(required × multiplier) 횟수 (src.ships clip으로 nominal margin 미달)
+    # ships_bin 선택 히스토그램 (K bins): counts["ships_bin_hist_k"] = count
+    for k in range(NUM_SHIPS_BINS):
+        counts[f"ships_bin_hist_{k}"] = 0
     target_prods = [t.production for t in planets if t.owner != acting_player]
     high_prod_threshold = np.quantile(target_prods, 0.75) if target_prods else None
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
             continue
-        launch      = action_np[i, 0]
-        ships_ratio = float(np.clip(action_np[i, 1], 0.0, 1.0))
-        target_idx  = int(np.argmax(action_np[i, 2:2 + len(planets)]))
+        launch     = action_np[i, 0]
+        # Action layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
+        ships_bin  = int(np.argmax(action_np[i, 1:1 + NUM_SHIPS_BINS]))
+        target_idx = int(np.argmax(action_np[i, 1 + NUM_SHIPS_BINS:
+                                              1 + NUM_SHIPS_BINS + len(planets)]))
+        multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
 
         if launch < 0.5:
             continue
@@ -307,14 +320,18 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             counts["filtered_invalid_target"] += 1
             continue
 
-        target       = planets[target_idx]
-        ships_needed = max(1, int(p.ships * ships_ratio))
-        ships_needed = min(ships_needed, p.ships)
+        target = planets[target_idx]
+
+        # 고정점 반복으로 (ships_needed, required) 동시 해결.
+        # 과거 1-pass 근사(p.ships로 turns 추정)는 느린 함대의 추가 production을
+        # 과소평가해 bin=1.10x가 상습 under-invested였음 → commit 3에서 수정.
+        ships_needed, angle, tx, ty, turns, required, _ = resolve_ships_for_capture(
+            p, target, av, multiplier, p.ships, pos_cache=pos_cache,
+        )
         if ships_needed <= 0:
             counts["filtered_zero_ships"] += 1
             continue
 
-        angle, tx, ty, turns = aim(p, target, av, ships_needed, pos_cache=pos_cache)
         if crosses_sun(p.x, p.y, tx, ty):
             counts["filtered_sun"] += 1
             continue
@@ -332,18 +349,21 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         if high_prod_threshold is not None and target.production >= high_prod_threshold:
             counts["launched_high_prod"] += 1
 
-        # ── ships 실측 (required = target.ships + prod × turns + 1) ─────────
-        # 1-pass 추정: 정확도는 margin이 흡수. turns는 aim()이 반환한 값 사용.
-        # turns=None 인 엣지 케이스는 보수적으로 1 사용 (과소추정 방지는 multiplier 역할).
-        eff_turns = turns if turns else 1
-        required = target.ships + target.production * eff_turns + 1
+        # ── ships 실측 (launched 기준 집계) ──────────────────────────────────
+        # send_required_ratio = ships_needed(clip 후) / required  (실제 공급 비율)
+        # under_invested     = ships_needed < int(required × multiplier)
+        #                      즉 src.ships clip으로 nominal multiplier margin을 못 채운 경우.
+        #                      commit 3 resolver가 margin을 보장하므로 이 분기는
+        #                      정확히 "src.ships clip" 시점과 일치 (bin 선택이 과도히 ambitious).
         srr = ships_needed / max(required, 1)
-        counts["ships_ratio_sum"]       += ships_ratio
-        counts["ships_ratio_sq_sum"]    += ships_ratio ** 2
-        counts["ships_to_send_sum"]     += ships_needed
-        counts["required_ships_sum"]    += required
-        counts["send_required_ratio_sum"] += srr
-        if srr < 1.0:
+        nominal_need = int(required * multiplier)
+        counts["chosen_multiplier_sum"]    += multiplier
+        counts["chosen_multiplier_sq_sum"] += multiplier ** 2
+        counts["ships_to_send_sum"]        += ships_needed
+        counts["required_ships_sum"]       += required
+        counts["send_required_ratio_sum"]  += srr
+        counts[f"ships_bin_hist_{ships_bin}"] += 1
+        if ships_needed < nominal_need:
             counts["under_invested_count"] += 1
 
         moves.append([p.id, angle, ships_needed])
@@ -421,104 +441,121 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
 
     dense_coef = T["dense_reward_coef"]
+    terminal_win_reward = float(T.get("terminal_win_reward", 1.0))
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
+    # Episode-grained collection:
+    #   - 바깥 while: target_steps 이상 채우고 현재 에피소드도 완주했으면 종료
+    #   - 안쪽 while: 한 에피소드가 done=True 찍을 때까지 무조건 완주
+    #   결과: buffer 마지막 step은 항상 done=True → last_value bootstrap 불필요.
+    #   n_steps 파라미터는 "target"으로 해석 (실제 수집량은 ≥ n_steps).
     step = 0
-    while step < n_steps:
-        raw_obs_main = env.state[0].observation
-        obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
+    while True:
+        ep_done = False
+        while not ep_done:
+            raw_obs_main = env.state[0].observation
+            obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
-        analysis = analyze_action_space(raw_planets, av, acting_player=0)
-        launch_mask, target_mask = analysis.launch_mask, analysis.target_mask
-        with torch.no_grad():
-            action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
-                obs_t.unsqueeze(0).to(device),
-                launch_mask=launch_mask.unsqueeze(0).to(device),
-                target_mask=target_mask.unsqueeze(0).to(device),
+            analysis = analyze_action_space(raw_planets, av, acting_player=0)
+            launch_mask, target_mask = analysis.launch_mask, analysis.target_mask
+            with torch.no_grad():
+                action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
+                    obs_t.unsqueeze(0).to(device),
+                    launch_mask=launch_mask.unsqueeze(0).to(device),
+                    target_mask=target_mask.unsqueeze(0).to(device),
+                )
+            action_np  = action_t.squeeze(0).cpu().numpy()
+            moves_main, decode_counts, launches_main = decode_action_to_moves(
+                action_np, raw_planets, av, acting_player=0, return_counts=True,
+                analysis=analysis,
             )
-        action_np  = action_t.squeeze(0).cpu().numpy()
-        moves_main, decode_counts, launches_main = decode_action_to_moves(
-            action_np, raw_planets, av, acting_player=0, return_counts=True,
-            analysis=analysis,
-        )
-        hit_tracker.record(decode_counts)
+            hit_tracker.record(decode_counts)
 
-        raw_obs_opp = env.state[1].observation
-        obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
-        moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
+            raw_obs_opp = env.state[1].observation
+            obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
+            moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
 
-        # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
-        prev_map      = _snapshot_planet_owners(env.state[0].observation)
-        prev_obs_snap = _snapshot_obs_for_resolve(env.state[0].observation)
-        hit_tracker.register_launches(launches_main, prev_obs_snap["next_fleet_id"])
-        env.step([moves_main, moves_opp])
-        done = env.done
+            # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
+            prev_map      = _snapshot_planet_owners(env.state[0].observation)
+            prev_obs_snap = _snapshot_obs_for_resolve(env.state[0].observation)
+            hit_tracker.register_launches(launches_main, prev_obs_snap["next_fleet_id"])
+            env.step([moves_main, moves_opp])
+            ep_done = env.done
 
-        curr_obs_main  = env.state[0].observation
-        max_speed      = env.configuration.shipSpeed
-        hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
-        curr_score     = (state_score(curr_obs_main, player=0)
-                        - state_score(env.state[1].observation, player=1))
-        dense_r        = dense_coef * (curr_score - prev_score)
-        cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0)
-        terminal_r     = 0.0
-        reward         = dense_r + cap_bonus
-        prev_score     = curr_score
+            curr_obs_main  = env.state[0].observation
+            max_speed      = env.configuration.shipSpeed
+            hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
+            curr_score     = (state_score(curr_obs_main, player=0)
+                            - state_score(env.state[1].observation, player=1))
+            dense_r        = dense_coef * (curr_score - prev_score)
+            cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0)
+            terminal_r     = 0.0
+            reward         = dense_r + cap_bonus
+            prev_score     = curr_score
 
-        if done:
-            r          = env.state[0].reward
-            terminal_r = 1.0 if r == 1 else (-1.0 if r == -1 else 0.0)
-            reward    += terminal_r
+            if ep_done:
+                r          = env.state[0].reward
+                terminal_r = terminal_win_reward if r == 1 else (
+                    -terminal_win_reward if r == -1 else 0.0
+                )
+                reward    += terminal_r
 
-        sum_dense    += dense_r
-        sum_cap      += cap_bonus
-        sum_terminal += terminal_r
+            sum_dense    += dense_r
+            sum_cap      += cap_bonus
+            sum_terminal += terminal_r
 
-        obs_list.append(obs_t)
-        act_list.append(action_t.squeeze(0).cpu())
-        rew_list.append(torch.tensor(reward, dtype=torch.float32))
-        done_list.append(torch.tensor(float(done), dtype=torch.float32))
-        logp_list.append(log_prob.squeeze(0).cpu())
-        logp_heads_list.append(lp_heads.squeeze(0).cpu())
-        val_list.append(value.squeeze(0).cpu())
-        launch_mask_list.append(launch_mask)
-        target_mask_list.append(target_mask)
+            obs_list.append(obs_t)
+            act_list.append(action_t.squeeze(0).cpu())
+            rew_list.append(torch.tensor(reward, dtype=torch.float32))
+            done_list.append(torch.tensor(float(ep_done), dtype=torch.float32))
+            logp_list.append(log_prob.squeeze(0).cpu())
+            logp_heads_list.append(lp_heads.squeeze(0).cpu())
+            val_list.append(value.squeeze(0).cpu())
+            launch_mask_list.append(launch_mask)
+            target_mask_list.append(target_mask)
 
-        step += 1
-        if done:
-            env = make("orbit_wars", debug=False)
-            env.reset()
-            hit_tracker.reset_episode(env.state[0].observation)
-            prev_score    = (state_score(env.state[0].observation, player=0)
-                           - state_score(env.state[1].observation, player=1))
-            history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
-            history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
-            history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
-            history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+            step += 1
 
-    # rollout 마지막 다음 상태의 critic value (non-terminal bootstrap용)
-    last_raw = env.state[0].observation
-    last_obs_t, last_raw_planets, last_av = get_obs_tensor(last_raw, 0, history_p, history_f)
-    last_lm, last_tm = build_action_masks(last_raw_planets, last_av, acting_player=0)
-    with torch.no_grad():
-        _, _, last_value, _ = main_model.get_action_and_value(
-            last_obs_t.unsqueeze(0).to(device),
-            launch_mask=last_lm.unsqueeze(0).to(device),
-            target_mask=last_tm.unsqueeze(0).to(device),
-        )
-    last_value = last_value.squeeze().cpu()
+        # 에피소드 완주 후 target 도달 여부 확인
+        if step >= n_steps:
+            break
+
+        # 다음 에피소드 준비 (env/history 리셋)
+        env = make("orbit_wars", debug=False)
+        env.reset()
+        hit_tracker.reset_episode(env.state[0].observation)
+        prev_score    = (state_score(env.state[0].observation, player=0)
+                       - state_score(env.state[1].observation, player=1))
+        history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+        history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+        history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+        history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+
+    # Buffer 마지막 step은 항상 done=True (episode-grained collection).
+    # → bootstrap 불필요, last_value = 0.0 고정.
+    last_value = torch.tensor(0.0, dtype=torch.float32)
 
     rewards = torch.stack(rew_list)
     dones   = torch.stack(done_list)
     values  = torch.stack(val_list)
+    # Full-episode collection 불변식: buffer 마지막 step은 항상 episode 끝.
+    assert dones[-1].item() == 1.0, (
+        "full-episode collection violated: buffer 마지막 step이 done=False. "
+        "rollout loop 구조 확인 필요."
+    )
     advantages, returns = compute_gae(rewards, dones, values, last_value=last_value)
 
-    reward_stats = {
-        "mean_dense":    sum_dense    / max(n_steps, 1),
-        "mean_cap":      sum_cap      / max(n_steps, 1),
-        "mean_terminal": sum_terminal / max(n_steps, 1),
-        **hit_tracker.summary(),
+    # Raw state 반환 (collect_rollout에서 worker 합산 후 한 번에 normalize).
+    # worker별 episode 길이가 달라도 합산된 raw counters/step/episode로
+    # 분모를 정확히 반영해 편향 없는 metric 산출.
+    raw_stats = {
+        "counters":     dict(hit_tracker.counters),
+        "n_steps":      hit_tracker.n_steps,
+        "episodes":     hit_tracker.episodes,
+        "sum_dense":    sum_dense,
+        "sum_cap":      sum_cap,
+        "sum_terminal": sum_terminal,
     }
     return (
         torch.stack(obs_list),
@@ -529,7 +566,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         torch.stack(logp_heads_list),
         torch.stack(launch_mask_list),
         torch.stack(target_mask_list),
-        reward_stats,
+        raw_stats,   # ← normalize는 collect_rollout에서 합산 후 수행
     )
 
 
@@ -567,10 +604,53 @@ def _rollout_worker(args):
         raise
 
 
+def _finalize_reward_stats(raw_list):
+    """Worker별 raw_stats 리스트를 합산해서 normalized reward_stats dict 구성.
+
+    단순 worker 평균은 episode 길이가 worker마다 다를 때 편향되므로
+    raw counters/n_steps/episodes/sum_* 을 먼저 합산하고, 그 합산된 분모로
+    한 번에 정규화한다 (step-weighted / episode-weighted / launched-weighted
+    모두 HitRateTracker.summary_from_counters가 올바르게 처리).
+    """
+    from collections import defaultdict
+    total_counters = defaultdict(float)
+    total_n_steps = 0
+    total_episodes = 0
+    total_dense = total_cap = total_terminal = 0.0
+    for r in raw_list:
+        for k, v in r["counters"].items():
+            total_counters[k] += v
+        total_n_steps  += r["n_steps"]
+        total_episodes += r["episodes"]
+        total_dense    += r["sum_dense"]
+        total_cap      += r["sum_cap"]
+        total_terminal += r["sum_terminal"]
+
+    stats = HitRateTracker.summary_from_counters(
+        total_counters, total_n_steps, total_episodes,
+    )
+    steps_safe = max(total_n_steps, 1)
+    stats["mean_dense"]    = total_dense    / steps_safe
+    stats["mean_cap"]      = total_cap      / steps_safe
+    stats["mean_terminal"] = total_terminal / steps_safe
+    # Episode-grained collection에서 generation마다 실제 수집량이 달라지므로
+    # target_steps 대비 초과량으로 "unusually 길었던 generation" 감지 가능.
+    stats["actual_steps"]  = total_n_steps
+    return stats
+
+
 def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None):
-    """n_envs=1이면 단일 env, 그 이상이면 multiprocessing 병렬 rollout."""
+    """n_envs=1이면 단일 env, 그 이상이면 multiprocessing 병렬 rollout.
+
+    _collect_single은 raw_stats(counters/n_steps/episodes/sum_*)를 반환.
+    여기서 worker들을 합산한 뒤 step-weighted로 정확히 정규화해서
+    최종 reward_stats를 만든다 (full-episode collection에서 worker별
+    episode 길이가 달라도 편향 없음).
+    """
     if n_envs <= 1 or pool is None:
-        return _collect_single(main_model, opponent_model, n_steps, DEVICE)
+        result = _collect_single(main_model, opponent_model, n_steps, DEVICE)
+        merged_stats = _finalize_reward_stats([result[8]])
+        return (*result[:8], merged_stats)
 
     main_state = {k: v.cpu() for k, v in main_model.state_dict().items()}
     opp_state  = ({k: v.cpu() for k, v in opponent_model.state_dict().items()}
@@ -581,12 +661,7 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
 
     results = pool.map(_rollout_worker, worker_args)
 
-    # reward_stats: worker별 평균을 다시 평균 (index 8)
-    # worker마다 key 집합이 다를 수 있으므로 union + .get(., 0.0)으로 안전하게 합침.
-    keys = set().union(*(r[8].keys() for r in results))
-    merged_stats = {
-        k: sum(r[8].get(k, 0.0) for r in results) / len(results) for k in keys
-    }
+    merged_stats = _finalize_reward_stats([r[8] for r in results])
     return (
         torch.cat([r[0] for r in results]),
         torch.cat([r[1] for r in results]),
@@ -913,12 +988,14 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_early_launch_neutral_captured=rew_stats.get("mean_early_launch_neutral_captured", 0.0),
                 early_launch_neutral_captured_per_episode=rew_stats.get("early_launch_neutral_captured_per_episode", 0.0),
                 early_neutral_launch_to_cap_rate=rew_stats.get("early_neutral_launch_to_cap_rate", 0.0),
-                ships_ratio_mean=rew_stats.get("ships_ratio_mean", 0.0),
-                ships_ratio_std=rew_stats.get("ships_ratio_std", 0.0),
+                chosen_multiplier_mean=rew_stats.get("chosen_multiplier_mean", 0.0),
+                chosen_multiplier_std=rew_stats.get("chosen_multiplier_std", 0.0),
                 ships_to_send_mean=rew_stats.get("ships_to_send_mean", 0.0),
                 required_ships_mean=rew_stats.get("required_ships_mean", 0.0),
                 send_required_ratio_mean=rew_stats.get("send_required_ratio_mean", 0.0),
                 under_invested_rate=rew_stats.get("under_invested_rate", 0.0),
+                **{f"ships_bin_rate_{k}": rew_stats.get(f"ships_bin_rate_{k}", 0.0)
+                   for k in range(NUM_SHIPS_BINS)},
                 **head_metrics,
             )
 
@@ -973,7 +1050,7 @@ if __name__ == "__main__":
         cli.total_timesteps = cli.total_timesteps or 10000
         cli.eval_interval   = cli.eval_interval   or 5
         cli.n_games         = cli.n_games         or 4
-        cli.rollout_steps   = cli.rollout_steps   or 128
+        cli.rollout_steps   = cli.rollout_steps   or 512
 
     train(
         n_envs=cli.n_envs,
