@@ -12,7 +12,8 @@ import numpy as np
 MAX_PLANETS = 40
 MAX_FLEETS = 100
 HISTORY = 20
-PLANET_DIM = 18   # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
+PLANET_DIM = 21   # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
+                  # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
 FLEET_DIM = 7
 
 ETA_NEAR = 5
@@ -76,7 +77,9 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
 
         # ETA feature: 내 행성 중 가장 가까운 곳에서 이 행성까지의 최소 ETA
         # 자기 자신은 스킵 (공격 대상이 아님 → 거리 0이면 feature 무의미)
-        min_eta = 50.0
+        # same-source bundle: best_src는 min_eta를 달성한 바로 그 행성
+        min_eta  = 50.0
+        best_src = None
         if my_planets:
             for src in my_planets:
                 if src.id == p.id:
@@ -84,7 +87,8 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
                 dist = math.hypot(p.x - src.x, p.y - src.y)
                 eta_to = estimate_arrival_turn(dist, 50)  # 50 ships 기준 근사
                 if eta_to < min_eta:
-                    min_eta = float(eta_to)
+                    min_eta  = float(eta_to)
+                    best_src = src
         min_eta_norm = min(min_eta / 50.0, 1.0)
 
         # 예상 도착 위치: min_eta 턴 후 이 행성의 위치
@@ -103,6 +107,25 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
                 if crosses_sun(src.x, src.y, pred_x, pred_y):
                     sun_block = 1.0
         sun_dist_norm = min(sun_dist_min / 50.0, 1.0)
+
+        # ── Target feasibility bundle (same best_src 기준) ──────────────────
+        # F20: 가장 가까운 아군의 ships — 공격 탄약(적/중립) 또는 증원 원천(자기)
+        # F19: required to capture — 적/중립만 (자기 행성은 0)
+        # F21: feasibility = best_src.ships / required — 적/중립만 (자기 행성은 0)
+        if best_src is not None:
+            best_src_ships_norm = min(best_src.ships / 1000.0, 1.0)
+        else:
+            best_src_ships_norm = 0.0
+
+        is_attackable = (p.owner != player) and (best_src is not None)
+        if is_attackable:
+            required         = p.ships + p.production * min_eta + 1
+            required_norm    = min(required / 1000.0, 1.0)
+            feasibility      = best_src.ships / max(required, 1.0)
+            feasibility_norm = min(feasibility / 4.0, 1.0)
+        else:
+            required_norm    = 0.0
+            feasibility_norm = 0.0
 
         arr[i] = [
             p.x / 100.0,
@@ -125,6 +148,10 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
             # ── 태양 위험도 ──
             sun_block,
             sun_dist_norm,
+            # ── Target feasibility (same best_src) ──
+            required_norm,
+            best_src_ships_norm,
+            feasibility_norm,
         ]
     return arr
 
