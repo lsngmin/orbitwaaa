@@ -19,8 +19,8 @@ training:
   n_epochs: 4           # 같은 rollout을 몇 epoch 반복할지
   learning_rate: 0.0001
   total_timesteps: 10000000
-  n_envs: 16            # 워커당 ~1 에피소드/gen, straggler 완화 + CPU oversubscription 회피
-  rollout_steps: 16     # steps_per_env = max(1, rollout_steps//n_envs) = 1 → 워커당 1 에피소드
+  n_envs: 64            # CPU core 수 (1 thread/worker 기준)에 맞춤 — oversubscription 회피
+  rollout_steps: 16384  # steps_per_env = 256 → 느린 워커 1 ep 유지, 빠른 워커가 유휴 시간에 추가 ep로 채움
   gamma: 1.0            # length invariance: 짧은/긴 에피소드 terminal 보상 동등
   gae_lambda: 0.95
   clip_range: 0.2

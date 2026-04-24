@@ -576,7 +576,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 def _init_worker():
     """worker 프로세스 초기화: CUDA 숨기기, 스레드 수 제한, 로그 억제."""
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    torch.set_num_threads(2)
+    # 1 thread/worker: n_envs × 1 = CPU core 수에 맞춤 (oversubscription 회피)
+    torch.set_num_threads(1)
     import logging
     logging.getLogger("kaggle_environments").setLevel(logging.ERROR)
 
