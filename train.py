@@ -58,13 +58,22 @@ class LeaguePool:
         self.pool_size = pool_size
         self.agents    = []   # [(path, win_rate, generation)]
 
-    def add(self, model, generation, win_rate):
+    def add(self, model, generation, win_rate=0.0):
+        """pool에 snapshot 편입. pool_size 초과 시 가장 오래된 항목 pop + 디스크 파일 삭제.
+
+        A policy (매 gen 편입): win_rate 생략 가능 — eval gate로 쓰지 않음.
+        """
         path = os.path.join(SAVE_DIR, f"gen_{generation:04d}.pt")
         torch.save(model.state_dict(), path)
         self.agents.append((path, win_rate, generation))
-        if len(self.agents) > self.pool_size:
-            self.agents.pop(0)
-        print(f"League: gen {generation} 추가 (승률 {win_rate:.2%})")
+        while len(self.agents) > self.pool_size:
+            old_path, _, _ = self.agents.pop(0)
+            if os.path.exists(old_path):
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+        print(f"League: gen {generation} 추가 (pool {len(self.agents)}/{self.pool_size})")
 
     def sample_opponent(self):
         if not self.agents:
@@ -1094,7 +1103,15 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
             # eval_interval 주기를 기다리지 않고 최근 모델 항상 유지.
             torch.save(main_model.state_dict(), os.path.join(SAVE_DIR, "main_latest.pt"))
 
+            # A policy: 매 gen league 편입 (eval 결과와 독립). pool_size로 자동 rotation.
+            league.add(main_model, generation, win_rate=0.0)
+
+            # resume 상태도 매 gen 갱신 — pool membership이 매 gen 바뀌므로 crash 시 정합성 유지.
+            save_checkpoint(ckpt_path, main_model, optimizer, generation, total_steps, league.agents)
+
             if generation % eval_interval == 0:
+                # eval: 모니터링 전용 (A policy). pool 편입 gate 아님, rollback 없음.
+                # 의미: main이 현재 pool 대비 어느 정도인지 기록 → csv/log에만 반영.
                 opp_eval = league.sample_opponent() or exploiter
                 eval_t0  = time.time()
                 win_rate, eval_split = evaluate(main_model, opp_eval, n_games=n_games)
@@ -1110,16 +1127,11 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                     **eval_split,
                 )
 
-                if win_rate >= SP["win_threshold"]:
-                    league.add(main_model, generation, win_rate)
-
                 exploiter_reset += 1
                 if exploiter_reset % 5 == 0:
                     exploiter     = OrbitWarsPolicy().to(DEVICE)
                     exploiter_opt = optim.Adam(exploiter.parameters(), lr=T["learning_rate"])
                     print("  Exploiter 리셋")
-
-                save_checkpoint(ckpt_path, main_model, optimizer, generation, total_steps, league.agents)
 
     finally:
         if pool is not None:
