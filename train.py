@@ -1050,7 +1050,7 @@ if __name__ == "__main__":
         cli.total_timesteps = cli.total_timesteps or 10000
         cli.eval_interval   = cli.eval_interval   or 5
         cli.n_games         = cli.n_games         or 4
-        cli.rollout_steps   = cli.rollout_steps   or 128
+        cli.rollout_steps   = cli.rollout_steps   or 512
 
     train(
         n_envs=cli.n_envs,
