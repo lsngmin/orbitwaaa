@@ -177,26 +177,44 @@ def neutral_capture_bonus(prev_map, curr_raw_obs, player):
 
 # ── Action masking ───────────────────────────────────────────────────────────
 
-def build_action_masks(raw_planets, av, acting_player):
-    """구조적 + path viability action 마스크.
+class ActionSpace:
+    """analyze_action_space의 step-local 분석 결과.
 
-    v2: sun cut + path viability까지 포함. 순차 cascade로 비용 최소화.
-      1. padding/self/own target 조기 컷 (O(1))
-      2. crosses_sun(src, tgt) 조기 컷 (O(1), aim 없음)
-      3. first_collision_on_path(ships_rep=src.ships) — 대표값 1회 sim
+    공유 가능한 자원:
+      planets   — Planet 객체 리스트 (raw_planets 1회 파싱)
+      pos_cache — PositionCache (mask 단계에서 (pid, turn) 미리 채워짐)
 
-    ships_rep 선택: src.ships (최대) — 빠른 속도/긴 세그먼트로 permissive 쪽.
-    decode safety filter는 유지 (mean_filtered_* 로 residual 검증).
+    Mask:
+      launch_mask, target_mask — ships_rep=src.ships 기준 viability
+                                  (decode는 actual ships로 별도 viability 재확인)
+    """
 
-    Returns:
-        launch_mask: (MAX_PLANETS,) bool
-        target_mask: (MAX_PLANETS, MAX_PLANETS) bool
+    __slots__ = ("planets", "pos_cache", "launch_mask", "target_mask",
+                 "av", "acting_player")
+
+    def __init__(self, planets, pos_cache, launch_mask, target_mask, av, acting_player):
+        self.planets       = planets
+        self.pos_cache     = pos_cache
+        self.launch_mask   = launch_mask
+        self.target_mask   = target_mask
+        self.av            = av
+        self.acting_player = acting_player
+
+
+def analyze_action_space(raw_planets, av, acting_player):
+    """공통 분석 1회 + masks 생성.
+
+    재사용 의도:
+      - planets/pos_cache → decode_action_to_moves(analysis=...)에 전달
+      - launch_mask/target_mask → 모델 forward에 전달
+
+    viability는 ships_rep=src.ships(최대값, permissive)로 평가.
+    decode는 actual ships_needed로 fcop를 다시 호출 (속도가 다르면 path도 다름).
     """
     planets      = [Planet(*p) for p in raw_planets[:MAX_PLANETS]]
-    num_real     = len(planets)
+    pos_cache    = PositionCache(planets, av)
     launch_mask  = torch.zeros(MAX_PLANETS, dtype=torch.bool)
     target_mask  = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
-    pos_cache    = PositionCache(planets, av)
 
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
@@ -228,26 +246,42 @@ def build_action_masks(raw_planets, av, acting_player):
         if not target_mask[i].any():
             target_mask[i, i] = True
 
-    return launch_mask, target_mask
+    return ActionSpace(planets, pos_cache, launch_mask, target_mask, av, acting_player)
+
+
+def build_action_masks(raw_planets, av, acting_player):
+    """Backward-compat 래퍼: analyze_action_space의 (launch_mask, target_mask)만 노출.
+
+    신규 코드는 analyze_action_space를 직접 사용하고 ActionSpace를
+    decode_action_to_moves에 그대로 넘겨 planets/pos_cache 재사용 권장.
+    """
+    a = analyze_action_space(raw_planets, av, acting_player)
+    return a.launch_mask, a.target_mask
 
 
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
 
-def decode_action_to_moves(action_np, raw_planets, av, acting_player, return_counts=False):
+def decode_action_to_moves(action_np, raw_planets, av, acting_player,
+                           return_counts=False, analysis=None):
     """Pure function: 샘플된 action_np → env moves 리스트. 모델 접근 없음.
 
     acting_player: 절대 owner ID (0 or 1). 행성 소유 판정에 사용.
     return_counts: True면 (moves, counts, launches) 튜플 반환 (hit rate tracking용).
         launches: moves와 1:1 대응하는 메타 dict 리스트 (source_id, target_id,
         ships, angle, start_x, start_y). fleet_id 매핑/resolve_step 입력으로 사용.
+    analysis: ActionSpace. 있으면 planets/pos_cache 재사용 (mask 단계와 공유).
     """
-    planets = [Planet(*p) for p in raw_planets]
+    if analysis is not None:
+        planets   = analysis.planets
+        pos_cache = analysis.pos_cache
+    else:
+        planets   = [Planet(*p) for p in raw_planets]
+        pos_cache = PositionCache(planets, av)
     moves   = []
     launches = []
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
                "filtered_zero_ships": 0, "filtered_sun": 0,
                "filtered_path": 0, "launched": 0}
-    pos_cache = PositionCache(planets, av)
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
@@ -307,14 +341,17 @@ def _opp_moves(opponent_model, obs_tensor, raw_planets, av, device):
     """상대(player 1) 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
     if opponent_model is None:
         return []
-    lm_opp, tm_opp = build_action_masks(raw_planets, av, acting_player=1)
+    analysis = analyze_action_space(raw_planets, av, acting_player=1)
     with torch.no_grad():
         action, *_ = opponent_model.get_action_and_value(
             obs_tensor.unsqueeze(0).to(device),
-            launch_mask=lm_opp.unsqueeze(0).to(device),
-            target_mask=tm_opp.unsqueeze(0).to(device),
+            launch_mask=analysis.launch_mask.unsqueeze(0).to(device),
+            target_mask=analysis.target_mask.unsqueeze(0).to(device),
         )
-    return decode_action_to_moves(action.squeeze(0).cpu().numpy(), raw_planets, av, acting_player=1)
+    return decode_action_to_moves(
+        action.squeeze(0).cpu().numpy(), raw_planets, av,
+        acting_player=1, analysis=analysis,
+    )
 
 
 def get_obs_tensor(raw_obs, player, history_p, history_f):
@@ -364,7 +401,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         raw_obs_main = env.state[0].observation
         obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
-        launch_mask, target_mask = build_action_masks(raw_planets, av, acting_player=0)
+        analysis = analyze_action_space(raw_planets, av, acting_player=0)
+        launch_mask, target_mask = analysis.launch_mask, analysis.target_mask
         with torch.no_grad():
             action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
                 obs_t.unsqueeze(0).to(device),
@@ -374,6 +412,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         action_np  = action_t.squeeze(0).cpu().numpy()
         moves_main, decode_counts, launches_main = decode_action_to_moves(
             action_np, raw_planets, av, acting_player=0, return_counts=True,
+            analysis=analysis,
         )
         hit_tracker.record(decode_counts)
 
@@ -700,14 +739,17 @@ def evaluate(main_model, opponent_model, n_games=20):
         while not env.done:
             raw_main = env.state[0].observation
             obs_t, raw_p, av = get_obs_tensor(raw_main, 0, history_p, history_f)
-            lm_e, tm_e = build_action_masks(raw_p, av, acting_player=0)
+            analysis_e = analyze_action_space(raw_p, av, acting_player=0)
             with torch.no_grad():
                 action_t, _, _, _ = main_model.get_action_and_value(
                     obs_t.unsqueeze(0).to(DEVICE),
-                    launch_mask=lm_e.unsqueeze(0).to(DEVICE),
-                    target_mask=tm_e.unsqueeze(0).to(DEVICE),
+                    launch_mask=analysis_e.launch_mask.unsqueeze(0).to(DEVICE),
+                    target_mask=analysis_e.target_mask.unsqueeze(0).to(DEVICE),
                 )
-            moves_main = decode_action_to_moves(action_t.squeeze(0).cpu().numpy(), raw_p, av, acting_player=0)
+            moves_main = decode_action_to_moves(
+                action_t.squeeze(0).cpu().numpy(), raw_p, av,
+                acting_player=0, analysis=analysis_e,
+            )
 
             raw_opp = env.state[1].observation
             obs_o, raw_po, avo = get_obs_tensor(raw_opp, 1, history_p_opp, history_f_opp)

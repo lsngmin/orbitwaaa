@@ -191,7 +191,7 @@ def test_collect_single_stored_action_matches_decoded_moves():
         sampled_actions.append(action_t.squeeze(0).cpu().numpy().copy())
         return action_t, lp, v, lp_h
 
-    def tracing_decode(action_np, raw_planets, av, acting_player=0, return_counts=False):
+    def tracing_decode(action_np, raw_planets, av, acting_player=0, return_counts=False, analysis=None):
         decoded_actions.append(action_np.copy())
         return original_decode(
             action_np,
@@ -199,6 +199,7 @@ def test_collect_single_stored_action_matches_decoded_moves():
             av,
             acting_player=acting_player,
             return_counts=return_counts,
+            analysis=analysis,
         )
 
     model.get_action_and_value = tracing_sample
