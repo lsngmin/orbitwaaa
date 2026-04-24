@@ -36,6 +36,16 @@ class HitRateTracker:
       마지막: tracker.summary() → mean_* 딕셔너리
     """
 
+    METRIC_KEYS = (
+        "attempts", "filtered_invalid_target", "filtered_zero_ships",
+        "filtered_sun", "filtered_path", "launched",
+        "out", "sun_crash",
+        "target_hit_exclusive", "target_hit_ambiguous",
+        "hit_other_exclusive", "hit_other_ambiguous",
+        "captured_exclusive", "captured_ambiguous",
+        "unknown_removal",
+    )
+
     def __init__(self, player_id=0):
         self.counters = defaultdict(int)
         self.n_steps  = 0
@@ -134,9 +144,8 @@ class HitRateTracker:
 
     # ── 요약 ────────────────────────────────────────────────────────────────
     def summary(self):
-        out = {}
-        for k, v in self.counters.items():
-            out[f"mean_{k}"] = v / max(self.n_steps, 1)
+        steps = max(self.n_steps, 1)
+        out = {f"mean_{k}": self.counters.get(k, 0) / steps for k in self.METRIC_KEYS}
         attempts = self.counters.get("attempts", 0)
         launched = self.counters.get("launched", 0)
         out["launch_rate"] = launched / max(attempts, 1)

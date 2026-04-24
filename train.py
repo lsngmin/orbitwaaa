@@ -511,9 +511,10 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
     results = pool.map(_rollout_worker, worker_args)
 
     # reward_stats: worker별 평균을 다시 평균 (index 8)
-    keys = results[0][8].keys()
+    # worker마다 key 집합이 다를 수 있으므로 union + .get(., 0.0)으로 안전하게 합침.
+    keys = set().union(*(r[8].keys() for r in results))
     merged_stats = {
-        k: sum(r[8][k] for r in results) / len(results) for k in keys
+        k: sum(r[8].get(k, 0.0) for r in results) / len(results) for k in keys
     }
     return (
         torch.cat([r[0] for r in results]),
