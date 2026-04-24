@@ -878,6 +878,16 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 neutral_capture_rate=rew_stats.get("neutral_capture_rate", 0.0),
                 enemy_capture_rate=rew_stats.get("enemy_capture_rate", 0.0),
                 early_home_expand_per_episode=rew_stats.get("early_home_expand_per_episode", 0.0),
+                mean_target_neutral=rew_stats.get("mean_target_neutral", 0.0),
+                mean_target_enemy=rew_stats.get("mean_target_enemy", 0.0),
+                mean_early_neutral_attempts=rew_stats.get("mean_early_neutral_attempts", 0.0),
+                mean_early_enemy_attempts=rew_stats.get("mean_early_enemy_attempts", 0.0),
+                mean_early_neutral_captured=rew_stats.get("mean_early_neutral_captured", 0.0),
+                target_neutral_rate=rew_stats.get("target_neutral_rate", 0.0),
+                target_enemy_rate=rew_stats.get("target_enemy_rate", 0.0),
+                early_neutral_attempts_per_episode=rew_stats.get("early_neutral_attempts_per_episode", 0.0),
+                early_enemy_attempts_per_episode=rew_stats.get("early_enemy_attempts_per_episode", 0.0),
+                early_neutral_captured_per_episode=rew_stats.get("early_neutral_captured_per_episode", 0.0),
                 **head_metrics,
             )
 
