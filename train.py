@@ -1090,6 +1090,10 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 **head_metrics,
             )
 
+            # crash 복구용: 매 gen마다 latest weights overwrite (용량 증가 없음).
+            # eval_interval 주기를 기다리지 않고 최근 모델 항상 유지.
+            torch.save(main_model.state_dict(), os.path.join(SAVE_DIR, "main_latest.pt"))
+
             if generation % eval_interval == 0:
                 opp_eval = league.sample_opponent() or exploiter
                 eval_t0  = time.time()
@@ -1116,7 +1120,6 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                     print("  Exploiter 리셋")
 
                 save_checkpoint(ckpt_path, main_model, optimizer, generation, total_steps, league.agents)
-                torch.save(main_model.state_dict(), os.path.join(SAVE_DIR, "main_latest.pt"))
 
     finally:
         if pool is not None:

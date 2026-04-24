@@ -42,7 +42,7 @@ env:
   history_turns: 20     # temporal window
 
 selfplay:
-  eval_interval: 50     # N세대마다 이전 버전과 대전
+  eval_interval: 25     # N세대마다 이전 버전과 대전 (gen 당 ~13분 → 5.4시간마다 eval)
   win_threshold: 0.55   # 이 승률 넘어야 새 버전으로 교체
   pool_size: 5          # 대전 상대 풀 크기 (과거 버전 몇 개 유지)
   phase_early_steps: 500000    # early → mid 전환 기준 total_steps
