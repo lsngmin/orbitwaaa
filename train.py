@@ -1103,15 +1103,10 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
             # eval_interval 주기를 기다리지 않고 최근 모델 항상 유지.
             torch.save(main_model.state_dict(), os.path.join(SAVE_DIR, "main_latest.pt"))
 
-            # A policy: 매 gen league 편입 (eval 결과와 독립). pool_size로 자동 rotation.
-            league.add(main_model, generation, win_rate=0.0)
-
-            # resume 상태도 매 gen 갱신 — pool membership이 매 gen 바뀌므로 crash 시 정합성 유지.
-            save_checkpoint(ckpt_path, main_model, optimizer, generation, total_steps, league.agents)
-
+            # eval: 모니터링 전용. league.add 전에 수행 — 방금 저장한 자기 자신을
+            # 샘플링해서 self-vs-self 50% 고정 승률을 찍는 걸 방지. 여기 pool은
+            # 아직 이전 gen들만 포함하므로 "main vs 과거 pool" 의미가 깔끔함.
             if generation % eval_interval == 0:
-                # eval: 모니터링 전용 (A policy). pool 편입 gate 아님, rollback 없음.
-                # 의미: main이 현재 pool 대비 어느 정도인지 기록 → csv/log에만 반영.
                 opp_eval = league.sample_opponent() or exploiter
                 eval_t0  = time.time()
                 win_rate, eval_split = evaluate(main_model, opp_eval, n_games=n_games)
@@ -1132,6 +1127,12 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                     exploiter     = OrbitWarsPolicy().to(DEVICE)
                     exploiter_opt = optim.Adam(exploiter.parameters(), lr=T["learning_rate"])
                     print("  Exploiter 리셋")
+
+            # A policy: 매 gen league 편입 (eval 이후). pool_size로 자동 rotation.
+            league.add(main_model, generation, win_rate=0.0)
+
+            # resume 상태 갱신: pool membership이 매 gen 바뀌므로 crash 시 정합성 유지.
+            save_checkpoint(ckpt_path, main_model, optimizer, generation, total_steps, league.agents)
 
     finally:
         if pool is not None:
