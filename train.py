@@ -34,7 +34,7 @@ from env_wrapper import (
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
     SHIPS_MULTIPLIER_BINS, NUM_SHIPS_BINS,
 )
-from prediction import aim, crosses_sun, first_collision_on_path, PositionCache
+from prediction import aim, crosses_sun, first_collision_on_path, PositionCache, resolve_ships_for_capture
 
 with open("config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -319,20 +319,16 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
 
         target = planets[target_idx]
 
-        # 1-pass required 추정: ships_rep=p.ships로 aim() 호출 → turns 획득
-        # turns로 required 계산 후 multiplier 적용. src.ships로 clip.
-        # turns=None 엣지 케이스는 보수적으로 1 사용.
-        _, _, _, est_turns = aim(p, target, av, int(p.ships), pos_cache=pos_cache)
-        eff_turns    = est_turns if est_turns else 1
-        required     = target.ships + target.production * eff_turns + 1
-        ships_needed = max(1, int(required * multiplier))
-        ships_needed = min(ships_needed, p.ships)
+        # 고정점 반복으로 (ships_needed, required) 동시 해결.
+        # 과거 1-pass 근사(p.ships로 turns 추정)는 느린 함대의 추가 production을
+        # 과소평가해 bin=1.10x가 상습 under-invested였음 → commit 3에서 수정.
+        ships_needed, angle, tx, ty, turns, required, _ = resolve_ships_for_capture(
+            p, target, av, multiplier, p.ships, pos_cache=pos_cache,
+        )
         if ships_needed <= 0:
             counts["filtered_zero_ships"] += 1
             continue
 
-        # ships_needed 확정 후 aim 재호출 — 속도가 달라지면 실제 path도 달라짐.
-        angle, tx, ty, turns = aim(p, target, av, ships_needed, pos_cache=pos_cache)
         if crosses_sun(p.x, p.y, tx, ty):
             counts["filtered_sun"] += 1
             continue

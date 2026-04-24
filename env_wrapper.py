@@ -269,7 +269,7 @@ class OrbitWarsEnv(gym.Env):
 
     def step(self, action):
         from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
-        from prediction import aim, crosses_sun
+        from prediction import aim, crosses_sun, resolve_ships_for_capture
 
         raw_planets, raw_fleets, comet_ids = self._current_obs()
         planets = [Planet(*p) for p in raw_planets]
@@ -306,18 +306,13 @@ class OrbitWarsEnv(gym.Env):
             ships_bin  = int(np.argmax(ships_bin_logits))
             multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
 
-            # 1-pass required 추정: ships_rep=p.ships로 aim() 호출 → turns 획득
-            # turns=None 엣지 케이스는 보수적으로 1 사용
-            angle, tx, ty, turns = aim(p, target, av, int(p.ships))
-            eff_turns    = turns if turns else 1
-            required     = target.ships + target.production * eff_turns + 1
-            ships_needed = max(1, int(required * multiplier))
-            ships_needed = min(ships_needed, p.ships)
+            # 고정점 반복으로 (ships_needed, required) 동시 해결 (commit 3).
+            ships_needed, angle, tx, ty, _, _, _ = resolve_ships_for_capture(
+                p, target, av, multiplier, p.ships,
+            )
             if ships_needed <= 0:
                 continue
 
-            # ships_needed로 aim 재호출 — 속도가 바뀌면 path도 달라짐
-            angle, tx, ty, _ = aim(p, target, av, ships_needed)
             if crosses_sun(p.x, p.y, tx, ty):
                 continue
 
