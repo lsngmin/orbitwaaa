@@ -37,6 +37,20 @@ class TrainingLogger:
             "noop_rate", "high_prod_target_rate",
             "neutral_capture_rate", "enemy_capture_rate",
             "early_home_expand_per_episode",
+            # ── 타겟 분포 / 초반 확장 계측 ──────────────────────────────────
+            "mean_target_neutral", "mean_target_enemy",
+            "mean_early_neutral_attempts", "mean_early_enemy_attempts",
+            "mean_early_neutral_captured",
+            "mean_early_launch_neutral_captured",
+            "target_neutral_rate", "target_enemy_rate",
+            "early_neutral_attempts_per_episode", "early_enemy_attempts_per_episode",
+            "early_neutral_captured_per_episode",
+            "early_launch_neutral_captured_per_episode",
+            "early_neutral_launch_to_cap_rate",
+            # ── ships 분포 실측 (commit 1: Categorical head 전 스냅샷) ──────
+            "ships_ratio_mean", "ships_ratio_std",
+            "ships_to_send_mean", "required_ships_mean",
+            "send_required_ratio_mean", "under_invested_rate",
             "mean_unknown_removal",
             "win_rate", "league_size",
         ]
@@ -148,3 +162,33 @@ class TrainingLogger:
                 f"/hprod={high_prod_rate:.0%}]"
             )
             print(line3)
+
+        tgt_n_rate    = kwargs.get("target_neutral_rate", "")
+        tgt_e_rate    = kwargs.get("target_enemy_rate", "")
+        early_n_att   = kwargs.get("early_neutral_attempts_per_episode", "")
+        early_e_att   = kwargs.get("early_enemy_attempts_per_episode", "")
+        early_n_cap   = kwargs.get("early_neutral_captured_per_episode", "")
+        early_lnc     = kwargs.get("early_launch_neutral_captured_per_episode", "")
+        early_l2c     = kwargs.get("early_neutral_launch_to_cap_rate", "")
+        if _is_num(tgt_n_rate):
+            line4 = (
+                f"aim=[tgt_n={tgt_n_rate:.0%}/tgt_e={tgt_e_rate:.0%}"
+                f" | early20: n_att={early_n_att:.2f}/e_att={early_e_att:.2f}"
+                f"/n_cap={early_n_cap:.2f}/home_cap={home20_per_ep:.2f}"
+                f" | launch20→cap={early_lnc:.2f}(={early_l2c:.0%})]"
+            )
+            print(line4)
+
+        sr_mean   = kwargs.get("ships_ratio_mean", "")
+        sr_std    = kwargs.get("ships_ratio_std", "")
+        sts_mean  = kwargs.get("ships_to_send_mean", "")
+        req_mean  = kwargs.get("required_ships_mean", "")
+        srr_mean  = kwargs.get("send_required_ratio_mean", "")
+        under     = kwargs.get("under_invested_rate", "")
+        if _is_num(sr_mean):
+            line5 = (
+                f"ships=[ratio={sr_mean:.3f}±{sr_std:.3f}"
+                f" | send={sts_mean:.1f}/req={req_mean:.1f}"
+                f" | s/r={srr_mean:.2f}/under={under:.0%}]"
+            )
+            print(line5)

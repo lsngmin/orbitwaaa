@@ -46,6 +46,18 @@ class HitRateTracker:
         "captured_exclusive", "captured_ambiguous",
         "captured_neutral", "captured_enemy",
         "early_home_expand",
+        # ── 타겟 분포 / 초반 확장 계측 ───────────────────────────────────────
+        "target_neutral",         # rollout 전체 중립 타겟 launched 수
+        "target_enemy",           # rollout 전체 적 타겟 launched 수
+        "early_neutral_attempts", # 초반 20턴 내 중립 타겟 launched 수
+        "early_enemy_attempts",   # 초반 20턴 내 적 타겟 launched 수
+        "early_neutral_captured", # 초반 20턴 내 (resolve 시점) 중립 점령 성공 수
+        "early_launch_neutral_captured",  # 초반 20턴 내 발사된 중립 타겟의 실제 점령 수
+                                          # (resolve 시점 무관 — fleet 비행시간 영향 X)
+        # ── ships 분포 실측 (commit 1: Categorical head 도입 전 스냅샷) ────
+        "ships_ratio_sum", "ships_ratio_sq_sum",
+        "ships_to_send_sum", "required_ships_sum",
+        "send_required_ratio_sum", "under_invested_count",
         "unknown_removal",
     )
     HOME_EXPAND_TURNS = 20
@@ -88,14 +100,27 @@ class HitRateTracker:
 
         engine이 유효 move마다 next_fleet_id를 1씩 증가시키고, decode는 엔진이
         수용하는 조건(상위집합)만 통과시키므로 moves[i]는 fleet_id = next_fleet_id+i.
+
+        동시에 target_owner 기반 launch 분포/초반 attempt 계측도 여기서 수행.
         """
+        is_early = self.episode_turn < self.HOME_EXPAND_TURNS
         for i, meta in enumerate(launches):
             fid = next_fleet_id + i
             self.pending[fid] = {
                 **meta,
                 "last_x": meta["start_x"],
                 "last_y": meta["start_y"],
+                "launched_at_turn": self.episode_turn,
             }
+            target_owner = meta.get("target_owner")
+            if target_owner == -1:
+                self.counters["target_neutral"] += 1
+                if is_early:
+                    self.counters["early_neutral_attempts"] += 1
+            elif target_owner is not None and target_owner != self.player_id:
+                self.counters["target_enemy"] += 1
+                if is_early:
+                    self.counters["early_enemy_attempts"] += 1
 
     # ── V2: 해소 ────────────────────────────────────────────────────────────
     def resolve_step(self, prev_obs, curr_obs, max_speed):
@@ -171,7 +196,13 @@ class HitRateTracker:
                         self.counters[f"captured_{suffix}"] += 1
                         if prev_owner == -1:
                             self.counters["captured_neutral"] += 1
+                            # 발사 시점 기준: "초반 20턴에 쏜 중립이 점령으로 이어졌나"
+                            # resolve 시점이 아니라 launched_at_turn 기준이라 fleet 비행시간 영향 없음
+                            if meta.get("launched_at_turn", 999) < self.HOME_EXPAND_TURNS:
+                                self.counters["early_launch_neutral_captured"] += 1
+                            # resolve 시점 기준 (기존)
                             if self.episode_turn < self.HOME_EXPAND_TURNS:
+                                self.counters["early_neutral_captured"] += 1
                                 px, py = prev_planet[2], prev_planet[3]
                                 if any(
                                     math.hypot(px - hx, py - hy) <= self.HOME_EXPAND_RADIUS
@@ -196,6 +227,41 @@ class HitRateTracker:
         out["neutral_capture_rate"] = self.counters.get("captured_neutral", 0) / max(launched, 1)
         out["enemy_capture_rate"] = self.counters.get("captured_enemy", 0) / max(launched, 1)
         out["early_home_expand_per_episode"] = self.counters.get("early_home_expand", 0) / max(self.episodes, 1)
+        # ── 타겟 분포 / 초반 확장 파생 지표 ─────────────────────────────────
+        eps = max(self.episodes, 1)
+        out["target_neutral_rate"] = self.counters.get("target_neutral", 0) / max(launched, 1)
+        out["target_enemy_rate"]   = self.counters.get("target_enemy", 0)   / max(launched, 1)
+        out["early_neutral_attempts_per_episode"] = self.counters.get("early_neutral_attempts", 0) / eps
+        out["early_enemy_attempts_per_episode"]   = self.counters.get("early_enemy_attempts", 0)   / eps
+        out["early_neutral_captured_per_episode"] = self.counters.get("early_neutral_captured", 0) / eps
+        out["early_launch_neutral_captured_per_episode"] = self.counters.get("early_launch_neutral_captured", 0) / eps
+        # 발사대비 점령율: 초반에 쏜 중립 타겟 중 몇 %가 점령으로 이어졌는가
+        # (fleet 비행시간 영향 없는 순수 실행 성공률)
+        early_n_att = self.counters.get("early_neutral_attempts", 0)
+        out["early_neutral_launch_to_cap_rate"] = (
+            self.counters.get("early_launch_neutral_captured", 0) / max(early_n_att, 1)
+        )
+        # ── ships 분포 실측 파생 지표 ──────────────────────────────────────
+        # 모든 통계는 "launched" 기준 평균 (filter 통과한 valid launch만 집계)
+        sr_sum   = self.counters.get("ships_ratio_sum", 0.0)
+        sr_sq    = self.counters.get("ships_ratio_sq_sum", 0.0)
+        sts_sum  = self.counters.get("ships_to_send_sum", 0)
+        req_sum  = self.counters.get("required_ships_sum", 0.0)
+        srr_sum  = self.counters.get("send_required_ratio_sum", 0.0)
+        under    = self.counters.get("under_invested_count", 0)
+        if launched > 0:
+            sr_mean = sr_sum / launched
+            sr_var  = max(sr_sq / launched - sr_mean ** 2, 0.0)
+            out["ships_ratio_mean"]         = sr_mean
+            out["ships_ratio_std"]          = math.sqrt(sr_var)
+            out["ships_to_send_mean"]       = sts_sum / launched
+            out["required_ships_mean"]      = req_sum / launched
+            out["send_required_ratio_mean"] = srr_sum / launched
+            out["under_invested_rate"]      = under / launched
+        else:
+            for k in ("ships_ratio_mean", "ships_ratio_std", "ships_to_send_mean",
+                      "required_ships_mean", "send_required_ratio_mean", "under_invested_rate"):
+                out[k] = 0.0
         return out
 
 

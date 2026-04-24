@@ -19,7 +19,7 @@ training:
   gae_lambda: 0.95
   clip_range: 0.2
   target_kl: null       # 이 값 초과 시 PPO epoch 조기 종료 (None이면 비활성)
-  ent_coef: 0.001       # 탐험 장려 엔트로피 계수
+  ent_coef: 0.005       # 탐험 장려 엔트로피 계수
   vf_coef: 0.5          # Critic loss 가중치
   max_grad_norm: 0.5    # gradient clipping
   dense_reward_coef: 0.02   # dense reward 계수 (0이면 terminal-only)
