@@ -68,6 +68,11 @@ class HitRateTracker:
         "chosen_multiplier_sum", "chosen_multiplier_sq_sum",
         "ships_to_send_sum", "required_ships_sum",
         "send_required_ratio_sum", "under_invested_count",
+        # ── target-type 분리: neutral(prod 없음) vs enemy(prod 회복) ────────
+        "ships_to_send_sum_neutral", "ships_to_send_sum_enemy",
+        "required_ships_sum_neutral", "required_ships_sum_enemy",
+        "send_required_ratio_sum_neutral", "send_required_ratio_sum_enemy",
+        "under_invested_count_neutral", "under_invested_count_enemy",
         "unknown_removal",
     ) + tuple(f"ships_bin_hist_{k}" for k in range(NUM_SHIPS_BINS))
     HOME_EXPAND_TURNS = 20
@@ -281,6 +286,28 @@ class HitRateTracker:
                 out[k] = 0.0
             for k in range(NUM_SHIPS_BINS):
                 out[f"ships_bin_rate_{k}"] = 0.0
+
+        # ── target-type 분리 지표 ───────────────────────────────────────────
+        # 분모: target_neutral / target_enemy (register_launches에서 launch 시점에 집계).
+        # 의미:
+        #   send_required_ratio_mean_{neutral,enemy}:
+        #     ships_needed / required 비율. required는 target.ships+prod×turns+1 기준.
+        #     1.10 bin 정상 수렴 시 ≈1.1 근처. clip(src.ships 한계)이 자주 발생하면 < 1.
+        #   under_invested_rate_{neutral,enemy}:
+        #     nominal margin 미달 비율 (= src.ships clip). under-invest가 enemy 쪽에
+        #     많으면 prod 재생산으로 장기 waste, 패배 상관 높음.
+        for kind in ("neutral", "enemy"):
+            n_launch = counters.get(f"target_{kind}", 0)
+            if n_launch > 0:
+                out[f"ships_to_send_mean_{kind}"]       = counters.get(f"ships_to_send_sum_{kind}", 0) / n_launch
+                out[f"required_ships_mean_{kind}"]      = counters.get(f"required_ships_sum_{kind}", 0.0) / n_launch
+                out[f"send_required_ratio_mean_{kind}"] = counters.get(f"send_required_ratio_sum_{kind}", 0.0) / n_launch
+                out[f"under_invested_rate_{kind}"]      = counters.get(f"under_invested_count_{kind}", 0) / n_launch
+            else:
+                out[f"ships_to_send_mean_{kind}"]       = 0.0
+                out[f"required_ships_mean_{kind}"]      = 0.0
+                out[f"send_required_ratio_mean_{kind}"] = 0.0
+                out[f"under_invested_rate_{kind}"]      = 0.0
         return out
 
     def summary(self):

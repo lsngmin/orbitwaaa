@@ -61,10 +61,17 @@ class TrainingLogger:
             "chosen_multiplier_mean", "chosen_multiplier_std",
             "ships_to_send_mean", "required_ships_mean",
             "send_required_ratio_mean", "under_invested_rate",
+            # target-type 분리 (neutral prod 없음 / enemy prod 회복 → waste 차이)
+            "send_required_ratio_mean_neutral", "send_required_ratio_mean_enemy",
+            "under_invested_rate_neutral", "under_invested_rate_enemy",
+            "ships_to_send_mean_neutral", "ships_to_send_mean_enemy",
+            "required_ships_mean_neutral", "required_ships_mean_enemy",
             # ships_bin 히스토그램 (launched 대비 비율)
             *(f"ships_bin_rate_{k}" for k in range(_NUM_SHIPS_BINS)),
             "mean_unknown_removal",
             "win_rate", "league_size",
+            # wall-time 계측
+            "eval_wall_s", "gen_wall_s",
         ]
         with open(self.path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
@@ -212,3 +219,18 @@ class TrainingLogger:
                 f"{bin_str}"
             )
             print(line5)
+
+        # target-type 분리: neutral(prod 없음)은 under-invest 해도 한 번 손실만,
+        # enemy(prod 회복)는 재생산으로 장기 waste → under_enemy가 패배 상관 큼.
+        srr_n  = kwargs.get("send_required_ratio_mean_neutral", "")
+        srr_e  = kwargs.get("send_required_ratio_mean_enemy", "")
+        und_n  = kwargs.get("under_invested_rate_neutral", "")
+        und_e  = kwargs.get("under_invested_rate_enemy", "")
+        sts_n  = kwargs.get("ships_to_send_mean_neutral", "")
+        sts_e  = kwargs.get("ships_to_send_mean_enemy", "")
+        if _is_num(srr_n) or _is_num(srr_e):
+            line6 = (
+                f"by_tgt=[neu: s/r={srr_n:.2f}/under={und_n:.0%}/send={sts_n:.1f}"
+                f" | enm: s/r={srr_e:.2f}/under={und_e:.0%}/send={sts_e:.1f}]"
+            )
+            print(line6)

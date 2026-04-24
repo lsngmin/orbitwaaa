@@ -296,7 +296,15 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                "ships_to_send_sum": 0,           # 실제 발사 ships 수 평균
                "required_ships_sum": 0.0,        # 필요 병력 추정치 평균
                "send_required_ratio_sum": 0.0,   # ships_to_send / required 평균
-               "under_invested_count": 0}        # ships_needed < int(required × multiplier) 횟수 (src.ships clip으로 nominal margin 미달)
+               "under_invested_count": 0,        # ships_needed < int(required × multiplier) 횟수 (src.ships clip으로 nominal margin 미달)
+               # ── target-type 분리 (neutral=prod 무시 가능 / enemy=prod 회복) ──
+               # 도메인 차이: 중립은 prod 없음 → under-invest해도 단발 손실만, 반면 적은
+               # prod로 재생산 → 같은 ratio라도 적 대상 under-invest가 장기적으로 더 큰 waste.
+               # 승패 상관관계 분석: under_invested_rate_enemy가 지표로서 더 날카로움.
+               "ships_to_send_sum_neutral": 0,   "ships_to_send_sum_enemy": 0,
+               "required_ships_sum_neutral": 0.0, "required_ships_sum_enemy": 0.0,
+               "send_required_ratio_sum_neutral": 0.0, "send_required_ratio_sum_enemy": 0.0,
+               "under_invested_count_neutral": 0, "under_invested_count_enemy": 0}
     # ships_bin 선택 히스토그램 (K bins): counts["ships_bin_hist_k"] = count
     for k in range(NUM_SHIPS_BINS):
         counts[f"ships_bin_hist_{k}"] = 0
@@ -358,14 +366,22 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         #                      정확히 "src.ships clip" 시점과 일치 (bin 선택이 과도히 ambitious).
         srr = ships_needed / max(required, 1)
         nominal_need = int(required * multiplier)
+        under_invested = ships_needed < nominal_need
         counts["chosen_multiplier_sum"]    += multiplier
         counts["chosen_multiplier_sq_sum"] += multiplier ** 2
         counts["ships_to_send_sum"]        += ships_needed
         counts["required_ships_sum"]       += required
         counts["send_required_ratio_sum"]  += srr
         counts[f"ships_bin_hist_{ships_bin}"] += 1
-        if ships_needed < nominal_need:
+        if under_invested:
             counts["under_invested_count"] += 1
+        # target-type 분리 (neutral vs enemy)
+        suffix = "neutral" if target.owner == -1 else "enemy"
+        counts[f"ships_to_send_sum_{suffix}"]       += ships_needed
+        counts[f"required_ships_sum_{suffix}"]      += required
+        counts[f"send_required_ratio_sum_{suffix}"] += srr
+        if under_invested:
+            counts[f"under_invested_count_{suffix}"] += 1
 
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
@@ -997,6 +1013,15 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 required_ships_mean=rew_stats.get("required_ships_mean", 0.0),
                 send_required_ratio_mean=rew_stats.get("send_required_ratio_mean", 0.0),
                 under_invested_rate=rew_stats.get("under_invested_rate", 0.0),
+                # target-type 분리: neutral(prod 없음) vs enemy(prod 회복) — waste 상관관계 분석용
+                send_required_ratio_mean_neutral=rew_stats.get("send_required_ratio_mean_neutral", 0.0),
+                send_required_ratio_mean_enemy=rew_stats.get("send_required_ratio_mean_enemy", 0.0),
+                under_invested_rate_neutral=rew_stats.get("under_invested_rate_neutral", 0.0),
+                under_invested_rate_enemy=rew_stats.get("under_invested_rate_enemy", 0.0),
+                ships_to_send_mean_neutral=rew_stats.get("ships_to_send_mean_neutral", 0.0),
+                ships_to_send_mean_enemy=rew_stats.get("ships_to_send_mean_enemy", 0.0),
+                required_ships_mean_neutral=rew_stats.get("required_ships_mean_neutral", 0.0),
+                required_ships_mean_enemy=rew_stats.get("required_ships_mean_enemy", 0.0),
                 **{f"ships_bin_rate_{k}": rew_stats.get(f"ships_bin_rate_{k}", 0.0)
                    for k in range(NUM_SHIPS_BINS)},
                 **head_metrics,
