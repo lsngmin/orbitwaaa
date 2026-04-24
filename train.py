@@ -16,6 +16,7 @@ import os
 import copy
 import random
 import math
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -914,6 +915,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
     try:
         while total_steps < total_timesteps:
             generation += 1
+            gen_t0 = time.time()
 
             self_prob  = _self_play_prob(total_steps, len(league))
             if random.random() < self_prob:
@@ -1001,12 +1003,17 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
 
             if generation % eval_interval == 0:
                 opp_eval = league.sample_opponent() or exploiter
+                eval_t0  = time.time()
                 win_rate = evaluate(main_model, opp_eval, n_games=n_games)
+                eval_wall_s = time.time() - eval_t0
 
+                gen_wall_s = time.time() - gen_t0
                 logger.log(
                     generation=generation, total_steps=total_steps, match_type="eval",
                     policy_loss=p_loss, value_loss=v_loss, entropy_loss=e_loss,
                     win_rate=win_rate, league_size=len(league),
+                    eval_wall_s=eval_wall_s,
+                    gen_wall_s=gen_wall_s,
                 )
 
                 if win_rate >= SP["win_threshold"]:
