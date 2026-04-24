@@ -633,6 +633,9 @@ def _finalize_reward_stats(raw_list):
     stats["mean_dense"]    = total_dense    / steps_safe
     stats["mean_cap"]      = total_cap      / steps_safe
     stats["mean_terminal"] = total_terminal / steps_safe
+    # Episode-grained collection에서 generation마다 실제 수집량이 달라지므로
+    # target_steps 대비 초과량으로 "unusually 길었던 generation" 감지 가능.
+    stats["actual_steps"]  = total_n_steps
     return stats
 
 

@@ -50,6 +50,8 @@ def test_mean_dense_step_weighted_not_worker_averaged():
     )
     # 편향된 worker 평균 0.015와 명확히 다름을 확인
     assert abs(stats["mean_dense"] - 0.015) > 1e-4
+    # actual_steps: generation 실제 수집량 (target 대비 초과 감지용)
+    assert stats["actual_steps"] == 1000
 
 
 # ── 2. per-episode metric: episode-weighted ──────────────────────────────────
