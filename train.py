@@ -292,7 +292,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                "ships_to_send_sum": 0,           # 실제 발사 ships 수 평균
                "required_ships_sum": 0.0,        # 필요 병력 추정치 평균
                "send_required_ratio_sum": 0.0,   # ships_to_send / required 평균
-               "under_invested_count": 0}        # send_required_ratio < 1.0 횟수 (src.ships로 clip된 경우)
+               "under_invested_count": 0}        # ships_needed < int(required × multiplier) 횟수 (src.ships clip으로 nominal margin 미달)
     # ships_bin 선택 히스토그램 (K bins): counts["ships_bin_hist_k"] = count
     for k in range(NUM_SHIPS_BINS):
         counts[f"ships_bin_hist_{k}"] = 0
@@ -347,16 +347,20 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             counts["launched_high_prod"] += 1
 
         # ── ships 실측 (launched 기준 집계) ──────────────────────────────────
-        # send_required_ratio는 actual ships_needed(clip 후) / required.
-        # under_invested: src.ships가 부족해 required × multiplier에 못 미친 경우.
+        # send_required_ratio = ships_needed(clip 후) / required  (실제 공급 비율)
+        # under_invested     = ships_needed < int(required × multiplier)
+        #                      즉 src.ships clip으로 nominal multiplier margin을 못 채운 경우.
+        #                      commit 3 resolver가 margin을 보장하므로 이 분기는
+        #                      정확히 "src.ships clip" 시점과 일치 (bin 선택이 과도히 ambitious).
         srr = ships_needed / max(required, 1)
+        nominal_need = int(required * multiplier)
         counts["chosen_multiplier_sum"]    += multiplier
         counts["chosen_multiplier_sq_sum"] += multiplier ** 2
         counts["ships_to_send_sum"]        += ships_needed
         counts["required_ships_sum"]       += required
         counts["send_required_ratio_sum"]  += srr
         counts[f"ships_bin_hist_{ships_bin}"] += 1
-        if srr < 1.0:
+        if ships_needed < nominal_need:
             counts["under_invested_count"] += 1
 
         moves.append([p.id, angle, ships_needed])

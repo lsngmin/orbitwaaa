@@ -109,6 +109,74 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
         assert counts[f"ships_bin_hist_{k}"] == 0
 
 
+@patch("train.Planet", FakePlanet)
+@patch("prediction.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
+@patch("train.crosses_sun", return_value=False)
+@patch("train.first_collision_on_path", return_value=("planet", 1))
+def test_under_invested_counts_multiplier_margin_clip(mock_path, mock_sun, mock_aim):
+    """
+    under_invested_count의 정확한 시맨틱:
+      ships_needed < int(required × multiplier) 인 경우만 집계.
+
+    회귀 방지 케이스 (Case B): src.ships >= required지만 nominal multiplier
+    target에는 못 미치는 clip 상황.
+      - src.ships=30, target.ships=5, prod=2, turns=10 → required=26
+      - multiplier=1.60 → nominal = int(26 × 1.60) = 41 → clip to 30
+      - srr = 30/26 = 1.15 ≥ 1.0 (과거 버그 기준으로는 under 아님)
+      - ships_needed(30) < nominal(41) → under_invested_count=1 (정확)
+
+    prediction.aim을 patch해야 resolve_ships_for_capture 내부 aim 호출까지 덮음.
+    """
+    # ships_bin=2 → 1.60x
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
+    _set_action(action_np, src_idx=0, ships_bin=2, target_idx=1)
+
+    raw_planets = [
+        make_raw(0, 10.0, 10.0, owner=0, ships=30),
+        make_raw(1, 80.0, 80.0, owner=1, ships=5, production=2),
+    ]
+
+    moves, counts, launches = decode_action_to_moves(
+        action_np, raw_planets, av=0.0, acting_player=0, return_counts=True,
+    )
+
+    assert counts["launched"] == 1
+    assert launches[0]["ships"] == 30          # clip 발생
+    # required=26, send=30 → srr>1 (과거 검사로는 under 아님)
+    assert launches[0]["ships"] > 26
+    # 그러나 nominal = int(26×1.60)=41 → under-invested
+    assert counts["under_invested_count"] == 1, (
+        "multiplier-margin clip 누락 (과거 버그): "
+        f"sent={launches[0]['ships']}, nominal={int(26 * 1.60)}"
+    )
+
+
+@patch("train.Planet", FakePlanet)
+@patch("prediction.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
+@patch("train.crosses_sun", return_value=False)
+@patch("train.first_collision_on_path", return_value=("planet", 1))
+def test_under_invested_zero_when_margin_satisfied(mock_path, mock_sun, mock_aim):
+    """
+    대조군: clip 없이 nominal margin 충족 시 under_invested_count=0.
+      - src.ships=100, required=26, multiplier=1.10 → nominal=28
+      - ships_needed = 28 (clip 없음), 28 >= 28 → under=0
+    """
+    action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
+    _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)  # 1.10x
+
+    raw_planets = [
+        make_raw(0, 10.0, 10.0, owner=0, ships=100),
+        make_raw(1, 80.0, 80.0, owner=1, ships=5, production=2),
+    ]
+    moves, counts, launches = decode_action_to_moves(
+        action_np, raw_planets, av=0.0, acting_player=0, return_counts=True,
+    )
+
+    assert counts["launched"] == 1
+    assert launches[0]["ships"] == 28           # int(26 × 1.10) = 28, clip 없음
+    assert counts["under_invested_count"] == 0  # margin 충족
+
+
 def test_hit_rate_tracker_summary_returns_per_step_means():
     tracker = HitRateTracker()
     tracker.record({
