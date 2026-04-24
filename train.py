@@ -445,103 +445,117 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
+    # Episode-grained collection:
+    #   - 바깥 while: target_steps 이상 채우고 현재 에피소드도 완주했으면 종료
+    #   - 안쪽 while: 한 에피소드가 done=True 찍을 때까지 무조건 완주
+    #   결과: buffer 마지막 step은 항상 done=True → last_value bootstrap 불필요.
+    #   n_steps 파라미터는 "target"으로 해석 (실제 수집량은 ≥ n_steps).
     step = 0
-    while step < n_steps:
-        raw_obs_main = env.state[0].observation
-        obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
+    while True:
+        ep_done = False
+        while not ep_done:
+            raw_obs_main = env.state[0].observation
+            obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
-        analysis = analyze_action_space(raw_planets, av, acting_player=0)
-        launch_mask, target_mask = analysis.launch_mask, analysis.target_mask
-        with torch.no_grad():
-            action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
-                obs_t.unsqueeze(0).to(device),
-                launch_mask=launch_mask.unsqueeze(0).to(device),
-                target_mask=target_mask.unsqueeze(0).to(device),
+            analysis = analyze_action_space(raw_planets, av, acting_player=0)
+            launch_mask, target_mask = analysis.launch_mask, analysis.target_mask
+            with torch.no_grad():
+                action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
+                    obs_t.unsqueeze(0).to(device),
+                    launch_mask=launch_mask.unsqueeze(0).to(device),
+                    target_mask=target_mask.unsqueeze(0).to(device),
+                )
+            action_np  = action_t.squeeze(0).cpu().numpy()
+            moves_main, decode_counts, launches_main = decode_action_to_moves(
+                action_np, raw_planets, av, acting_player=0, return_counts=True,
+                analysis=analysis,
             )
-        action_np  = action_t.squeeze(0).cpu().numpy()
-        moves_main, decode_counts, launches_main = decode_action_to_moves(
-            action_np, raw_planets, av, acting_player=0, return_counts=True,
-            analysis=analysis,
-        )
-        hit_tracker.record(decode_counts)
+            hit_tracker.record(decode_counts)
 
-        raw_obs_opp = env.state[1].observation
-        obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
-        moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
+            raw_obs_opp = env.state[1].observation
+            obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
+            moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
 
-        # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
-        prev_map      = _snapshot_planet_owners(env.state[0].observation)
-        prev_obs_snap = _snapshot_obs_for_resolve(env.state[0].observation)
-        hit_tracker.register_launches(launches_main, prev_obs_snap["next_fleet_id"])
-        env.step([moves_main, moves_opp])
-        done = env.done
+            # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
+            prev_map      = _snapshot_planet_owners(env.state[0].observation)
+            prev_obs_snap = _snapshot_obs_for_resolve(env.state[0].observation)
+            hit_tracker.register_launches(launches_main, prev_obs_snap["next_fleet_id"])
+            env.step([moves_main, moves_opp])
+            ep_done = env.done
 
-        curr_obs_main  = env.state[0].observation
-        max_speed      = env.configuration.shipSpeed
-        hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
-        curr_score     = (state_score(curr_obs_main, player=0)
-                        - state_score(env.state[1].observation, player=1))
-        dense_r        = dense_coef * (curr_score - prev_score)
-        cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0)
-        terminal_r     = 0.0
-        reward         = dense_r + cap_bonus
-        prev_score     = curr_score
+            curr_obs_main  = env.state[0].observation
+            max_speed      = env.configuration.shipSpeed
+            hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
+            curr_score     = (state_score(curr_obs_main, player=0)
+                            - state_score(env.state[1].observation, player=1))
+            dense_r        = dense_coef * (curr_score - prev_score)
+            cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0)
+            terminal_r     = 0.0
+            reward         = dense_r + cap_bonus
+            prev_score     = curr_score
 
-        if done:
-            r          = env.state[0].reward
-            terminal_r = terminal_win_reward if r == 1 else (
-                -terminal_win_reward if r == -1 else 0.0
-            )
-            reward    += terminal_r
+            if ep_done:
+                r          = env.state[0].reward
+                terminal_r = terminal_win_reward if r == 1 else (
+                    -terminal_win_reward if r == -1 else 0.0
+                )
+                reward    += terminal_r
 
-        sum_dense    += dense_r
-        sum_cap      += cap_bonus
-        sum_terminal += terminal_r
+            sum_dense    += dense_r
+            sum_cap      += cap_bonus
+            sum_terminal += terminal_r
 
-        obs_list.append(obs_t)
-        act_list.append(action_t.squeeze(0).cpu())
-        rew_list.append(torch.tensor(reward, dtype=torch.float32))
-        done_list.append(torch.tensor(float(done), dtype=torch.float32))
-        logp_list.append(log_prob.squeeze(0).cpu())
-        logp_heads_list.append(lp_heads.squeeze(0).cpu())
-        val_list.append(value.squeeze(0).cpu())
-        launch_mask_list.append(launch_mask)
-        target_mask_list.append(target_mask)
+            obs_list.append(obs_t)
+            act_list.append(action_t.squeeze(0).cpu())
+            rew_list.append(torch.tensor(reward, dtype=torch.float32))
+            done_list.append(torch.tensor(float(ep_done), dtype=torch.float32))
+            logp_list.append(log_prob.squeeze(0).cpu())
+            logp_heads_list.append(lp_heads.squeeze(0).cpu())
+            val_list.append(value.squeeze(0).cpu())
+            launch_mask_list.append(launch_mask)
+            target_mask_list.append(target_mask)
 
-        step += 1
-        if done:
-            env = make("orbit_wars", debug=False)
-            env.reset()
-            hit_tracker.reset_episode(env.state[0].observation)
-            prev_score    = (state_score(env.state[0].observation, player=0)
-                           - state_score(env.state[1].observation, player=1))
-            history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
-            history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
-            history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
-            history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+            step += 1
 
-    # rollout 마지막 다음 상태의 critic value (non-terminal bootstrap용)
-    last_raw = env.state[0].observation
-    last_obs_t, last_raw_planets, last_av = get_obs_tensor(last_raw, 0, history_p, history_f)
-    last_lm, last_tm = build_action_masks(last_raw_planets, last_av, acting_player=0)
-    with torch.no_grad():
-        _, _, last_value, _ = main_model.get_action_and_value(
-            last_obs_t.unsqueeze(0).to(device),
-            launch_mask=last_lm.unsqueeze(0).to(device),
-            target_mask=last_tm.unsqueeze(0).to(device),
-        )
-    last_value = last_value.squeeze().cpu()
+        # 에피소드 완주 후 target 도달 여부 확인
+        if step >= n_steps:
+            break
+
+        # 다음 에피소드 준비 (env/history 리셋)
+        env = make("orbit_wars", debug=False)
+        env.reset()
+        hit_tracker.reset_episode(env.state[0].observation)
+        prev_score    = (state_score(env.state[0].observation, player=0)
+                       - state_score(env.state[1].observation, player=1))
+        history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+        history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+        history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+        history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
+
+    # Buffer 마지막 step은 항상 done=True (episode-grained collection).
+    # → bootstrap 불필요, last_value = 0.0 고정.
+    last_value = torch.tensor(0.0, dtype=torch.float32)
 
     rewards = torch.stack(rew_list)
     dones   = torch.stack(done_list)
     values  = torch.stack(val_list)
+    # Full-episode collection 불변식: buffer 마지막 step은 항상 episode 끝.
+    assert dones[-1].item() == 1.0, (
+        "full-episode collection violated: buffer 마지막 step이 done=False. "
+        "rollout loop 구조 확인 필요."
+    )
     advantages, returns = compute_gae(rewards, dones, values, last_value=last_value)
 
-    reward_stats = {
-        "mean_dense":    sum_dense    / max(n_steps, 1),
-        "mean_cap":      sum_cap      / max(n_steps, 1),
-        "mean_terminal": sum_terminal / max(n_steps, 1),
-        **hit_tracker.summary(),
+    # Raw state 반환 (collect_rollout에서 worker 합산 후 한 번에 normalize).
+    # worker별 episode 길이가 달라도 합산된 raw counters/step/episode로
+    # 분모를 정확히 반영해 편향 없는 metric 산출.
+    raw_stats = {
+        "counters":     dict(hit_tracker.counters),
+        "n_steps":      hit_tracker.n_steps,
+        "episodes":     hit_tracker.episodes,
+        "sum_dense":    sum_dense,
+        "sum_cap":      sum_cap,
+        "sum_terminal": sum_terminal,
     }
     return (
         torch.stack(obs_list),
@@ -552,7 +566,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         torch.stack(logp_heads_list),
         torch.stack(launch_mask_list),
         torch.stack(target_mask_list),
-        reward_stats,
+        raw_stats,   # ← normalize는 collect_rollout에서 합산 후 수행
     )
 
 
@@ -590,10 +604,50 @@ def _rollout_worker(args):
         raise
 
 
+def _finalize_reward_stats(raw_list):
+    """Worker별 raw_stats 리스트를 합산해서 normalized reward_stats dict 구성.
+
+    단순 worker 평균은 episode 길이가 worker마다 다를 때 편향되므로
+    raw counters/n_steps/episodes/sum_* 을 먼저 합산하고, 그 합산된 분모로
+    한 번에 정규화한다 (step-weighted / episode-weighted / launched-weighted
+    모두 HitRateTracker.summary_from_counters가 올바르게 처리).
+    """
+    from collections import defaultdict
+    total_counters = defaultdict(float)
+    total_n_steps = 0
+    total_episodes = 0
+    total_dense = total_cap = total_terminal = 0.0
+    for r in raw_list:
+        for k, v in r["counters"].items():
+            total_counters[k] += v
+        total_n_steps  += r["n_steps"]
+        total_episodes += r["episodes"]
+        total_dense    += r["sum_dense"]
+        total_cap      += r["sum_cap"]
+        total_terminal += r["sum_terminal"]
+
+    stats = HitRateTracker.summary_from_counters(
+        total_counters, total_n_steps, total_episodes,
+    )
+    steps_safe = max(total_n_steps, 1)
+    stats["mean_dense"]    = total_dense    / steps_safe
+    stats["mean_cap"]      = total_cap      / steps_safe
+    stats["mean_terminal"] = total_terminal / steps_safe
+    return stats
+
+
 def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None):
-    """n_envs=1이면 단일 env, 그 이상이면 multiprocessing 병렬 rollout."""
+    """n_envs=1이면 단일 env, 그 이상이면 multiprocessing 병렬 rollout.
+
+    _collect_single은 raw_stats(counters/n_steps/episodes/sum_*)를 반환.
+    여기서 worker들을 합산한 뒤 step-weighted로 정확히 정규화해서
+    최종 reward_stats를 만든다 (full-episode collection에서 worker별
+    episode 길이가 달라도 편향 없음).
+    """
     if n_envs <= 1 or pool is None:
-        return _collect_single(main_model, opponent_model, n_steps, DEVICE)
+        result = _collect_single(main_model, opponent_model, n_steps, DEVICE)
+        merged_stats = _finalize_reward_stats([result[8]])
+        return (*result[:8], merged_stats)
 
     main_state = {k: v.cpu() for k, v in main_model.state_dict().items()}
     opp_state  = ({k: v.cpu() for k, v in opponent_model.state_dict().items()}
@@ -604,12 +658,7 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
 
     results = pool.map(_rollout_worker, worker_args)
 
-    # reward_stats: worker별 평균을 다시 평균 (index 8)
-    # worker마다 key 집합이 다를 수 있으므로 union + .get(., 0.0)으로 안전하게 합침.
-    keys = set().union(*(r[8].keys() for r in results))
-    merged_stats = {
-        k: sum(r[8].get(k, 0.0) for r in results) / len(results) for k in keys
-    }
+    merged_stats = _finalize_reward_stats([r[8] for r in results])
     return (
         torch.cat([r[0] for r in results]),
         torch.cat([r[1] for r in results]),

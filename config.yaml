@@ -20,7 +20,7 @@ training:
   learning_rate: 0.0001
   total_timesteps: 10000000
   n_envs: 64
-  gamma: 0.99
+  gamma: 1.0            # length invariance: 짧은/긴 에피소드 terminal 보상 동등
   gae_lambda: 0.95
   clip_range: 0.2
   target_kl: null       # 이 값 초과 시 PPO epoch 조기 종료 (None이면 비활성)

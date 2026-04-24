@@ -115,7 +115,10 @@ def test_decode_sun_blocked(mock_sun, mock_aim):
 def test_single_sample_per_step():
     """
     _collect_single에서 main agent의 get_action_and_value가
-    스텝당 정확히 1회 + 마지막에 GAE bootstrap용 1회 호출되는지 확인.
+    각 step당 정확히 1회 호출되는지 확인 (double-sampling 회귀 방지).
+
+    Full-episode collection에서는 bootstrap 호출이 없으므로:
+      call_count == len(collected_actions)  (정확히 step당 1회)
     """
     from train import _collect_single
     from model import OrbitWarsPolicy
@@ -134,12 +137,16 @@ def test_single_sample_per_step():
     model.get_action_and_value = counting_fn
 
     N_STEPS = 3
-    _collect_single(model, None, n_steps=N_STEPS, device=device)
+    result = _collect_single(model, None, n_steps=N_STEPS, device=device)
+    collected_actions = result[1]   # (obs, act, adv, ret, ...) — index 1은 actions
 
-    expected = N_STEPS + 1  # +1: last_value bootstrap for GAE truncation
-    assert call_count[0] == expected, (
-        f"get_action_and_value called {call_count[0]} times for {N_STEPS} steps "
-        f"(expected {expected} = steps + bootstrap — double sampling bug re-introduced?)"
+    assert call_count[0] == len(collected_actions), (
+        f"get_action_and_value called {call_count[0]} times, but "
+        f"{len(collected_actions)} actions stored — double sampling bug re-introduced?"
+    )
+    # full-episode collection은 target_steps 이상 수집 보장
+    assert len(collected_actions) >= N_STEPS, (
+        f"collected {len(collected_actions)} steps < target {N_STEPS}"
     )
 
 
@@ -212,12 +219,14 @@ def test_collect_single_stored_action_matches_decoded_moves():
     with patch.object(train, "decode_action_to_moves", side_effect=tracing_decode):
         _collect_single(model, None, n_steps=N_STEPS, device=device)
 
-    # sampled: N_STEPS + 1 (마지막은 GAE bootstrap용, decode와 무관)
-    # decoded: N_STEPS
-    assert len(sampled_actions) == N_STEPS + 1
-    assert len(decoded_actions) == N_STEPS
+    # Full-episode collection: bootstrap 호출이 없음 → sampled == decoded 개수.
+    assert len(sampled_actions) == len(decoded_actions), (
+        f"sampled({len(sampled_actions)}) ≠ decoded({len(decoded_actions)}) — "
+        f"double sampling bug re-introduced?"
+    )
+    assert len(decoded_actions) >= N_STEPS
 
-    for step, (sampled, decoded) in enumerate(zip(sampled_actions[:N_STEPS], decoded_actions)):
+    for step, (sampled, decoded) in enumerate(zip(sampled_actions, decoded_actions)):
         np.testing.assert_array_equal(
             sampled, decoded,
             err_msg=f"Step {step}: stored action_t ≠ decoded action (double-sampling bug)"
