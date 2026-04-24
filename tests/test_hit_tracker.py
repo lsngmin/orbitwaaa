@@ -330,6 +330,67 @@ def test_early_neutral_captured_counts_within_first_20_turns():
     assert tracker.counters["early_home_expand"] == 0
 
 
+def test_early_launch_neutral_captured_counts_when_launched_early_but_resolved_late():
+    """
+    핵심 진단 케이스: 초반 15턴에 발사한 fleet이 25턴에 도착해 중립 점령.
+    - episode_turn=25 (resolve 시점) → 기존 early_neutral_captured 안 잡힘
+    - launched_at_turn=15 < 20 → early_launch_neutral_captured 잡힘
+    """
+    tracker = HitRateTracker(player_id=0)
+    tracker.reset_episode(_obs(
+        planets=[_planet(99, 0, 90.0, 90.0)],  # my home
+        fleets=[],
+    ))
+    tracker.episode_turn = 15  # 초반 구간에 발사
+    tracker.register_launches(
+        [{**_make_launch(0, 5, 10, 0.0, 20.0, 50.0), "target_owner": -1}],
+        next_fleet_id=1,
+    )
+    # 시간 경과: resolve 시점은 25턴 (초반 구간 벗어남)
+    tracker.episode_turn = 25
+    prev_obs = _obs(planets=[
+        _planet(99, 0, 90.0, 90.0),
+        _planet(5, -1, 22.0, 50.0, ships=1),
+    ])
+    curr_obs = _obs(planets=[
+        _planet(99, 0, 90.0, 90.0),
+        _planet(5, 0, 22.0, 50.0, ships=9),
+    ])
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+
+    assert tracker.counters["captured_neutral"] == 1
+    # resolve 시점(25) >= 20 이라 기존 지표는 0
+    assert tracker.counters["early_neutral_captured"] == 0
+    # launched_at_turn(15) < 20 이라 새 지표는 1
+    assert tracker.counters["early_launch_neutral_captured"] == 1
+
+
+def test_early_launch_neutral_captured_zero_when_launched_late():
+    """대조군: 발사 자체가 22턴(초반 벗어남)에 일어난 경우 → 새 지표도 0."""
+    tracker = HitRateTracker(player_id=0)
+    tracker.reset_episode(_obs(
+        planets=[_planet(99, 0, 90.0, 90.0)],
+        fleets=[],
+    ))
+    tracker.episode_turn = 22
+    tracker.register_launches(
+        [{**_make_launch(0, 5, 10, 0.0, 20.0, 50.0), "target_owner": -1}],
+        next_fleet_id=1,
+    )
+    prev_obs = _obs(planets=[
+        _planet(99, 0, 90.0, 90.0),
+        _planet(5, -1, 22.0, 50.0, ships=1),
+    ])
+    curr_obs = _obs(planets=[
+        _planet(99, 0, 90.0, 90.0),
+        _planet(5, 0, 22.0, 50.0, ships=9),
+    ])
+    tracker.resolve_step(prev_obs, curr_obs, max_speed=6)
+
+    assert tracker.counters["captured_neutral"] == 1
+    assert tracker.counters["early_launch_neutral_captured"] == 0
+
+
 def test_resolve_keeps_alive_fleet_in_pending():
     tracker = HitRateTracker(player_id=0)
     tracker.register_launches(

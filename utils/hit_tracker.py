@@ -51,7 +51,9 @@ class HitRateTracker:
         "target_enemy",           # rollout 전체 적 타겟 launched 수
         "early_neutral_attempts", # 초반 20턴 내 중립 타겟 launched 수
         "early_enemy_attempts",   # 초반 20턴 내 적 타겟 launched 수
-        "early_neutral_captured", # 초반 20턴 내 중립 점령 성공 수 (거리 무관)
+        "early_neutral_captured", # 초반 20턴 내 (resolve 시점) 중립 점령 성공 수
+        "early_launch_neutral_captured",  # 초반 20턴 내 발사된 중립 타겟의 실제 점령 수
+                                          # (resolve 시점 무관 — fleet 비행시간 영향 X)
         "unknown_removal",
     )
     HOME_EXPAND_TURNS = 20
@@ -104,6 +106,7 @@ class HitRateTracker:
                 **meta,
                 "last_x": meta["start_x"],
                 "last_y": meta["start_y"],
+                "launched_at_turn": self.episode_turn,
             }
             target_owner = meta.get("target_owner")
             if target_owner == -1:
@@ -189,6 +192,11 @@ class HitRateTracker:
                         self.counters[f"captured_{suffix}"] += 1
                         if prev_owner == -1:
                             self.counters["captured_neutral"] += 1
+                            # 발사 시점 기준: "초반 20턴에 쏜 중립이 점령으로 이어졌나"
+                            # resolve 시점이 아니라 launched_at_turn 기준이라 fleet 비행시간 영향 없음
+                            if meta.get("launched_at_turn", 999) < self.HOME_EXPAND_TURNS:
+                                self.counters["early_launch_neutral_captured"] += 1
+                            # resolve 시점 기준 (기존)
                             if self.episode_turn < self.HOME_EXPAND_TURNS:
                                 self.counters["early_neutral_captured"] += 1
                                 px, py = prev_planet[2], prev_planet[3]
@@ -222,6 +230,13 @@ class HitRateTracker:
         out["early_neutral_attempts_per_episode"] = self.counters.get("early_neutral_attempts", 0) / eps
         out["early_enemy_attempts_per_episode"]   = self.counters.get("early_enemy_attempts", 0)   / eps
         out["early_neutral_captured_per_episode"] = self.counters.get("early_neutral_captured", 0) / eps
+        out["early_launch_neutral_captured_per_episode"] = self.counters.get("early_launch_neutral_captured", 0) / eps
+        # 발사대비 점령율: 초반에 쏜 중립 타겟 중 몇 %가 점령으로 이어졌는가
+        # (fleet 비행시간 영향 없는 순수 실행 성공률)
+        early_n_att = self.counters.get("early_neutral_attempts", 0)
+        out["early_neutral_launch_to_cap_rate"] = (
+            self.counters.get("early_launch_neutral_captured", 0) / max(early_n_att, 1)
+        )
         return out
 
 
