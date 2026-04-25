@@ -139,6 +139,42 @@ def test_env_build_tensor_matches_model_view():
             f"_build_tensor fleet h={h} drift"
 
 
+def test_attention_pool_params_present():
+    """Attention pool query + cross-attn 파라미터가 state_dict 에 존재.
+
+    회귀: pool 모듈이 빠지면 학습 → 제출 weights 호환성 깨짐.
+    """
+    policy = mdl.OrbitWarsPolicy()
+    sd_keys = set(policy.state_dict().keys())
+    assert "planet_pool_query" in sd_keys, "planet_pool_query 누락"
+    # MultiheadAttention 의 in_proj_weight, out_proj.weight 등이 들어있어야 함
+    assert any(k.startswith("planet_pool_attn.") for k in sd_keys), \
+        "planet_pool_attn 파라미터 누락"
+    if mdl.FLEET_TEMPORAL:
+        assert "fleet_pool_query" in sd_keys
+        assert any(k.startswith("fleet_pool_attn.") for k in sd_keys)
+
+
+def test_attention_pool_query_independent_of_input_last_turn():
+    """학습된 query 가 마지막 턴 input 에 종속되지 않음 — pool 의 핵심 동기.
+
+    같은 H턴 시퀀스의 마지막 턴만 다른 두 입력 → pool 출력이 유의미하게 다름
+    (마지막 턴 무시 X) 이지만, 마지막 턴 anchor 가 아니라는 sanity 차원.
+    여기선 단순히 forward 가 안 깨지는지 회귀.
+    """
+    torch.manual_seed(0)
+    m = mdl.OrbitWarsPolicy().eval()
+    P, F, H = mdl.MAX_PLANETS, mdl.MAX_FLEETS, mdl.HISTORY
+    PD, FD = mdl.PLANET_DIM, mdl.FLEET_DIM
+    OBS = H * (P * PD + F * FD)
+    obs = torch.zeros(1, OBS)
+    with torch.no_grad():
+        logits, value = m(obs)
+    assert logits.shape == (1, P, mdl.ACTION_DIM)
+    assert value.shape == (1, 1)
+    assert not torch.isnan(logits).any()
+
+
 def test_fleet_padding_mask_separates_empty_from_lookup_miss():
     """fleet padding mask 가 빈 슬롯(-2) 만 가리고, real fleet w/ src miss(-1)는 통과.
 

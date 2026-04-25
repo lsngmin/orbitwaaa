@@ -92,6 +92,20 @@ class OrbitWarsPolicy(nn.Module):
         # ablation B (fleet_temporal=false): fleet_temporal_attn 미사용, current-step만 통과
         self.fleet_temporal_attn  = make_transformer(FLEET_TEMPORAL_LAYERS) if FLEET_TEMPORAL else None
 
+        # 1.5 Attention pool — H턴 시퀀스를 학습 가능한 query 로 weighted-sum.
+        # 이전: p_t[:, -1, :] (마지막 위치 anchor) → 마지막 턴 input 의 noise 에 민감.
+        # 이후: 학습된 query 가 "어떤 턴이 결정적인지" 자율적 가중. 마지막 턴이 transient
+        # (fleet 모두 도착 등) 일 때 자동으로 과거 턴 가중치 ↑.
+        self.planet_pool_query = nn.Parameter(torch.randn(1, 1, EMBED_DIM) * 0.02)
+        self.planet_pool_attn  = nn.MultiheadAttention(
+            EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
+        )
+        if FLEET_TEMPORAL:
+            self.fleet_pool_query = nn.Parameter(torch.randn(1, 1, EMBED_DIM) * 0.02)
+            self.fleet_pool_attn  = nn.MultiheadAttention(
+                EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
+            )
+
         # 2. Local Attention — fleet ↔ 행성 관계
         self.local_attn = make_transformer(LOCAL_LAYERS)
 
@@ -180,7 +194,11 @@ class OrbitWarsPolicy(nn.Module):
         p_t   = p_t + p_pos.unsqueeze(0)
         p_pad_seq = planet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_PLANETS, HISTORY)
         p_t   = self.planet_temporal_attn(p_t, src_key_padding_mask=_safe_pad_mask(p_pad_seq))
-        p_t   = p_t[:, -1, :].view(B, MAX_PLANETS, EMBED_DIM)
+        # attention pool: 학습된 query 가 H턴을 weighted-sum (마지막 위치 anchor 대체)
+        p_q   = self.planet_pool_query.expand(B * MAX_PLANETS, 1, EMBED_DIM)
+        p_t, _ = self.planet_pool_attn(p_q, p_t, p_t,
+                                        key_padding_mask=_safe_pad_mask(p_pad_seq))
+        p_t   = p_t.squeeze(1).view(B, MAX_PLANETS, EMBED_DIM)
 
         # fleet: ablation A=temporal encoding, ablation B=current-step only
         if FLEET_TEMPORAL:
@@ -189,9 +207,12 @@ class OrbitWarsPolicy(nn.Module):
             f_t   = f_t + f_pos.unsqueeze(0)
             f_pad_seq = fleet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_FLEETS, HISTORY)
             f_t   = self.fleet_temporal_attn(f_t, src_key_padding_mask=_safe_pad_mask(f_pad_seq))
-            f_t   = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
+            f_q   = self.fleet_pool_query.expand(B * MAX_FLEETS, 1, EMBED_DIM)
+            f_t, _ = self.fleet_pool_attn(f_q, f_t, f_t,
+                                           key_padding_mask=_safe_pad_mask(f_pad_seq))
+            f_t   = f_t.squeeze(1).view(B, MAX_FLEETS, EMBED_DIM)
         else:
-            # current-step fleet embedding만 사용 (마지막 턴)
+            # current-step fleet embedding만 사용 (마지막 턴) — pool 적용 안 함
             f_t = f_emb[:, -1, :, :]  # (B, F, E)
 
         # --- 1.5 Source planet fusion — fleet 가 자기 source planet 표현 참조 ---
