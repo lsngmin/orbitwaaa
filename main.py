@@ -93,7 +93,8 @@ def _fresh_history():
         maxlen=HISTORY,
     )
     for arr in f_hist:
-        arr[:, -1] = -2.0   # empty-slot sentinel (-1 = real fleet w/ src miss)
+        arr[:, 7] = -2.0   # src_idx empty-slot sentinel
+        arr[:, 8] = -2.0   # dst_idx empty-slot sentinel
     return (
         deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY),
         f_hist,
@@ -180,8 +181,8 @@ def agent(obs):
     # slot-stable fleet encoding: 안정 매핑 + 새 슬롯 history 클리어
     from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
     fleets_nt = [Fleet(*f) for f in raw_fleets]
-    fid_to_slot, newly = update_fleet_slots(fleets_nt, slot_state)
-    clear_fleet_history_at_slots(f_hist, newly)
+    fid_to_slot, slots_to_clear = update_fleet_slots(fleets_nt, slot_state)
+    clear_fleet_history_at_slots(f_hist, slots_to_clear)
     f_hist.append(encode_fleets(raw_fleets, raw_planets, player, fid_to_slot))
 
     # 학습 obs 레이아웃: 턴별 interleave (env_wrapper._build_tensor 와 동일).

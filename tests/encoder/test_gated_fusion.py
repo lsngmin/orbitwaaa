@@ -52,7 +52,9 @@ def test_residual_identity_when_all_invalid(model):
     p_t = torch.randn(B, MAX_PLANETS, EMBED_DIM)
     fp_idx = torch.full((B, MAX_FLEETS), -1.0)
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(B, MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     # bit-exact: residual identity (mask 가 fusion 항을 0 으로)
     assert torch.equal(out, f_t), \
         "residual identity 깨짐 — invalid mask 가 fusion 기여를 완전 차단해야 함"
@@ -69,8 +71,11 @@ def test_residual_identity_with_random_pt(model):
     p_t1 = torch.randn(B, MAX_PLANETS, EMBED_DIM)
     p_t2 = torch.randn(B, MAX_PLANETS, EMBED_DIM) * 100.0
 
-    out1 = model._fleet_source_fuse(f_t, p_t1, fp_idx)
-    out2 = model._fleet_source_fuse(f_t, p_t2, fp_idx)
+    no_pad = torch.zeros(B, MAX_PLANETS, dtype=torch.bool)
+    out1 = model._gated_planet_fuse(f_t, p_t1, no_pad, fp_idx,
+                                     model.fleet_source_value, model.fleet_source_gate)
+    out2 = model._gated_planet_fuse(f_t, p_t2, no_pad, fp_idx,
+                                     model.fleet_source_value, model.fleet_source_gate)
     assert torch.equal(out1, out2), \
         "invalid mask 인데 p_t 변경이 출력에 새는 중 — mask 가 gather 결과를 막아야 함"
 
@@ -90,7 +95,9 @@ def test_invalid_fleets_unchanged_when_others_valid(model):
     for f in valid_set:
         fp_idx[0, f] = float(f % MAX_PLANETS)
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(B, MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     for f in range(MAX_FLEETS):
         if f in valid_set:
             continue
@@ -106,7 +113,9 @@ def test_valid_fleets_change(model):
     p_t = torch.randn(B, MAX_PLANETS, EMBED_DIM)
     fp_idx = torch.zeros(B, MAX_FLEETS)   # 전부 valid (idx=0)
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(B, MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     diff = (out - f_t).abs().mean()
     assert diff > 1e-4, f"valid 인데 fusion 기여가 거의 0: {diff}"
 
@@ -122,7 +131,9 @@ def test_fusion_addition_magnitude_bounded(model):
     p_t = torch.randn(B, MAX_PLANETS, EMBED_DIM) * 5.0
     fp_idx = torch.zeros(B, MAX_FLEETS)
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(B, MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     delta = (out - f_t).abs()
     assert delta.max().item() <= 1.0 + 1e-5, \
         f"추가량이 1.0 초과: {delta.max()} — gate/tanh 범위 깨짐"
@@ -139,7 +150,9 @@ def test_gradient_flows_through_fusion(model):
     p_t = torch.randn(B, MAX_PLANETS, EMBED_DIM, requires_grad=True)
     fp_idx = torch.zeros(B, MAX_FLEETS)
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(B, MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     out.sum().backward()
 
     assert model.fleet_source_gate.weight.grad is not None

@@ -12,7 +12,7 @@ HISTORY                = 20
 MAX_PLANETS            = 40
 MAX_FLEETS             = 100
 PLANET_DIM             = 21   # +3: target feasibility bundle (required, best_src_ships, feasibility)
-FLEET_DIM              = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
+FLEET_DIM              = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
 FLEET_FEAT_DIM         = 7
 # ships head: required_ships 배수 Categorical (commit 2)
 SHIPS_MULTIPLIER_BINS  = (1.10, 1.30, 1.60, 2.00)

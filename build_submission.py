@@ -130,7 +130,7 @@ def extract_pt_dims(ckpt: dict) -> dict:
     return {
         "PLANET_DIM":     int(planet_dim),
         "FLEET_FEAT_DIM": int(fleet_feat),       # fleet_embed 입력 dim
-        "FLEET_DIM":      int(fleet_feat) + 1,   # obs 저장 dim (= FEAT + 1 source idx)
+        "FLEET_DIM":      int(fleet_feat) + 2,   # obs 저장 dim (= FEAT + src_idx + dst_idx)
         "EMBED_DIM":      int(embed_dim),
         "HISTORY":        int(history),
         "ACTION_DIM":     int(action_dim),

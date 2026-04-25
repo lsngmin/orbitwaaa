@@ -3,8 +3,8 @@
 핵심 계약:
   - fleet.from_planet_id → planets[:MAX_PLANETS] 내 idx 로 정확히 매핑
   - 미존재 planet id → -1 sentinel
-  - 빈 fleet 슬롯 → -1 sentinel
-  - 마지막 dim 위치에 idx 저장
+  - 빈 fleet 슬롯 → -2 sentinel (idx 7,8 양쪽)
+  - idx 7 = src_idx, idx 8 = dst_idx (FLEET_DIM=9)
   - planets 가 비-순차 id 순서로 와도 매핑 정확
 """
 
@@ -30,15 +30,20 @@ def _fleet(id_, owner, from_pid, ships=10, x=10.0, y=10.0, angle=0.0):
     return (id_, owner, x, y, angle, from_pid, ships)
 
 
-def test_idx_at_last_dim_position():
-    """마지막 dim (= FLEET_DIM - 1) 자리에 idx 저장."""
+SRC_IDX_COL = 7
+DST_IDX_COL = 8
+
+
+def test_idx_at_src_dim_position():
+    """idx 7 = src_idx, idx 8 = dst_idx (FLEET_DIM=9)."""
     raw_planets = [_planet(7)]
     raw_fleets  = [_fleet(0, owner=0, from_pid=7)]
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
 
     assert arr.shape == (MAX_FLEETS, FLEET_DIM)
-    # 마지막 dim 만 idx, 앞 FLEET_FEAT_DIM 은 numeric features
-    assert arr[0, FLEET_DIM - 1] == 0.0   # planet 7 → planets[0] → idx 0
+    assert FLEET_DIM == 9
+    # src_idx 위치 — planet 7 → planets[0] → idx 0
+    assert arr[0, SRC_IDX_COL] == 0.0
 
 
 def test_id_to_idx_mapping_preserves_position():
@@ -51,9 +56,9 @@ def test_id_to_idx_mapping_preserves_position():
         _fleet(2, owner=1, from_pid=99),    # → idx 2
     ]
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
-    assert arr[0, -1] == 0.0
-    assert arr[1, -1] == 1.0
-    assert arr[2, -1] == 2.0
+    assert arr[0, SRC_IDX_COL] == 0.0
+    assert arr[1, SRC_IDX_COL] == 1.0
+    assert arr[2, SRC_IDX_COL] == 2.0
 
 
 def test_unknown_id_maps_to_sentinel():
@@ -61,17 +66,18 @@ def test_unknown_id_maps_to_sentinel():
     raw_planets = [_planet(0), _planet(1)]
     raw_fleets  = [_fleet(0, owner=0, from_pid=999)]   # 없는 id
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
-    assert arr[0, -1] == -1.0
+    assert arr[0, SRC_IDX_COL] == -1.0
 
 
 def test_empty_slots_have_sentinel():
-    """빈 fleet 슬롯 (fleet 리스트가 짧음) → 마지막 dim = -2.0 (empty-slot sentinel)."""
+    """빈 fleet 슬롯 → src_idx, dst_idx 둘 다 -2 (empty-slot sentinel)."""
     raw_planets = [_planet(0)]
     raw_fleets  = []   # 전부 빈 슬롯
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
     assert arr.shape == (MAX_FLEETS, FLEET_DIM)
-    # 모든 슬롯의 마지막 dim 은 -2 (empty-slot sentinel)
-    assert np.all(arr[:, -1] == -2.0)
+    # src_idx, dst_idx 둘 다 -2
+    assert np.all(arr[:, SRC_IDX_COL] == -2.0)
+    assert np.all(arr[:, DST_IDX_COL] == -2.0)
     # 앞 numeric feature 들은 0
     assert np.all(arr[:, :FLEET_FEAT_DIM] == 0.0)
 
@@ -85,9 +91,9 @@ def test_lookup_miss_real_fleet_keeps_minus_one():
     raw_fleets  = [_fleet(0, owner=0, from_pid=999)]   # 없는 src id
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
     # slot 0: real fleet, src lookup miss → -1
-    assert arr[0, -1] == -1.0, "real fleet w/ src miss 는 -1 sentinel 유지해야 함"
+    assert arr[0, SRC_IDX_COL] == -1.0, "real fleet w/ src miss 는 -1 sentinel 유지해야 함"
     # 다른 슬롯들: 빈 슬롯 → -2
-    assert np.all(arr[1:, -1] == -2.0), "빈 슬롯은 -2 sentinel"
+    assert np.all(arr[1:, SRC_IDX_COL] == -2.0), "빈 슬롯은 -2 sentinel"
     # real fleet 의 다른 feature 는 valid (위치/ships 등)
     assert arr[0, 4] > 0.0 or arr[0, 5] == 1.0, "real fleet 의 numeric feature 는 살아있어야 함"
 
@@ -193,4 +199,28 @@ def test_planets_overflow_beyond_max_maps_to_sentinel():
     # 잘릴 행성 (idx ≥ MAX_PLANETS) 을 source 로
     raw_fleets = [_fleet(0, owner=0, from_pid=MAX_PLANETS + 2)]
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
-    assert arr[0, -1] == -1.0
+    assert arr[0, SRC_IDX_COL] == -1.0
+
+
+def test_dst_idx_ray_cast_to_target_planet():
+    """fleet 이 target planet 방향으로 향하면 dst_idx 에 해당 idx 저장.
+
+    ray-cast: closest approach 가 radius*1.5 이내면 hit.
+    """
+    # planets[0] = src (id=0, x=10,y=50), planets[1] = target (id=1, x=80,y=50)
+    raw_planets = [_planet(0, x=10.0, y=50.0), _planet(1, x=80.0, y=50.0)]
+    # fleet 을 (15, 50) 에서 angle=0 (east) 으로 발사 → planets[1] 방향
+    raw_fleets = [_fleet(0, owner=0, from_pid=0, x=15.0, y=50.0, angle=0.0)]
+    arr = encode_fleets(raw_fleets, raw_planets, player=0)
+    assert arr[0, SRC_IDX_COL] == 0.0   # src = planets[0]
+    assert arr[0, DST_IDX_COL] == 1.0   # ray hits planets[1]
+
+
+def test_dst_idx_no_hit_returns_minus_one():
+    """ray 가 어떤 planet 도 안 맞히면 dst_idx = -1 (NOT -2)."""
+    raw_planets = [_planet(0, x=10.0, y=10.0)]
+    # fleet at (50, 90) angle=0 east → 멀어지는 방향, planets[0] 안 맞음
+    raw_fleets = [_fleet(0, owner=0, from_pid=0, x=50.0, y=90.0, angle=0.0)]
+    arr = encode_fleets(raw_fleets, raw_planets, player=0)
+    assert arr[0, SRC_IDX_COL] == 0.0
+    assert arr[0, DST_IDX_COL] == -1.0

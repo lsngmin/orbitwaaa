@@ -35,7 +35,8 @@ MAX_PLANETS            = ENV["max_planets"]
 MAX_FLEETS             = ENV["max_fleets"]
 PLANET_DIM             = 16   # 0-14: numeric features, 15: is_valid (submission_features 동기화)
 PLANET_FEAT_DIM        = 15
-FLEET_DIM              = 8   # 0-6: numeric features, 7: src_idx (-2=empty slot, -1=src lookup miss, ≥0=valid)
+FLEET_DIM              = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
+                              # idx 7,8 sentinel: -2=empty slot, -1=lookup miss (real fleet), ≥0=valid
 FLEET_FEAT_DIM         = 7
 
 SHIPS_MULTIPLIER_BINS = tuple(M.get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
@@ -77,9 +78,11 @@ class OrbitWarsActor(nn.Module):
         self.planet_embed = nn.Linear(PLANET_FEAT_DIM, EMBED_DIM)
         self.fleet_embed  = nn.Linear(FLEET_FEAT_DIM,  EMBED_DIM)
 
-        # Gated source-planet fusion (model.py 와 키 동일)
+        # Gated planet fusion — source + destination (model.py 와 키 동일)
         self.fleet_source_value = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
         self.fleet_source_gate  = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
+        self.fleet_dest_value   = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
+        self.fleet_dest_gate    = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
 
         self.planet_temporal_pos = nn.Embedding(HISTORY, EMBED_DIM)
         self.fleet_temporal_pos  = nn.Embedding(HISTORY, EMBED_DIM)
@@ -121,12 +124,13 @@ class OrbitWarsActor(nn.Module):
 
         p_features = p_raw[..., :PLANET_FEAT_DIM]
         f_features = f_raw[..., :FLEET_FEAT_DIM]
-        fp_idx_raw = f_raw[:, -1, :, -1]
+        fp_idx_raw = f_raw[:, -1, :, 7]    # src_idx
+        dp_idx_raw = f_raw[:, -1, :, 8]    # dst_idx
 
         # Padding masks (sentinel 기반, model.py 와 동일)
-        # fleet: -2 = empty slot. -1 = real fleet w/ src miss (mask 안 함)
+        # fleet: idx 7,8 모두 -2 = empty slot. -1 = real fleet w/ lookup miss (mask 안 함)
         planet_pad_h   = (p_raw[..., -1] == 0)
-        fleet_pad_h    = (f_raw[..., -1] == -2)
+        fleet_pad_h    = (f_raw[..., 7] == -2)
         planet_pad_now = planet_pad_h[:, -1, :]
         fleet_pad_now  = fleet_pad_h[:, -1, :]
 
@@ -157,17 +161,36 @@ class OrbitWarsActor(nn.Module):
                                        key_padding_mask=_safe_pad_mask(f_pad_seq))
         f_t   = f_t.squeeze(1).view(B, MAX_FLEETS, EMBED_DIM)
 
-        # Source planet fusion (model.py 와 동일)
-        fp_idx      = fp_idx_raw.long()
-        valid       = (fp_idx >= 0) & (fp_idx < MAX_PLANETS)
-        fp_idx_safe = fp_idx.clamp(0, MAX_PLANETS - 1)
-        gather_idx  = fp_idx_safe.unsqueeze(-1).expand(-1, -1, EMBED_DIM)
-        src_t       = p_t.gather(1, gather_idx)
+        # Planet fusion — source + destination (model.py._gated_planet_fuse 와 동일)
+        # Hole A: planet_pad_now 도 valid 검증에 포함 (padded slot lookup 차단)
+        # Hole D: valid 슬롯만 matmul → compute 절감
+        def _fuse(f_t, idx_raw, value_layer, gate_layer):
+            B, F, E    = f_t.shape
+            idx        = idx_raw.long()
+            idx_safe   = idx.clamp(0, MAX_PLANETS - 1)
+            gathered_pad = planet_pad_now.gather(1, idx_safe)
+            valid      = (idx >= 0) & (idx < MAX_PLANETS) & ~gathered_pad
 
-        fused_in = torch.cat([f_t, src_t], dim=-1)
-        gate     = torch.sigmoid(self.fleet_source_gate(fused_in))
-        cand     = torch.tanh(self.fleet_source_value(fused_in))
-        f_t      = f_t + gate * cand * valid.unsqueeze(-1).to(f_t.dtype)
+            gather_idx = idx_safe.unsqueeze(-1).expand(-1, -1, E)
+            planet_t   = p_t.gather(1, gather_idx)
+
+            flat_valid = valid.flatten()
+            f_flat     = f_t.reshape(-1, E)
+            src_flat   = planet_t.reshape(-1, E)
+            f_sub      = f_flat[flat_valid]
+            src_sub    = src_flat[flat_valid]
+
+            fused_in   = torch.cat([f_sub, src_sub], dim=-1)
+            gate       = torch.sigmoid(gate_layer(fused_in))
+            cand       = torch.tanh(value_layer(fused_in))
+            update_sub = gate * cand
+
+            update_flat = torch.zeros_like(f_flat)
+            update_flat[flat_valid] = update_sub
+            return f_t + update_flat.view(B, F, E)
+
+        f_t = _fuse(f_t, fp_idx_raw, self.fleet_source_value, self.fleet_source_gate)
+        f_t = _fuse(f_t, dp_idx_raw, self.fleet_dest_value,   self.fleet_dest_gate)
 
         # Local (fleet ↔ planet) + Global
         local_tokens = torch.cat([p_t, f_t], dim=1)

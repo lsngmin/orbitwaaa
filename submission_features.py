@@ -14,7 +14,7 @@ MAX_FLEETS = 100
 HISTORY = 20
 PLANET_DIM      = 16
 PLANET_FEAT_DIM = 15
-FLEET_DIM      = 8
+FLEET_DIM      = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
 FLEET_FEAT_DIM = 7
 
 ETA_NEAR = 5
@@ -30,15 +30,22 @@ def new_fleet_slot_state():
 
 
 def update_fleet_slots(fleets, slot_state):
-    """env_wrapper.update_fleet_slots 미러. slot_state in-place 갱신."""
+    """env_wrapper.update_fleet_slots 미러. slot_state in-place 갱신.
+
+    Returns: (fid_to_slot, slots_to_clear)
+      slots_to_clear = newly_allocated ∪ just_freed_no_reuse
+      (두 경우 모두 history 클리어 필요 — env_wrapper 의 docstring 참조)
+    """
     fleet_to_slot = slot_state["fleet_to_slot"]
     free_slots    = slot_state["free_slots"]
 
     alive_ids = {f.id for f in fleets}
     dead_ids  = set(fleet_to_slot.keys()) - alive_ids
+    just_freed = set()
     for fid in dead_ids:
         slot = fleet_to_slot.pop(fid)
         free_slots.append(slot)
+        just_freed.add(slot)
     free_slots.sort()
 
     fid_to_slot     = {}
@@ -53,7 +60,7 @@ def update_fleet_slots(fleets, slot_state):
         fleet_to_slot[f.id] = slot
         fid_to_slot[f.id]   = slot
         newly_allocated.add(slot)
-    return fid_to_slot, newly_allocated
+    return fid_to_slot, newly_allocated | just_freed
 
 
 def clear_fleet_history_at_slots(fleet_history, slots):
@@ -63,7 +70,8 @@ def clear_fleet_history_at_slots(fleet_history, slots):
     for arr in fleet_history:
         for slot in slots:
             arr[slot] = 0.0
-            arr[slot, -1] = -2.0   # empty-slot sentinel (real fleet w/ src miss 는 -1)
+            arr[slot, 7] = -2.0   # src_idx empty-slot sentinel
+            arr[slot, 8] = -2.0   # dst_idx empty-slot sentinel
 
 def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
                    angular_velocity=0.0):
@@ -185,16 +193,23 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
 
 
 def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
-    """env_wrapper.encode_fleets 미러. fid_to_slot 으로 슬롯 안정화."""
+    """env_wrapper.encode_fleets 미러. fid_to_slot 으로 슬롯 안정화.
+
+    feature layout (FLEET_DIM=9):
+      0-6: numeric, 7: src_idx, 8: dst_idx
+        sentinel: -2=empty slot, -1=lookup miss (real fleet), ≥0=valid planet idx
+    """
     from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
     from prediction import fleet_speed, MAX_SPEED
 
     fleets    = [Fleet(*f)  for f in raw_fleets]
     planets   = [Planet(*p) for p in raw_planets]
-    id_to_idx = {p.id: idx for idx, p in enumerate(planets[:MAX_PLANETS])}
+    truncated = planets[:MAX_PLANETS]
+    id_to_idx = {p.id: idx for idx, p in enumerate(truncated)}
 
     arr = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
-    arr[:, -1] = -2.0   # empty-slot sentinel (real fleet 의 lookup miss 는 -1)
+    arr[:, 7] = -2.0   # src_idx empty-slot sentinel
+    arr[:, 8] = -2.0   # dst_idx empty-slot sentinel
     for i, f in enumerate(fleets):
         if fid_to_slot is None:
             if i >= MAX_FLEETS:
@@ -205,9 +220,29 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
             if slot is None or slot >= MAX_FLEETS:
                 continue
         src_idx = id_to_idx.get(f.from_planet_id, -1)
-        speed   = fleet_speed(f.ships)
-        vx      = speed * math.cos(f.angle)
-        vy      = speed * math.sin(f.angle)
+
+        # destination ray-cast: 첫 충돌 행성 idx (env_wrapper.encode_fleets 와 동일 logic)
+        dx = math.cos(f.angle)
+        dy = math.sin(f.angle)
+        dst_idx = -1
+        first_t = math.inf
+        for j, p in enumerate(truncated):
+            fx = f.x - p.x
+            fy = f.y - p.y
+            t  = -(fx * dx + fy * dy)
+            if t <= 0:
+                continue
+            cx = f.x + t * dx
+            cy = f.y + t * dy
+            if math.hypot(cx - p.x, cy - p.y) > p.radius * 1.5:
+                continue
+            if t < first_t:
+                first_t = t
+                dst_idx = j
+
+        speed = fleet_speed(f.ships)
+        vx    = speed * math.cos(f.angle)
+        vy    = speed * math.sin(f.angle)
         arr[slot] = [
             f.x / 100.0,
             f.y / 100.0,
@@ -217,5 +252,6 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
             1.0 if f.owner == player else 0.0,
             1.0 if f.owner not in (-1, player) else 0.0,
             float(src_idx),
+            float(dst_idx),
         ]
     return arr
