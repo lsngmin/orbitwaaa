@@ -1397,20 +1397,24 @@ if __name__ == "__main__":
     parser.add_argument("--eval-interval",    type=int,   default=None,          help="평가 주기 세대 수 (기본: config)")
     parser.add_argument("--n-games",          type=int,   default=None,          help="평가 게임 수 (기본: 20)")
     parser.add_argument("--rollout-steps",    type=int,   default=None,          help="rollout 스텝 수 (기본: config)")
-    parser.add_argument("--smoke",            action="store_true",               help="smoke test 세팅 (10000 steps, eval 5, 4 games)")
+    parser.add_argument("--smoke",            action="store_true",               help="smoke test 세팅 (3000 steps, eval 2, 4 games, n_envs 4, rollout 512)")
     cli = parser.parse_args()
 
     DEVICE   = torch.device(f"cuda:{cli.gpu}" if torch.cuda.is_available() else "cpu")
     SAVE_DIR = cli.run_dir
 
-    # config 기본값 적용 (CLI 미지정 시)
+    # smoke 우선 적용 — CLI 명시값(=non-None) 은 보존, 미지정만 작은 값으로 채움.
+    # 이후 config-default fallback 은 None 만 채우므로 smoke 값 덮어쓰지 않음.
+    if cli.smoke:
+        cli.total_timesteps = cli.total_timesteps or 3000
+        cli.eval_interval   = cli.eval_interval   or 2
+        cli.n_games         = cli.n_games         or 4
+        cli.n_envs          = cli.n_envs          or 4
+        cli.rollout_steps   = cli.rollout_steps   or 512
+
+    # config 기본값 적용 (CLI/smoke 미지정 시)
     cli.n_envs        = cli.n_envs        if cli.n_envs        is not None else T.get("n_envs", 1)
     cli.rollout_steps = cli.rollout_steps if cli.rollout_steps is not None else T.get("rollout_steps", 512)
-
-    if cli.smoke:
-        cli.total_timesteps = cli.total_timesteps or 10000
-        cli.eval_interval   = cli.eval_interval   or 5
-        cli.n_games         = cli.n_games         or 4
 
     train(
         n_envs=cli.n_envs,
