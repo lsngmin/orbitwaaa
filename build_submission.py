@@ -293,7 +293,7 @@ def smoke_encode(code: dict) -> None:
     # 더미 행성 1개 (id, owner, x, y, radius, ships, production)
     raw_planets = [(0, 0, 50.0, 50.0, 5.0, 50, 2)]
     raw_fleets  = []
-    arr = sf.encode_planets(raw_planets, raw_fleets, player=0, comet_ids=set())
+    arr = sf.encode_planets(raw_planets, raw_fleets, player=0, comet_ids=set(), comets=[])
 
     if arr.shape != (sf.MAX_PLANETS, sf.PLANET_DIM):
         fail(
