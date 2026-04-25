@@ -66,7 +66,7 @@ class OrbitWarsActor(nn.Module):
     nn.Module key layout 이 학습 모델과 완전히 같도록 구성:
       planet_embed / fleet_embed
       planet_temporal_pos / fleet_temporal_pos
-      planet_temporal_attn / fleet_temporal_attn(optional)
+      planet_temporal_attn / fleet_temporal_attn
       local_attn / global_attn
       actor  (critic 은 제외)
     """
