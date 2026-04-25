@@ -96,14 +96,15 @@ orbitwaaa/
 | 샘플링 후  | per-planet `(launch, ships_bin, target)` | `launch=1` 인 source 만 살아남음 |
 | 디코더     | `[from_planet_id, direction_angle, num_ships]` 의 리스트 | Kaggle 환경에 그대로 제출 |
 
-`K = NUM_SHIPS_BINS = 4`, `ships_multiplier_bins = [1.10, 1.30, 1.60, 2.00]`. ships head 는 절대 수가 아니라 **`required_ships` 대비 배수** 의 Categorical:
+`K = NUM_SHIPS_BINS = 4`, `ships_surplus_bins = [0.0, 0.33, 0.66, 1.0]`. ships head 는 **floor(=required_ships) 위 surplus 의 fraction** Categorical:
 
 ```text
-required_ships ≈ target.ships + target.production * eta + 1
-ships_to_send  = min(int(required_ships * multiplier), src.ships)
+required_ships ≈ ETA forward sim 기반 도착 시 필요 함선 (in-flight 반영)
+surplus        = max(0, src.ships - required_ships)
+ships_to_send  = clip(required_ships + bin × surplus, 1, src.ships)
 ```
 
-`1.00x` 가 빈에서 빠진 이유는 **margin 0**이면 도착 시점에 이미 적 production 으로 점령이 실패하기 때문.
+`bin=0` → just-capture (정확히 floor), `bin=1` → 올인 (src.ships 전부). 모든 bin 이 의미적으로 다른 행동을 만들고 floor 가 항상 보장돼 점령 실패 신호 sparse 함정이 사라짐.
 
 ### 4. 표기법
 

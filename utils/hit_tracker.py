@@ -15,8 +15,8 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import (
 _cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
 with open(_cfg_path) as _f:
     _CFG = yaml.safe_load(_f)
-SHIPS_MULTIPLIER_BINS = tuple(_CFG["model"].get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
-NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
+SHIPS_SURPLUS_BINS = tuple(_CFG["model"].get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
+NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
 
 
 def _get(obs, key, default=None):
@@ -64,10 +64,13 @@ class HitRateTracker:
         "early_neutral_captured", # 초반 20턴 내 (resolve 시점) 중립 점령 성공 수
         "early_launch_neutral_captured",  # 초반 20턴 내 발사된 중립 타겟의 실제 점령 수
                                           # (resolve 시점 무관 — fleet 비행시간 영향 X)
-        # ── ships 분포 실측 (commit 2: Categorical multiplier head) ───────
-        "chosen_multiplier_sum", "chosen_multiplier_sq_sum",
+        # ── ships 분포 실측 (Categorical surplus-fraction head) ──────────
+        # chosen_surplus_frac: bin 값 (0~1, surplus 중 발사 비율) 평균/std
+        # over_send_excess_sum: per-target Σships - required 의 양수 초과분 누적
+        "chosen_surplus_frac_sum", "chosen_surplus_frac_sq_sum",
         "ships_to_send_sum", "required_ships_sum",
         "send_required_ratio_sum", "under_invested_count",
+        "over_send_excess_sum", "over_send_target_count",
         # ── target-type 분리: neutral(prod 없음) vs enemy(prod 회복) ────────
         "ships_to_send_sum_neutral", "ships_to_send_sum_enemy",
         "required_ships_sum_neutral", "required_ships_sum_enemy",
@@ -372,31 +375,39 @@ class HitRateTracker:
         out["early_neutral_launch_to_cap_rate"] = (
             counters.get("early_launch_neutral_captured", 0) / max(early_n_att, 1)
         )
-        # ── ships 분포 실측 파생 지표 (Categorical multiplier) ──────────────
+        # ── ships 분포 실측 파생 지표 (surplus-fraction Categorical) ─────
         # pooled variance: var = E[X²] - E[X]² 는 counter 합산에도 유효.
-        cm_sum   = counters.get("chosen_multiplier_sum", 0.0)
-        cm_sq    = counters.get("chosen_multiplier_sq_sum", 0.0)
+        # under_invested: src.ships < required (capacity short — bin 무관 점령 불가)
+        # over_send_excess_rate: target 당 합산 ships - required 평균 초과 (다중 source waste)
+        cm_sum   = counters.get("chosen_surplus_frac_sum", 0.0)
+        cm_sq    = counters.get("chosen_surplus_frac_sq_sum", 0.0)
         sts_sum  = counters.get("ships_to_send_sum", 0)
         req_sum  = counters.get("required_ships_sum", 0.0)
         srr_sum  = counters.get("send_required_ratio_sum", 0.0)
         under    = counters.get("under_invested_count", 0)
+        os_sum   = counters.get("over_send_excess_sum", 0)
+        os_tgts  = counters.get("over_send_target_count", 0)
         if launched > 0:
             cm_mean = cm_sum / launched
             cm_var  = max(cm_sq / launched - cm_mean ** 2, 0.0)
-            out["chosen_multiplier_mean"]   = cm_mean
-            out["chosen_multiplier_std"]    = math.sqrt(cm_var)
+            out["chosen_surplus_frac_mean"] = cm_mean
+            out["chosen_surplus_frac_std"]  = math.sqrt(cm_var)
             out["ships_to_send_mean"]       = sts_sum / launched
             out["required_ships_mean"]      = req_sum / launched
             out["send_required_ratio_mean"] = srr_sum / launched
             out["under_invested_rate"]      = under / launched
+            out["over_send_excess_per_launch"] = os_sum / launched
             for k in range(NUM_SHIPS_BINS):
                 out[f"ships_bin_rate_{k}"] = counters.get(f"ships_bin_hist_{k}", 0) / launched
         else:
-            for k in ("chosen_multiplier_mean", "chosen_multiplier_std", "ships_to_send_mean",
-                      "required_ships_mean", "send_required_ratio_mean", "under_invested_rate"):
+            for k in ("chosen_surplus_frac_mean", "chosen_surplus_frac_std",
+                      "ships_to_send_mean", "required_ships_mean",
+                      "send_required_ratio_mean", "under_invested_rate",
+                      "over_send_excess_per_launch"):
                 out[k] = 0.0
             for k in range(NUM_SHIPS_BINS):
                 out[f"ships_bin_rate_{k}"] = 0.0
+        out["over_send_target_rate"] = os_tgts / steps
 
         # ── target-type 분리 지표 ───────────────────────────────────────────
         # 분모: target_neutral / target_enemy (register_launches에서 launch 시점에 집계).

@@ -37,10 +37,10 @@ FLEET_DIM       = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
                       # idx 7,8 sentinel: -2=empty slot, -1=lookup miss (real fleet), ≥0=valid
 FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 
-# ships head: required_ships 배수 Categorical (commit 2)
-# decode: ships_to_send = min(int(required × multiplier), src.ships)
-SHIPS_MULTIPLIER_BINS = tuple(M.get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
-NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
+# ships head: surplus fraction Categorical
+# decode: ships_to_send = clip(required + bin × max(0, src.ships - required), 1, src.ships)
+SHIPS_SURPLUS_BINS = tuple(M.get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
+NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
 
 # Action layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
 ACTION_DIM      = 1 + NUM_SHIPS_BINS + MAX_PLANETS

@@ -14,9 +14,9 @@ MAX_FLEETS             = 200   # 4P 대응
 PLANET_DIM             = 21   # +3: target feasibility bundle (required, best_src_ships, feasibility)
 FLEET_DIM              = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
 FLEET_FEAT_DIM         = 7
-# ships head: required_ships 배수 Categorical (commit 2)
-SHIPS_MULTIPLIER_BINS  = (1.10, 1.30, 1.60, 2.00)
-NUM_SHIPS_BINS         = len(SHIPS_MULTIPLIER_BINS)
+# ships head: surplus fraction Categorical
+SHIPS_SURPLUS_BINS     = (0.0, 0.33, 0.66, 1.0)
+NUM_SHIPS_BINS         = len(SHIPS_SURPLUS_BINS)
 ACTION_DIM             = 1 + NUM_SHIPS_BINS + MAX_PLANETS   # 1 + 4 + 44 = 49
 PLANET_TEMPORAL_LAYERS = 2
 FLEET_TEMPORAL_LAYERS  = 1

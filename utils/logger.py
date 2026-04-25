@@ -10,11 +10,11 @@ def _is_num(x):
     return isinstance(x, numbers.Real) and not isinstance(x, bool)
 
 
-# ships_multiplier_bins 로드 (ships_bin_rate_k 필드명 생성용)
+# ships_surplus_bins 로드 (ships_bin_rate_k 필드명 생성용)
 _cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
 with open(_cfg_path) as _f:
     _CFG = yaml.safe_load(_f)
-_SHIPS_BINS     = tuple(_CFG["model"].get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
+_SHIPS_BINS     = tuple(_CFG["model"].get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
 _NUM_SHIPS_BINS = len(_SHIPS_BINS)
 
 
@@ -36,6 +36,8 @@ class TrainingLogger:
             "mean_dense_rew", "mean_cap_bonus", "mean_terminal_rew",
             # Sprint 2: 발사 시 자원 보존 페널티 (음수 mean). all_in_penalty=0 이면 0.
             "mean_all_in_penalty",
+            # 다중 source over-send 페널티 (음수 mean). over_send_penalty=0 이면 0.
+            "mean_over_send_penalty",
             "mean_attempts", "mean_launched", "launch_rate",
             "mean_filtered_invalid_target", "mean_filtered_zero_ships", "mean_filtered_sun",
             "mean_filtered_path",
@@ -59,10 +61,11 @@ class TrainingLogger:
             "early_neutral_captured_per_episode",
             "early_launch_neutral_captured_per_episode",
             "early_neutral_launch_to_cap_rate",
-            # ── ships 분포 실측 (commit 2: Categorical multiplier head) ─────
-            "chosen_multiplier_mean", "chosen_multiplier_std",
+            # ── ships 분포 실측 (Categorical surplus-fraction head) ─────────
+            "chosen_surplus_frac_mean", "chosen_surplus_frac_std",
             "ships_to_send_mean", "required_ships_mean",
             "send_required_ratio_mean", "under_invested_rate",
+            "over_send_excess_per_launch", "over_send_target_rate",
             # target-type 분리 (neutral prod 없음 / enemy prod 회복 → waste 차이)
             "send_required_ratio_mean_neutral", "send_required_ratio_mean_enemy",
             "under_invested_rate_neutral", "under_invested_rate_enemy",
@@ -113,6 +116,7 @@ class TrainingLogger:
         mean_cap    = kwargs.get("mean_cap_bonus", "")
         mean_term   = kwargs.get("mean_terminal_rew", "")
         mean_aip    = kwargs.get("mean_all_in_penalty", "")
+        mean_osp    = kwargs.get("mean_over_send_penalty", "")
         mean_attempts = kwargs.get("mean_attempts", "")
         mean_launched = kwargs.get("mean_launched", "")
         launch_rate   = kwargs.get("launch_rate", "")
@@ -130,10 +134,12 @@ class TrainingLogger:
                    f" | ep={epochs_done}") if _is_num(approx_kl) else ""
         ent_str = (f" | el={ent_launch:.2f} | es={ent_ships:.2f} | et={ent_target:.2f}"
                    ) if _is_num(ent_launch) else ""
-        # aip = all-in penalty (Sprint 2). 0 이면 비활성. 음수로 찍힘.
+        # aip = all-in penalty (Sprint 2). osp = over-send penalty (다중 source 협조).
+        # 둘 다 0 이면 비활성. 음수로 찍힘.
         aip_str = f" | aip={mean_aip:+.4f}" if _is_num(mean_aip) else ""
+        osp_str = f" | osp={mean_osp:+.4f}" if _is_num(mean_osp) else ""
         rew_str = (f" | dr={mean_dense:+.4f} | cb={mean_cap:+.4f} | tr={mean_term:+.4f}"
-                   f"{aip_str}"
+                   f"{aip_str}{osp_str}"
                    ) if _is_num(mean_dense) else ""
         head_str = (f" | klh=[{kl_l:.3f}/{kl_s:.3f}/{kl_t:.3f}]"
                     f" | cfh=[{cf_l:.2f}/{cf_s:.2f}/{cf_t:.2f}]"
@@ -218,12 +224,13 @@ class TrainingLogger:
             )
             print(line4)
 
-        cm_mean   = kwargs.get("chosen_multiplier_mean", "")
-        cm_std    = kwargs.get("chosen_multiplier_std", "")
+        cm_mean   = kwargs.get("chosen_surplus_frac_mean", "")
+        cm_std    = kwargs.get("chosen_surplus_frac_std", "")
         sts_mean  = kwargs.get("ships_to_send_mean", "")
         req_mean  = kwargs.get("required_ships_mean", "")
         srr_mean  = kwargs.get("send_required_ratio_mean", "")
         under     = kwargs.get("under_invested_rate", "")
+        os_excess = kwargs.get("over_send_excess_per_launch", "")
         if _is_num(cm_mean):
             # bin 히스토그램: launched 대비 각 bin의 선택 비율
             bin_rates = []
@@ -232,10 +239,11 @@ class TrainingLogger:
                 if _is_num(r):
                     bin_rates.append(f"{_SHIPS_BINS[k]:.2f}={r:.0%}")
             bin_str = " | bins=[" + "/".join(bin_rates) + "]" if bin_rates else ""
+            os_str = f" | os={os_excess:.1f}" if _is_num(os_excess) else ""
             line5 = (
-                f"ships=[mult={cm_mean:.2f}±{cm_std:.2f}"
+                f"ships=[surf={cm_mean:.2f}±{cm_std:.2f}"
                 f" | send={sts_mean:.1f}/req={req_mean:.1f}"
-                f" | s/r={srr_mean:.2f}/under={under:.0%}]"
+                f" | s/r={srr_mean:.2f}/under={under:.0%}{os_str}]"
                 f"{bin_str}"
             )
             print(line5)

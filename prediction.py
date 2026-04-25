@@ -301,43 +301,54 @@ def project_target_at_eta(target, eta, planets, fleets):
     return sim_owner, sim_ships
 
 
-def resolve_ships_for_capture(src, dst, angular_velocity, multiplier, src_ships,
+def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
                                pos_cache=None, max_iter=5, fleets=None,
                                planets=None):
     """
-    `ships_needed`와 `required`를 고정점 반복으로 동시에 해결.
+    surplus-fraction head decode.
 
     관계식:
-      required     = dst.ships + dst.production × turns(ships_needed) + 1
-      ships_needed = min(max(1, int(required × multiplier)), src_ships)
+      required     = ETA forward sim 기반 도착 시 필요 함선 (in-flight 반영)
+      surplus      = max(0, src_ships - required)
+      ships_needed = clip(required + bin_value × surplus, 1, src_ships)
 
-    반복 특성:
-      req(s)는 s에 대해 monotone 비증가 (ships↑ → speed↑ → turns↓ → req↓).
-      하지만 int(req × mult)의 이산성 때문에 정확한 고정점이 없고 두 값 사이를
-      왕복 oscillate할 수 있음. 이 경우 "지금까지 본 최대" ships_needed를 채택해
-      under-investment를 방지 (margin ≥ multiplier 보장).
+    bin_value=0 → just-capture (floor=required), bin_value=1 → 올인 (src_ships).
+    src_ships < required (capacity short) 인 경우 ships_needed = src_ships
+    (호출자가 capacity 부족을 under_invested 로 집계).
+
+    고정점 반복: required 가 ships(=속도) 에 의존 → 한번에 안 풀림.
+      ships↑ → 속도↑ → turns↓ → required↓ → ships(=req+frac×surplus) 변동 → 반복.
+      bin_value=0 일 때는 ships=required 라 monotone, bin_value>0 일 때도
+      surplus 가 monotone 비증가라 비교적 빠르게 수렴. oscillate 시 best_ships
+      (conservative=가장 큰) 채택.
 
     returns: (ships_needed, angle, tx, ty, turns, required, converged)
-      - converged=True : 엄밀 고정점 도달
-      - converged=False: oscillation으로 max_iter 소진 → best_ships (conservative)
     """
     src_ships = int(src_ships)
     if src_ships <= 0:
-        # degenerate: 호출자가 ships<=0 filter에서 거른다
         angle, tx, ty, turns = aim(src, dst, angular_velocity, 1, pos_cache=pos_cache)
         return 0, angle, tx, ty, turns, dst.ships + 1, True
 
     use_dynamic = fleets is not None and planets is not None
 
     def _required_at(eff_turns):
-        # 정적: dst 스냅샷만. 동적: in-flight fleet 효과까지 포함.
         if use_dynamic:
             proj_owner, proj_ships = project_target_at_eta(dst, eff_turns, planets, fleets)
             if proj_owner == src.owner:
-                # 도착 시점에 이미 내 거 — 점령 의미 없음 (호출자가 mask off 해야 함)
+                # 도착 시점에 이미 내 거 — 점령 의미 없음 (호출자가 mask off)
                 return 0
             return max(1, int(proj_ships) + 1)
         return dst.ships + dst.production * eff_turns + 1
+
+    def _send_for(req):
+        if req <= 0:
+            return 0
+        if src_ships < req:
+            # capacity short: 보낼 수 있는 만큼만 (호출자가 under_invested 로 집계)
+            return src_ships
+        surplus = src_ships - req
+        raw = req + bin_value * surplus
+        return min(src_ships, max(1, int(round(raw))))
 
     ships_rep = src_ships
     angle = tx = ty = None
@@ -347,10 +358,11 @@ def resolve_ships_for_capture(src, dst, angular_velocity, multiplier, src_ships,
     converged = False
     for _ in range(max_iter):
         angle, tx, ty, turns = aim(src, dst, angular_velocity, ships_rep, pos_cache=pos_cache)
-        eff_turns = turns if turns else 1
-        required  = _required_at(eff_turns)
-        new_needed = max(1, int(required * multiplier))
-        new_needed = min(new_needed, src_ships)
+        eff_turns  = turns if turns else 1
+        required   = _required_at(eff_turns)
+        if required <= 0:
+            return 0, angle, tx, ty, turns, 0, True
+        new_needed = _send_for(required)
         if new_needed > best_ships:
             best_ships = new_needed
         if new_needed == ships_rep:
@@ -358,7 +370,6 @@ def resolve_ships_for_capture(src, dst, angular_velocity, multiplier, src_ships,
             break
         ships_rep = new_needed
 
-    # 비수렴(oscillation) 시 best_ships 채택 + angle/required 재계산.
     if not converged and best_ships != ships_rep:
         ships_rep = best_ships
         angle, tx, ty, turns = aim(src, dst, angular_velocity, ships_rep, pos_cache=pos_cache)

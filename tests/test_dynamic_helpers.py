@@ -194,12 +194,12 @@ def test_resolve_ships_dynamic_uses_inflight_fleets():
 
     # 정적: required ≈ 50 + 1 = 51
     _, _, _, _, _, req_static, _ = resolve_ships_for_capture(
-        src, dst, angular_velocity=0.0, multiplier=1.0, src_ships=src.ships,
+        src, dst, angular_velocity=0.0, bin_value=1.0, src_ships=src.ships,
     )
 
     # 동적: 내 inbound 20 → defender 도착 시점 30 → required ≈ 31
     _, _, _, _, _, req_dynamic, _ = resolve_ships_for_capture(
-        src, dst, angular_velocity=0.0, multiplier=1.0, src_ships=src.ships,
+        src, dst, angular_velocity=0.0, bin_value=1.0, src_ships=src.ships,
         fleets=[inflight], planets=[src, dst],
     )
 
@@ -218,7 +218,7 @@ def test_resolve_ships_dynamic_zero_when_already_owned():
     inflight = _fleet(0, owner=0, x=70.0, y=20.0, angle=0.0, ships=50, from_pid=0)
 
     _, _, _, _, _, req, _ = resolve_ships_for_capture(
-        src, dst, angular_velocity=0.0, multiplier=1.0, src_ships=src.ships,
+        src, dst, angular_velocity=0.0, bin_value=1.0, src_ships=src.ships,
         fleets=[inflight], planets=[src, dst],
     )
     # 도착 시 이미 내 거 → required 0

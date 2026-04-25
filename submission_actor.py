@@ -39,9 +39,9 @@ FLEET_DIM              = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
                               # idx 7,8 sentinel: -2=empty slot, -1=lookup miss (real fleet), ≥0=valid
 FLEET_FEAT_DIM         = 7
 
-SHIPS_MULTIPLIER_BINS = tuple(M.get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
-NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
-ACTION_DIM            = 1 + NUM_SHIPS_BINS + MAX_PLANETS
+SHIPS_SURPLUS_BINS = tuple(M.get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
+NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
+ACTION_DIM         = 1 + NUM_SHIPS_BINS + MAX_PLANETS
 
 
 def _make_transformer(layers):

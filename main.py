@@ -31,7 +31,7 @@ from submission_features import (
     new_fleet_slot_state, update_fleet_slots, clear_fleet_history_at_slots,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
 )
-from submission_actor import OrbitWarsActor, NUM_SHIPS_BINS, SHIPS_MULTIPLIER_BINS
+from submission_actor import OrbitWarsActor, NUM_SHIPS_BINS, SHIPS_SURPLUS_BINS
 from train import analyze_action_space, decode_action_to_moves
 
 

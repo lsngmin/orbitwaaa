@@ -19,7 +19,7 @@ build_submission.py — Kaggle 제출 archive 자동 빌드.
    - submission_features.PLANET_DIM / FLEET_DIM
    - submission_actor.PLANET_DIM / EMBED_DIM / HISTORY
    - env_wrapper.PLANET_DIM (train/submission parity)
-   - config.yaml: embed_dim, history_turns, max_planets, ships_multiplier_bins
+   - config.yaml: embed_dim, history_turns, max_planets, ships_surplus_bins
    - ACTION_DIM = 1 + NUM_SHIPS_BINS + MAX_PLANETS
 3) Smoke load + forward
    - OrbitWarsActor() 인스턴스화 → load_state_dict(strict=False)
@@ -151,7 +151,7 @@ def extract_code_dims() -> dict:
     with open(ROOT / "config.yaml") as f:
         cfg = yaml.safe_load(f)
 
-    bins = tuple(cfg["model"].get("ships_multiplier_bins", []))
+    bins = tuple(cfg["model"].get("ships_surplus_bins", []))
     return {
         "sf_PLANET_DIM": int(sf.PLANET_DIM),
         "sf_FLEET_DIM":  int(sf.FLEET_DIM),
@@ -223,7 +223,7 @@ def verify(pt: dict, code: dict) -> None:
         msg += "\n   • PLANET_DIM 변경: env_wrapper.py / submission_features.py / submission_actor.py 모두 동기화"
         msg += "\n   • EMBED_DIM 변경: config.yaml 의 model.embed_dim 만 동기화 (코드는 자동 반영)"
         msg += "\n   • HISTORY 변경:   config.yaml 의 env.history_turns 동기화"
-        msg += "\n   • 배수 bins 변경: config.yaml 의 model.ships_multiplier_bins 동기화"
+        msg += "\n   • surplus bins 변경: config.yaml 의 model.ships_surplus_bins 동기화"
         fail(msg)
 
     ok("차원 검증 통과 ("

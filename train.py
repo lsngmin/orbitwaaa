@@ -33,7 +33,7 @@ from model import OrbitWarsPolicy
 from env_wrapper import (
     encode_planets, encode_fleets,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
-    SHIPS_MULTIPLIER_BINS, NUM_SHIPS_BINS,
+    SHIPS_SURPLUS_BINS, NUM_SHIPS_BINS,
 )
 from prediction import (
     aim, crosses_sun, first_collision_on_path, PositionCache,
@@ -324,25 +324,24 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     counts  = {"attempts": 0, "filtered_invalid_target": 0,
                "filtered_zero_ships": 0, "filtered_sun": 0,
                "filtered_path": 0, "launched": 0, "launched_high_prod": 0,
-               # ── ships 분포 실측 (commit 2: Categorical multiplier head) ──
-               "chosen_multiplier_sum": 0.0,     # 선택된 배수 평균 (1.10~2.00)
-               "chosen_multiplier_sq_sum": 0.0,  # std 계산용
+               # ── ships 분포 실측 (Categorical surplus-fraction head) ──────
+               "chosen_surplus_frac_sum": 0.0,     # 선택된 surplus fraction 평균 (0~1)
+               "chosen_surplus_frac_sq_sum": 0.0,  # std 계산용
                "ships_to_send_sum": 0,           # 실제 발사 ships 수 평균
                "required_ships_sum": 0.0,        # 필요 병력 추정치 평균
                "send_required_ratio_sum": 0.0,   # ships_to_send / required 평균
-               "under_invested_count": 0,        # ships_needed < int(required × multiplier) 횟수 (src.ships clip으로 nominal margin 미달)
+               "under_invested_count": 0,        # src.ships < required (capacity short) 횟수
+               # ── over-send (다중 source 협조 실패): per-target Σships > required ───
+               #   excess_sum    : Σ max(0, total_sent_to_target − required_at_target)
+               #   target_count  : 이번 step 에서 over-send 발생한 distinct target 수
+               "over_send_excess_sum": 0,
+               "over_send_target_count": 0,
                # ── target-type 분리 (neutral=prod 무시 가능 / enemy=prod 회복) ──
-               # 도메인 차이: 중립은 prod 없음 → under-invest해도 단발 손실만, 반면 적은
-               # prod로 재생산 → 같은 ratio라도 적 대상 under-invest가 장기적으로 더 큰 waste.
-               # 승패 상관관계 분석: under_invested_rate_enemy가 지표로서 더 날카로움.
                "ships_to_send_sum_neutral": 0,   "ships_to_send_sum_enemy": 0,
                "required_ships_sum_neutral": 0.0, "required_ships_sum_enemy": 0.0,
                "send_required_ratio_sum_neutral": 0.0, "send_required_ratio_sum_enemy": 0.0,
                "under_invested_count_neutral": 0, "under_invested_count_enemy": 0,
                # ── 1차 진단 metric (자원 보존 측정) ──────────────────────────
-               # all_in_launches: ships_needed >= 0.8 * src.ships (source를 거의 비움)
-               # remaining_ships_after_launch_sum: 발사 후 source에 남은 ships 합
-               #   둘 다 launched 분모로 나눠 rate/mean 산출.
                "all_in_launches": 0,
                "remaining_ships_after_launch_sum": 0}
     # ships_bin 선택 히스토그램 (K bins): counts["ships_bin_hist_k"] = count
@@ -350,6 +349,10 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         counts[f"ships_bin_hist_{k}"] = 0
     target_prods = [t.production for t in planets if t.owner != acting_player]
     high_prod_threshold = np.quantile(target_prods, 0.75) if target_prods else None
+
+    # per-target sends: over-send penalty 산출용 (다중 source 협조 측정)
+    target_sends = {}        # target_id -> total ships sent this step
+    target_required = {}     # target_id -> required (snapshot at first launch)
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         if p.owner != acting_player:
@@ -359,7 +362,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         ships_bin  = int(np.argmax(action_np[i, 1:1 + NUM_SHIPS_BINS]))
         target_idx = int(np.argmax(action_np[i, 1 + NUM_SHIPS_BINS:
                                               1 + NUM_SHIPS_BINS + len(planets)]))
-        multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
+        bin_value  = float(SHIPS_SURPLUS_BINS[ships_bin])
 
         if launch < 0.5:
             continue
@@ -371,12 +374,10 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
 
         target = planets[target_idx]
 
-        # 고정점 반복으로 (ships_needed, required) 동시 해결.
-        # 과거 1-pass 근사(p.ships로 turns 추정)는 느린 함대의 추가 production을
-        # 과소평가해 bin=1.10x가 상습 under-invested였음 → commit 3에서 수정.
+        # 고정점 반복: surplus formula 로 ships_needed 결정.
         # 동적: fleets/planets 전달 시 in-flight 효과를 ETA forward sim 으로 반영.
         ships_needed, angle, tx, ty, turns, required, _ = resolve_ships_for_capture(
-            p, target, av, multiplier, p.ships, pos_cache=pos_cache,
+            p, target, av, bin_value, p.ships, pos_cache=pos_cache,
             fleets=(analysis.fleets if analysis is not None else None),
             planets=(planets if analysis is not None else None),
         )
@@ -402,16 +403,14 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             counts["launched_high_prod"] += 1
 
         # ── ships 실측 (launched 기준 집계) ──────────────────────────────────
-        # send_required_ratio = ships_needed(clip 후) / required  (실제 공급 비율)
-        # under_invested     = ships_needed < int(required × multiplier)
-        #                      즉 src.ships clip으로 nominal multiplier margin을 못 채운 경우.
-        #                      commit 3 resolver가 margin을 보장하므로 이 분기는
-        #                      정확히 "src.ships clip" 시점과 일치 (bin 선택이 과도히 ambitious).
+        # send_required_ratio = ships_needed / required  (실제 공급 비율)
+        # under_invested     = src.ships < required (capacity short — bin 무관 점령 불가).
+        #   surplus formula 는 src.ships >= required 면 ships_needed >= required 보장 →
+        #   이 분기는 src capacity 가 부족한 경우만.
         srr = ships_needed / max(required, 1)
-        nominal_need = int(required * multiplier)
-        under_invested = ships_needed < nominal_need
-        counts["chosen_multiplier_sum"]    += multiplier
-        counts["chosen_multiplier_sq_sum"] += multiplier ** 2
+        under_invested = p.ships < required
+        counts["chosen_surplus_frac_sum"]    += bin_value
+        counts["chosen_surplus_frac_sq_sum"] += bin_value ** 2
         counts["ships_to_send_sum"]        += ships_needed
         counts["required_ships_sum"]       += required
         counts["send_required_ratio_sum"]  += srr
@@ -425,6 +424,9 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         counts[f"send_required_ratio_sum_{suffix}"] += srr
         if under_invested:
             counts[f"under_invested_count_{suffix}"] += 1
+        # per-target 누적 (over-send 산출용 — 같은 target 두 번째 launch 부터는 required 고정)
+        target_sends[target.id]   = target_sends.get(target.id, 0) + ships_needed
+        target_required.setdefault(target.id, required)
 
         # ── 1차 진단: all-in / 잔여 ships ─────────────────────────────────
         # all-in: 한 번에 source의 80%+ 비우는 발사 (자원 무시 직접 지표).
@@ -445,6 +447,15 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             "start_x": start_x,
             "start_y": start_y,
         })
+
+    # over-send 정산: target 별 합산 ships 가 required 초과한 만큼 누적.
+    # 다중 source 에서 같은 target 으로 보낸 경우 협조 실패 신호.
+    for tid, sent_total in target_sends.items():
+        req = target_required.get(tid, 0)
+        excess = sent_total - req
+        if excess > 0:
+            counts["over_send_excess_sum"]   += excess
+            counts["over_send_target_count"] += 1
 
     if return_counts:
         return moves, counts, launches
@@ -500,6 +511,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     hit_tracker = HitRateTracker()
     sum_dense = sum_cap = sum_terminal = 0.0
     sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
+    sum_over_send_penalty = 0.0   # 다중 source 협조 실패 페널티 (음수 누적)
     # win_rate 계측: episode 종료 시 main(player=0) reward로 win/draw/loss 집계.
     # draw는 0.5 가중치 (eval과 동일 규약).
     sum_wins = 0.0
@@ -517,6 +529,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     terminal_win_reward = float(T.get("terminal_win_reward", 1.0))
     # Sprint 2: 발사 시 source 80%+ 비우는 발사당 페널티 (음수). 0 이면 비활성.
     all_in_penalty_coef = float(T.get("all_in_penalty", 0.0))
+    # 다중 source over-send 페널티 (per-excess-ship). 0 이면 비활성.
+    over_send_penalty_coef = float(T.get("over_send_penalty", 0.0))
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
@@ -568,8 +582,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             # Sprint 2: 이번 step 의 all-in 발사 수에 비례한 페널티 (decode 시 이미 카운트됨).
             #   penalty = -coef × n_all_in   (coef=0 이면 비활성, Sprint 1 baseline 동일)
             all_in_penalty = -all_in_penalty_coef * decode_counts.get("all_in_launches", 0)
+            # over-send: per-target Σships - required 의 양수 초과분에 비례한 페널티.
+            #   다중 source 에서 같은 target 에 redundant 발사 시 함선 단위로 줄임.
+            over_send_penalty = -over_send_penalty_coef * decode_counts.get("over_send_excess_sum", 0)
             terminal_r     = 0.0
-            reward         = dense_r + cap_bonus + all_in_penalty
+            reward         = dense_r + cap_bonus + all_in_penalty + over_send_penalty
             prev_score     = curr_score
 
             if ep_done:
@@ -583,6 +600,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             sum_dense    += dense_r
             sum_cap      += cap_bonus
             sum_all_in_penalty += all_in_penalty
+            sum_over_send_penalty += over_send_penalty
             sum_terminal += terminal_r
 
             obs_list.append(obs_t)
@@ -636,6 +654,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "sum_dense":    sum_dense,
         "sum_cap":      sum_cap,
         "sum_all_in_penalty": sum_all_in_penalty,
+        "sum_over_send_penalty": sum_over_send_penalty,
         "sum_terminal": sum_terminal,
         "sum_wins":     sum_wins,
     }
@@ -701,6 +720,7 @@ def _finalize_reward_stats(raw_list):
     total_episodes = 0
     total_dense = total_cap = total_terminal = 0.0
     total_all_in_penalty = 0.0
+    total_over_send_penalty = 0.0
     total_wins = 0.0
     for r in raw_list:
         for k, v in r["counters"].items():
@@ -710,6 +730,7 @@ def _finalize_reward_stats(raw_list):
         total_dense    += r["sum_dense"]
         total_cap      += r["sum_cap"]
         total_all_in_penalty += r.get("sum_all_in_penalty", 0.0)
+        total_over_send_penalty += r.get("sum_over_send_penalty", 0.0)
         total_terminal += r["sum_terminal"]
         total_wins     += r.get("sum_wins", 0.0)
 
@@ -722,6 +743,8 @@ def _finalize_reward_stats(raw_list):
     stats["mean_terminal"] = total_terminal / steps_safe
     # Sprint 2: per-step all-in launch penalty (음수). all_in_penalty=0 이면 0.
     stats["mean_all_in_penalty"] = total_all_in_penalty / steps_safe
+    # 다중 source over-send 페널티 (음수). over_send_penalty=0 이면 0.
+    stats["mean_over_send_penalty"] = total_over_send_penalty / steps_safe
     # rollout 내 main(player=0) 승률. on-policy sampling이라 eval보다 noisy지만,
     # match_type별 log로 분포별 성능을 바로 볼 수 있는 이점.
     stats["win_rate"]      = total_wins / max(total_episodes, 1)
@@ -1315,12 +1338,15 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_early_launch_neutral_captured=rew_stats.get("mean_early_launch_neutral_captured", 0.0),
                 early_launch_neutral_captured_per_episode=rew_stats.get("early_launch_neutral_captured_per_episode", 0.0),
                 early_neutral_launch_to_cap_rate=rew_stats.get("early_neutral_launch_to_cap_rate", 0.0),
-                chosen_multiplier_mean=rew_stats.get("chosen_multiplier_mean", 0.0),
-                chosen_multiplier_std=rew_stats.get("chosen_multiplier_std", 0.0),
+                chosen_surplus_frac_mean=rew_stats.get("chosen_surplus_frac_mean", 0.0),
+                chosen_surplus_frac_std=rew_stats.get("chosen_surplus_frac_std", 0.0),
                 ships_to_send_mean=rew_stats.get("ships_to_send_mean", 0.0),
                 required_ships_mean=rew_stats.get("required_ships_mean", 0.0),
                 send_required_ratio_mean=rew_stats.get("send_required_ratio_mean", 0.0),
                 under_invested_rate=rew_stats.get("under_invested_rate", 0.0),
+                over_send_excess_per_launch=rew_stats.get("over_send_excess_per_launch", 0.0),
+                over_send_target_rate=rew_stats.get("over_send_target_rate", 0.0),
+                mean_over_send_penalty=rew_stats.get("mean_over_send_penalty", 0.0),
                 # target-type 분리: neutral(prod 없음) vs enemy(prod 회복) — waste 상관관계 분석용
                 send_required_ratio_mean_neutral=rew_stats.get("send_required_ratio_mean_neutral", 0.0),
                 send_required_ratio_mean_enemy=rew_stats.get("send_required_ratio_mean_enemy", 0.0),
