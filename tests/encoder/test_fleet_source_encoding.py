@@ -76,19 +76,88 @@ def test_empty_slots_have_sentinel():
     assert np.all(arr[:, :FLEET_FEAT_DIM] == 0.0)
 
 
-def test_first_seven_features_unchanged_from_baseline():
-    """0~6 dim 의 의미는 그대로 (좌표/각도/ships/owner)."""
+def test_fleet_features_layout():
+    """idx 0~6 layout 회귀 (좌표/속도벡터/ships/owner).
+
+    PR2 변경: idx 2,3 = (cos, sin) → (vx/MAX_SPEED, vy/MAX_SPEED)
+    where vx = fleet_speed(ships) × cos(angle).
+    """
+    from prediction import fleet_speed, MAX_SPEED
+
     raw_planets = [_planet(0)]
     raw_fleets  = [_fleet(0, owner=0, from_pid=0, ships=300, x=20.0, y=80.0, angle=0.0)]
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
 
-    assert arr[0, 0] == pytest.approx(0.20)            # x/100
-    assert arr[0, 1] == pytest.approx(0.80)            # y/100
-    assert arr[0, 2] == pytest.approx(math.cos(0.0))   # cos(angle)
-    assert arr[0, 3] == pytest.approx(math.sin(0.0))   # sin(angle)
-    assert arr[0, 4] == pytest.approx(0.30)            # 300/1000
-    assert arr[0, 5] == 1.0                            # owner == player
-    assert arr[0, 6] == 0.0                            # not enemy
+    speed_300 = fleet_speed(300)
+    expected_vx = speed_300 * math.cos(0.0) / MAX_SPEED
+    expected_vy = speed_300 * math.sin(0.0) / MAX_SPEED
+
+    assert arr[0, 0] == pytest.approx(0.20)                  # x/100
+    assert arr[0, 1] == pytest.approx(0.80)                  # y/100
+    assert arr[0, 2] == pytest.approx(expected_vx, abs=1e-5) # vx/MAX_SPEED
+    assert arr[0, 3] == pytest.approx(expected_vy, abs=1e-5) # vy/MAX_SPEED
+    assert arr[0, 4] == pytest.approx(0.30)                  # 300/1000
+    assert arr[0, 5] == 1.0                                  # owner == player
+    assert arr[0, 6] == 0.0                                  # not enemy
+
+
+def test_velocity_direction_recovered_via_atan2():
+    """vx, vy 로부터 atan2 로 angle 복원 가능 (ships > 0 일 때)."""
+    raw_planets = [_planet(0)]
+    angles = [0.0, math.pi / 4, math.pi / 2, 3 * math.pi / 4,
+              math.pi - 1e-3, -math.pi / 2, -math.pi / 4]
+    raw_fleets = [
+        _fleet(i, owner=0, from_pid=0, ships=200, angle=a)
+        for i, a in enumerate(angles)
+    ]
+    arr = encode_fleets(raw_fleets, raw_planets, player=0)
+    for i, a in enumerate(angles):
+        vx = arr[i, 2]
+        vy = arr[i, 3]
+        recovered = math.atan2(vy, vx)
+        # angle wrap (±π) 허용
+        diff = (recovered - a + math.pi) % (2 * math.pi) - math.pi
+        assert abs(diff) < 1e-4, f"angle={a}, recovered={recovered}"
+
+
+def test_velocity_magnitude_scales_with_ships():
+    """ships 가 많을수록 |v| 가 크다 (단조 증가)."""
+    from prediction import fleet_speed, MAX_SPEED
+
+    raw_planets = [_planet(0)]
+    ship_counts = [10, 100, 500, 2000]   # 2000 은 cap (= MAX_SPEED)
+    raw_fleets = [
+        _fleet(i, owner=0, from_pid=0, ships=n, angle=0.0)
+        for i, n in enumerate(ship_counts)
+    ]
+    arr = encode_fleets(raw_fleets, raw_planets, player=0)
+
+    mags = [math.hypot(arr[i, 2], arr[i, 3]) for i in range(len(ship_counts))]
+
+    # 단조 증가 (혹은 cap 에서 동률)
+    for a, b in zip(mags, mags[1:]):
+        assert a <= b + 1e-6, f"non-monotonic: {mags}"
+
+    # cap (ships=2000) 에서 |v|/MAX_SPEED ≈ 1
+    assert mags[-1] == pytest.approx(1.0, abs=1e-5)
+    # ships=10 에서 fleet_speed(10)/MAX_SPEED 와 일치
+    assert mags[0] == pytest.approx(fleet_speed(10) / MAX_SPEED, abs=1e-5)
+
+
+def test_zero_ships_yields_zero_velocity():
+    """ships <= 1 → fleet_speed = 1.0, |v|/MAX_SPEED = 1/6 (cos/sin scale 만 적용).
+
+    실제 게임에선 ships<=1 인 fleet 이 거의 없지만, encoder 가 0 division 등으로
+    터지지 않는지 회귀.
+    """
+    from prediction import fleet_speed, MAX_SPEED
+
+    raw_planets = [_planet(0)]
+    raw_fleets  = [_fleet(0, owner=0, from_pid=0, ships=1, angle=0.0)]
+    arr = encode_fleets(raw_fleets, raw_planets, player=0)
+
+    assert arr[0, 2] == pytest.approx(fleet_speed(1) / MAX_SPEED, abs=1e-5)
+    assert arr[0, 3] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_planets_overflow_beyond_max_maps_to_sentinel():
