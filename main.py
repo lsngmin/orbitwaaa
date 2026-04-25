@@ -31,7 +31,7 @@ from submission_features import (
     new_fleet_slot_state, update_fleet_slots, clear_fleet_history_at_slots,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
 )
-from submission_actor import OrbitWarsActor, NUM_SHIPS_BINS, SHIPS_MULTIPLIER_BINS
+from submission_actor import OrbitWarsActor, NUM_SHIPS_BINS, SHIPS_SURPLUS_BINS
 from train import analyze_action_space, decode_action_to_moves
 
 
@@ -93,7 +93,8 @@ def _fresh_history():
         maxlen=HISTORY,
     )
     for arr in f_hist:
-        arr[:, -1] = -2.0   # empty-slot sentinel (-1 = real fleet w/ src miss)
+        arr[:, 7] = -2.0   # src_idx empty-slot sentinel
+        arr[:, 8] = -2.0   # dst_idx empty-slot sentinel
     return (
         deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY),
         f_hist,
@@ -180,8 +181,8 @@ def agent(obs):
     # slot-stable fleet encoding: 안정 매핑 + 새 슬롯 history 클리어
     from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
     fleets_nt = [Fleet(*f) for f in raw_fleets]
-    fid_to_slot, newly = update_fleet_slots(fleets_nt, slot_state)
-    clear_fleet_history_at_slots(f_hist, newly)
+    fid_to_slot, slots_to_clear = update_fleet_slots(fleets_nt, slot_state)
+    clear_fleet_history_at_slots(f_hist, slots_to_clear)
     f_hist.append(encode_fleets(raw_fleets, raw_planets, player, fid_to_slot))
 
     # 학습 obs 레이아웃: 턴별 interleave (env_wrapper._build_tensor 와 동일).
@@ -196,7 +197,7 @@ def agent(obs):
     with torch.no_grad():
         action_logits = model(obs_t).cpu()               # (1, P, ACTION_DIM)
 
-    analysis = analyze_action_space(raw_planets, av, acting_player=player)
+    analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=player)
     action_np = _sample_action(action_logits, analysis)
     moves = decode_action_to_moves(
         action_np, raw_planets, av, acting_player=player, analysis=analysis

@@ -1,9 +1,9 @@
-"""fleet_embed 가 from_planet_idx 를 feature 로 받지 않는지 회귀.
+"""fleet_embed 가 src/dst idx 를 feature 로 받지 않는지 회귀.
 
 설계 의도:
-  from_planet_idx 는 lookup pointer 일 뿐, feature 가 아님.
+  idx 7 (src_idx), idx 8 (dst_idx) 는 lookup pointer 일 뿐, feature 가 아님.
   fleet_embed 는 첫 7 dim (numeric features) 만 소비하고
-  마지막 1 dim (idx) 은 gather 에서만 사용.
+  마지막 2 dim (idx) 은 gather 에서만 사용.
 
 회귀 시나리오:
   - fleet_embed.weight.shape[1] == FLEET_FEAT_DIM (= 7)
@@ -19,9 +19,9 @@ import pytest
 from model import OrbitWarsPolicy, FLEET_DIM, FLEET_FEAT_DIM, EMBED_DIM, MAX_FLEETS
 
 
-def test_fleet_feat_dim_is_one_less_than_fleet_dim():
-    """FLEET_FEAT_DIM + 1 == FLEET_DIM (마지막 dim 은 idx 자리)."""
-    assert FLEET_FEAT_DIM + 1 == FLEET_DIM
+def test_fleet_feat_dim_is_two_less_than_fleet_dim():
+    """FLEET_FEAT_DIM + 2 == FLEET_DIM (마지막 두 dim = src_idx, dst_idx)."""
+    assert FLEET_FEAT_DIM + 2 == FLEET_DIM
 
 
 def test_fleet_embed_input_dim_excludes_idx():
@@ -44,10 +44,10 @@ def test_same_features_different_idx_yields_same_embed():
     B, H = 2, 5   # 임의 history 길이 (fleet_embed 는 step 무관)
     feats = torch.randn(B, H, MAX_FLEETS, FLEET_FEAT_DIM)
 
-    # idx 두 가지 (서로 매우 다른 값)
-    idx_a = torch.zeros(B, H, MAX_FLEETS, 1)
-    idx_b = torch.full((B, H, MAX_FLEETS, 1), 39.0)   # MAX_PLANETS-1 가깝게
-    idx_c = torch.full((B, H, MAX_FLEETS, 1), -1.0)
+    # idx 자리 (src, dst) 두 dim — 서로 매우 다른 값으로
+    idx_a = torch.zeros(B, H, MAX_FLEETS, 2)
+    idx_b = torch.full((B, H, MAX_FLEETS, 2), 39.0)   # MAX_PLANETS-1 가깝게
+    idx_c = torch.full((B, H, MAX_FLEETS, 2), -1.0)
 
     f_raw_a = torch.cat([feats, idx_a], dim=-1)
     f_raw_b = torch.cat([feats, idx_b], dim=-1)
@@ -73,11 +73,13 @@ def test_fleet_embed_full_obs_with_extreme_idx_safe():
     OBS_DIM = HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM)
     obs = torch.zeros(1, OBS_DIM)
 
-    # last-step fleet 들의 idx 자리에 극단값 박기
+    # last-step fleet 들의 src/dst idx 자리에 극단값 박기
     last_off = (HISTORY - 1) * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM)
     last_off += MAX_PLANETS * PLANET_DIM
     for f in range(MAX_FLEETS):
-        obs[0, last_off + f * FLEET_DIM + (FLEET_DIM - 1)] = 39.0 if f % 2 else -1.0
+        # idx 7 = src_idx, idx 8 = dst_idx
+        obs[0, last_off + f * FLEET_DIM + 7] = 39.0 if f % 2 else -1.0
+        obs[0, last_off + f * FLEET_DIM + 8] = -1.0 if f % 3 else 39.0
 
     with torch.no_grad():
         logits, value = m(obs)

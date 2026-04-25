@@ -40,10 +40,10 @@ def make_raw(id_, x, y, owner, ships=20, production=2, radius=3.0):
 @patch("train.Planet", FakePlanet)
 @patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 def test_decode_action_counts_cover_filters_and_launch(mock_aim):
-    """commit 2: Categorical multiplier head.
-    ships_bin=0 (1.10배) 기준 시나리오:
+    """surplus-fraction head.
+    ships_bin=0 (bin_value=0.0 → just-capture floor) 기준 시나리오:
       - target(enemy) ships=5, prod=2, turns=10 → required = 5 + 2×10 + 1 = 26
-      - ships_needed = min(int(26 × 1.10), src.ships) = min(28, src.ships)
+      - src.ships=20 < required=26 (capacity short) → ships_needed = src.ships = 20
     """
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
 
@@ -56,7 +56,7 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     # planet 3 -> sun filtered
     _set_action(action_np, src_idx=3, ships_bin=0, target_idx=5)
 
-    # planet 4 -> valid launch (ships_bin=0 → 1.10x)
+    # planet 4 -> valid launch (ships_bin=0 → bin_value=0.0, just-capture floor)
     _set_action(action_np, src_idx=4, ships_bin=0, target_idx=5)
 
     raw_planets = [
@@ -82,7 +82,7 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     assert len(launches) == 1
     assert launches[0]["source_id"] == 4
     assert launches[0]["target_id"] == 5
-    # required = 5 + 2×10 + 1 = 26, int(26×1.10) = 28, clip to src.ships=20
+    # required = 5 + 2×10 + 1 = 26, src.ships=20 < required → capacity short → 20
     assert launches[0]["ships"] == 20
     assert math.isclose(launches[0]["angle"], math.pi / 4)
     expected_core = {
@@ -96,9 +96,10 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     for k, v in expected_core.items():
         assert counts[k] == v, f"{k}: expected {v}, got {counts[k]}"
     # ships 실측 필드 존재 확인 (값 검증은 별도 테스트)
-    for k in ("chosen_multiplier_sum", "chosen_multiplier_sq_sum",
+    for k in ("chosen_surplus_frac_sum", "chosen_surplus_frac_sq_sum",
               "ships_to_send_sum", "required_ships_sum",
-              "send_required_ratio_sum", "under_invested_count"):
+              "send_required_ratio_sum", "under_invested_count",
+              "over_send_excess_sum", "over_send_target_count"):
         assert k in counts, f"missing ships field: {k}"
     # ships_bin 히스토그램 필드 존재 확인
     for k in range(NUM_SHIPS_BINS):
@@ -113,26 +114,24 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
 @patch("prediction.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 @patch("train.first_collision_on_path", return_value=("planet", 1))
-def test_under_invested_counts_multiplier_margin_clip(mock_path, mock_sun, mock_aim):
+def test_under_invested_counts_capacity_short(mock_path, mock_sun, mock_aim):
     """
-    under_invested_count의 정확한 시맨틱:
-      ships_needed < int(required × multiplier) 인 경우만 집계.
+    surplus-fraction head 의 under_invested_count 시맨틱:
+      src.ships < required (capacity short — bin 무관 점령 불가).
 
-    회귀 방지 케이스 (Case B): src.ships >= required지만 nominal multiplier
-    target에는 못 미치는 clip 상황.
-      - src.ships=30, target.ships=5, prod=2, turns=10 → required=26
-      - multiplier=1.60 → nominal = int(26 × 1.60) = 41 → clip to 30
-      - srr = 30/26 = 1.15 ≥ 1.0 (과거 버그 기준으로는 under 아님)
-      - ships_needed(30) < nominal(41) → under_invested_count=1 (정확)
+    회귀 방지: src 가 required 보다 적게 가지고 있으면 어떤 bin 으로도
+    floor(required) 를 채울 수 없음. 이 케이스만 under_invested 로 집계.
+      - src.ships=20, target.ships=5, prod=2, turns=10 → required=26
+      - bin=2 (0.66) 무관: src 가 부족하므로 ships_needed = src.ships = 20
+      - under_invested_count=1 (capacity short)
 
     prediction.aim을 patch해야 resolve_ships_for_capture 내부 aim 호출까지 덮음.
     """
-    # ships_bin=2 → 1.60x
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
     _set_action(action_np, src_idx=0, ships_bin=2, target_idx=1)
 
     raw_planets = [
-        make_raw(0, 10.0, 10.0, owner=0, ships=30),
+        make_raw(0, 10.0, 10.0, owner=0, ships=20),
         make_raw(1, 80.0, 80.0, owner=1, ships=5, production=2),
     ]
 
@@ -141,13 +140,11 @@ def test_under_invested_counts_multiplier_margin_clip(mock_path, mock_sun, mock_
     )
 
     assert counts["launched"] == 1
-    assert launches[0]["ships"] == 30          # clip 발생
-    # required=26, send=30 → srr>1 (과거 검사로는 under 아님)
-    assert launches[0]["ships"] > 26
-    # 그러나 nominal = int(26×1.60)=41 → under-invested
+    assert launches[0]["ships"] == 20          # capacity short → src.ships
+    # required=26, send=20 → src.ships < required → under-invested
     assert counts["under_invested_count"] == 1, (
-        "multiplier-margin clip 누락 (과거 버그): "
-        f"sent={launches[0]['ships']}, nominal={int(26 * 1.60)}"
+        "capacity-short under_invested 누락: "
+        f"src.ships=20 < required=26 인데 카운트 안 됨"
     )
 
 
@@ -155,14 +152,15 @@ def test_under_invested_counts_multiplier_margin_clip(mock_path, mock_sun, mock_
 @patch("prediction.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 @patch("train.first_collision_on_path", return_value=("planet", 1))
-def test_under_invested_zero_when_margin_satisfied(mock_path, mock_sun, mock_aim):
+def test_under_invested_zero_when_capacity_sufficient(mock_path, mock_sun, mock_aim):
     """
-    대조군: clip 없이 nominal margin 충족 시 under_invested_count=0.
-      - src.ships=100, required=26, multiplier=1.10 → nominal=28
-      - ships_needed = 28 (clip 없음), 28 >= 28 → under=0
+    대조군: src.ships >= required → under_invested_count=0.
+      - src.ships=100, required=26, bin=0 (just-capture floor)
+      - ships_needed = required = 26 (surplus=74 × 0.0 = 0)
+      - 100 >= 26 → under=0
     """
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
-    _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)  # 1.10x
+    _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)  # bin=0.0
 
     raw_planets = [
         make_raw(0, 10.0, 10.0, owner=0, ships=100),
@@ -173,8 +171,8 @@ def test_under_invested_zero_when_margin_satisfied(mock_path, mock_sun, mock_aim
     )
 
     assert counts["launched"] == 1
-    assert launches[0]["ships"] == 28           # int(26 × 1.10) = 28, clip 없음
-    assert counts["under_invested_count"] == 0  # margin 충족
+    assert launches[0]["ships"] == 26           # bin=0 → just-capture (= required)
+    assert counts["under_invested_count"] == 0  # capacity 충족
 
 
 def test_hit_rate_tracker_summary_returns_per_step_means():
@@ -486,32 +484,32 @@ def test_early_launch_neutral_captured_zero_when_launched_late():
 
 def test_ships_distribution_metrics_computed_from_launched_aggregates():
     """
-    commit 2: decode counts에 누적한 chosen_multiplier_sum/ships_to_send_sum/
-    required_ships_sum/send_required_ratio_sum/ships_bin_hist_*를
+    surplus-fraction head: decode counts에 누적한 chosen_surplus_frac_sum/
+    ships_to_send_sum/required_ships_sum/send_required_ratio_sum/ships_bin_hist_*를
     summary()가 launched로 나눠 평균/표준편차/히스토그램으로 환산.
     """
     tracker = HitRateTracker()
-    # 2번의 launch 시뮬: multiplier 1.10 & 1.60, ships 28 & 40, required 26 & 25
+    # 2번의 launch 시뮬: bin_value 0.0 & 0.66, ships 26 & 40, required 26 & 25
     record = {
         "attempts": 2,
         "launched": 2,
-        "chosen_multiplier_sum": 1.10 + 1.60,         # mean 1.35
-        "chosen_multiplier_sq_sum": 1.21 + 2.56,      # E[X²]=1.885 → std=sqrt(1.885-1.8225)=0.25
-        "ships_to_send_sum": 28 + 40,                 # mean 34
+        "chosen_surplus_frac_sum": 0.0 + 0.66,        # mean 0.33
+        "chosen_surplus_frac_sq_sum": 0.0 + 0.4356,   # E[X²]=0.2178, var=0.2178-0.1089=0.1089 → std=0.33
+        "ships_to_send_sum": 26 + 40,                 # mean 33
         "required_ships_sum": 26 + 25,                # mean 25.5
-        "send_required_ratio_sum": 1.08 + 1.60,       # mean 1.34 (둘 다 srr≥1 → under 0)
+        "send_required_ratio_sum": 1.0 + 1.60,        # mean 1.30
         "under_invested_count": 0,
-        # bin 0 (1.10) 1회, bin 2 (1.60) 1회
+        # bin 0 (0.0) 1회, bin 2 (0.66) 1회
         "ships_bin_hist_0": 1,
         "ships_bin_hist_2": 1,
     }
     tracker.record(record)
     s = tracker.summary()
-    assert abs(s["chosen_multiplier_mean"] - 1.35) < 1e-6
-    assert abs(s["chosen_multiplier_std"] - 0.25) < 1e-6
-    assert abs(s["ships_to_send_mean"] - 34.0) < 1e-6
+    assert abs(s["chosen_surplus_frac_mean"] - 0.33) < 1e-6
+    assert abs(s["chosen_surplus_frac_std"] - 0.33) < 1e-6
+    assert abs(s["ships_to_send_mean"] - 33.0) < 1e-6
     assert abs(s["required_ships_mean"] - 25.5) < 1e-6
-    assert abs(s["send_required_ratio_mean"] - 1.34) < 1e-6
+    assert abs(s["send_required_ratio_mean"] - 1.30) < 1e-6
     assert abs(s["under_invested_rate"] - 0.0) < 1e-6
     # bin 히스토그램 비율 (launched=2 기준)
     assert abs(s["ships_bin_rate_0"] - 0.5) < 1e-6
@@ -526,8 +524,9 @@ def test_ships_distribution_metrics_zero_when_no_launches():
     tracker = HitRateTracker()
     tracker.record({"attempts": 1, "launched": 0})
     s = tracker.summary()
-    for k in ("chosen_multiplier_mean", "chosen_multiplier_std", "ships_to_send_mean",
-              "required_ships_mean", "send_required_ratio_mean", "under_invested_rate"):
+    for k in ("chosen_surplus_frac_mean", "chosen_surplus_frac_std", "ships_to_send_mean",
+              "required_ships_mean", "send_required_ratio_mean", "under_invested_rate",
+              "over_send_excess_per_launch"):
         assert s[k] == 0.0, f"{k} should be 0 when launched=0, got {s[k]}"
     for k in range(NUM_SHIPS_BINS):
         assert s[f"ships_bin_rate_{k}"] == 0.0, f"ships_bin_rate_{k} should be 0"

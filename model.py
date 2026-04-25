@@ -25,7 +25,6 @@ ENV = CFG["env"]
 EMBED_DIM              = M["embed_dim"]
 PLANET_TEMPORAL_LAYERS = M["planet_temporal_layers"]
 FLEET_TEMPORAL_LAYERS  = M["fleet_temporal_layers"]
-FLEET_TEMPORAL         = M["fleet_temporal"]
 LOCAL_LAYERS           = M["local_layers"]
 GLOBAL_LAYERS          = M["global_layers"]
 NUM_HEADS              = M["num_heads"]
@@ -34,13 +33,14 @@ MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
 PLANET_DIM      = 16  # 0-14: numeric features, 15: is_valid (1=real, 0=empty)
 PLANET_FEAT_DIM = 15  # planet_embed 입력 dim (is_valid 제외)
-FLEET_DIM       = 8   # 0-6: numeric features, 7: src_idx (-2=empty slot, -1=src lookup miss, ≥0=valid)
+FLEET_DIM       = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
+                      # idx 7,8 sentinel: -2=empty slot, -1=lookup miss (real fleet), ≥0=valid
 FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 
-# ships head: required_ships 배수 Categorical (commit 2)
-# decode: ships_to_send = min(int(required × multiplier), src.ships)
-SHIPS_MULTIPLIER_BINS = tuple(M.get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
-NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
+# ships head: surplus fraction Categorical
+# decode: ships_to_send = clip(required + bin × max(0, src.ships - required), 1, src.ships)
+SHIPS_SURPLUS_BINS = tuple(M.get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
+NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
 
 # Action layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
 ACTION_DIM      = 1 + NUM_SHIPS_BINS + MAX_PLANETS
@@ -76,12 +76,16 @@ class OrbitWarsPolicy(nn.Module):
         self.planet_embed = nn.Linear(PLANET_FEAT_DIM, EMBED_DIM)
         self.fleet_embed  = nn.Linear(FLEET_FEAT_DIM,  EMBED_DIM)
 
-        # Gated source-planet fusion — fleet 가 자기 source planet 의 표현을 참조.
-        # candidate = tanh(Wv [f_t ; src_t])
-        # gate      = sigmoid(Wg [f_t ; src_t])
+        # Gated planet fusion — fleet 가 자기 source/destination planet 표현을 참조.
+        # candidate = tanh(Wv [f_t ; planet_t])
+        # gate      = sigmoid(Wg [f_t ; planet_t])
         # f_fused   = f_t + gate * candidate    (residual + gated update)
+        # Source: 출발지 행성 컨텍스트 (출발지 약화 신호 등).
+        # Destination: ray-cast 첫 충돌 행성 컨텍스트 (목적지 방어/위협 직접 참조).
         self.fleet_source_value = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
         self.fleet_source_gate  = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
+        self.fleet_dest_value   = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
+        self.fleet_dest_gate    = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
 
         # 위치 인코딩 — planet/fleet 분리
         self.planet_temporal_pos = nn.Embedding(HISTORY, EMBED_DIM)
@@ -89,8 +93,7 @@ class OrbitWarsPolicy(nn.Module):
 
         # 1. Temporal Attention — planet/fleet 분리
         self.planet_temporal_attn = make_transformer(PLANET_TEMPORAL_LAYERS)
-        # ablation B (fleet_temporal=false): fleet_temporal_attn 미사용, current-step만 통과
-        self.fleet_temporal_attn  = make_transformer(FLEET_TEMPORAL_LAYERS) if FLEET_TEMPORAL else None
+        self.fleet_temporal_attn  = make_transformer(FLEET_TEMPORAL_LAYERS)
 
         # 1.5 Attention pool — H턴 시퀀스를 학습 가능한 query 로 weighted-sum.
         # 이전: p_t[:, -1, :] (마지막 위치 anchor) → 마지막 턴 input 의 noise 에 민감.
@@ -100,11 +103,10 @@ class OrbitWarsPolicy(nn.Module):
         self.planet_pool_attn  = nn.MultiheadAttention(
             EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
         )
-        if FLEET_TEMPORAL:
-            self.fleet_pool_query = nn.Parameter(torch.randn(1, 1, EMBED_DIM) * 0.02)
-            self.fleet_pool_attn  = nn.MultiheadAttention(
-                EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
-            )
+        self.fleet_pool_query = nn.Parameter(torch.randn(1, 1, EMBED_DIM) * 0.02)
+        self.fleet_pool_attn  = nn.MultiheadAttention(
+            EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
+        )
 
         # 2. Local Attention — fleet ↔ 행성 관계
         self.local_attn = make_transformer(LOCAL_LAYERS)
@@ -126,29 +128,58 @@ class OrbitWarsPolicy(nn.Module):
             nn.Linear(EMBED_DIM, 1),
         )
 
-    def _fleet_source_fuse(self, f_t, p_t, fp_idx_raw):
-        """Gated residual fusion — fleet 가 source planet 표현을 참조.
+    def _gated_planet_fuse(self, f_t, p_t, planet_pad_now, idx_raw,
+                            value_layer, gate_layer):
+        """Gated residual fusion — fleet 가 지정 planet idx 의 표현을 참조.
 
-        invalid(-1)/out-of-range 는 valid mask 로 fusion 차단 → residual identity.
+        invalid 슬롯은 fusion 차단 (residual identity). source/destination 공유 logic,
+        호출자가 (value_layer, gate_layer) 로 분리.
+
+        valid 정의 (Hole A — 강건화):
+          - idx ∈ [0, MAX_PLANETS) — 범위
+          - planet_pad_now[idx] == False — gather 대상 슬롯이 padded 가 아님.
+          현재 흐름에선 id_to_idx 가 padded slot 으로 안 향하므로 (3) 은 redundant
+          하지만, encoder 변경 시 silent leak 방지용 1차 회귀 가드.
+
+        compute optimization (Hole D):
+          invalid 슬롯도 통과시키면 B*F 의 ~95% (대다수 empty) 가 무의미 matmul.
+          valid 슬롯만 골라 W_g/W_v 통과 → scatter back. valid 가 비면 자연스럽게
+          (0,2E) → (0,E) 로 흘러 추가 분기 없음.
 
         Args:
-          f_t        : (B, F, E)
-          p_t        : (B, P, E)
-          fp_idx_raw : (B, F) — float; 마지막 dim 그대로 (cast 전)
+          f_t            : (B, F, E)
+          p_t            : (B, P, E)
+          planet_pad_now : (B, P) bool — 현재 step 의 planet padding mask
+          idx_raw        : (B, F) — float; gather pointer (cast 전)
         Returns:
-          (B, F, E)  — f_t + gate * tanh(Wv [f_t;src]) * valid
+          (B, F, E) — f_t + (valid 슬롯에만) gate * tanh(Wv [f_t; planet])
         """
-        fp_idx      = fp_idx_raw.long()
-        valid       = (fp_idx >= 0) & (fp_idx < MAX_PLANETS)
-        fp_idx_safe = fp_idx.clamp(0, MAX_PLANETS - 1)
-        gather_idx  = fp_idx_safe.unsqueeze(-1).expand(-1, -1, EMBED_DIM)
-        src_t       = p_t.gather(1, gather_idx)
+        B, F, E    = f_t.shape
+        idx        = idx_raw.long()
+        idx_safe   = idx.clamp(0, MAX_PLANETS - 1)
+        # gathered_pad: 각 fleet 슬롯이 가리키는 planet 슬롯의 padding 여부
+        gathered_pad = planet_pad_now.gather(1, idx_safe)                    # (B, F)
+        valid        = (idx >= 0) & (idx < MAX_PLANETS) & ~gathered_pad      # (B, F)
 
-        fused_in = torch.cat([f_t, src_t], dim=-1)
-        gate     = torch.sigmoid(self.fleet_source_gate(fused_in))
-        cand     = torch.tanh(self.fleet_source_value(fused_in))
-        valid_f  = valid.unsqueeze(-1).to(f_t.dtype)
-        return f_t + gate * cand * valid_f
+        gather_idx = idx_safe.unsqueeze(-1).expand(-1, -1, E)
+        planet_t   = p_t.gather(1, gather_idx)                                # (B, F, E)
+
+        # subset valid 슬롯만 matmul (compute 절감)
+        flat_valid = valid.flatten()                                          # (B*F,)
+        f_flat     = f_t.reshape(-1, E)                                       # (B*F, E)
+        src_flat   = planet_t.reshape(-1, E)                                  # (B*F, E)
+
+        f_sub      = f_flat[flat_valid]                                       # (N, E)
+        src_sub    = src_flat[flat_valid]                                     # (N, E)
+
+        fused_in   = torch.cat([f_sub, src_sub], dim=-1)                      # (N, 2E)
+        gate       = torch.sigmoid(gate_layer(fused_in))                      # (N, E)
+        cand       = torch.tanh(value_layer(fused_in))                        # (N, E)
+        update_sub = gate * cand                                              # (N, E)
+
+        update_flat = torch.zeros_like(f_flat)
+        update_flat[flat_valid] = update_sub
+        return f_t + update_flat.view(B, F, E)
 
     def forward(self, obs_flat):
         """
@@ -168,16 +199,17 @@ class OrbitWarsPolicy(nn.Module):
 
         # 마지막 dim 은 sentinel — embed 입력에서 분리.
         #   planet: idx 15 = is_valid (1=real, 0=empty)
-        #   fleet : idx 7  = from_planet_idx (-1=invalid)
+        #   fleet : idx 7 = src_idx, idx 8 = dst_idx
         p_features = p_raw[..., :PLANET_FEAT_DIM]               # (B, H, P, 15)
         f_features = f_raw[..., :FLEET_FEAT_DIM]                # (B, H, F, 7)
-        fp_idx_raw = f_raw[:, -1, :, -1]                        # (B, F) — 현재 step idx
+        fp_idx_raw = f_raw[:, -1, :, 7]                          # (B, F) — src_idx
+        dp_idx_raw = f_raw[:, -1, :, 8]                          # (B, F) — dst_idx
 
         # --- Padding masks (sentinel 기반, 명시적) ---
-        # fleet: -2 = empty slot (mask 대상). -1 = real fleet 인데 src lookup miss
+        # fleet: idx 7,8 모두 -2 = empty slot. -1 = real fleet w/ lookup miss
         # (위치/속도/ships 다 valid → mask 안 함, fusion 만 차단됨)
         planet_pad_h = (p_raw[..., -1] == 0)                     # (B, H, P)
-        fleet_pad_h  = (f_raw[..., -1] == -2)                    # (B, H, F)
+        fleet_pad_h  = (f_raw[..., 7] == -2)                     # (B, H, F)
         planet_pad_now = planet_pad_h[:, -1, :]                  # (B, P)
         fleet_pad_now  = fleet_pad_h[:, -1, :]                   # (B, F)
 
@@ -200,23 +232,22 @@ class OrbitWarsPolicy(nn.Module):
                                         key_padding_mask=_safe_pad_mask(p_pad_seq))
         p_t   = p_t.squeeze(1).view(B, MAX_PLANETS, EMBED_DIM)
 
-        # fleet: ablation A=temporal encoding, ablation B=current-step only
-        if FLEET_TEMPORAL:
-            f_pos = self.fleet_temporal_pos(t_idx)
-            f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
-            f_t   = f_t + f_pos.unsqueeze(0)
-            f_pad_seq = fleet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_FLEETS, HISTORY)
-            f_t   = self.fleet_temporal_attn(f_t, src_key_padding_mask=_safe_pad_mask(f_pad_seq))
-            f_q   = self.fleet_pool_query.expand(B * MAX_FLEETS, 1, EMBED_DIM)
-            f_t, _ = self.fleet_pool_attn(f_q, f_t, f_t,
-                                           key_padding_mask=_safe_pad_mask(f_pad_seq))
-            f_t   = f_t.squeeze(1).view(B, MAX_FLEETS, EMBED_DIM)
-        else:
-            # current-step fleet embedding만 사용 (마지막 턴) — pool 적용 안 함
-            f_t = f_emb[:, -1, :, :]  # (B, F, E)
+        # fleet: planet 과 동일한 temporal self-attn → pool 경로
+        f_pos = self.fleet_temporal_pos(t_idx)
+        f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
+        f_t   = f_t + f_pos.unsqueeze(0)
+        f_pad_seq = fleet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_FLEETS, HISTORY)
+        f_t   = self.fleet_temporal_attn(f_t, src_key_padding_mask=_safe_pad_mask(f_pad_seq))
+        f_q   = self.fleet_pool_query.expand(B * MAX_FLEETS, 1, EMBED_DIM)
+        f_t, _ = self.fleet_pool_attn(f_q, f_t, f_t,
+                                       key_padding_mask=_safe_pad_mask(f_pad_seq))
+        f_t   = f_t.squeeze(1).view(B, MAX_FLEETS, EMBED_DIM)
 
-        # --- 1.5 Source planet fusion — fleet 가 자기 source planet 표현 참조 ---
-        f_t = self._fleet_source_fuse(f_t, p_t, fp_idx_raw)
+        # --- 1.5 Planet fusion — fleet 가 source/destination planet 표현 참조 ---
+        f_t = self._gated_planet_fuse(f_t, p_t, planet_pad_now, fp_idx_raw,
+                                       self.fleet_source_value, self.fleet_source_gate)
+        f_t = self._gated_planet_fuse(f_t, p_t, planet_pad_now, dp_idx_raw,
+                                       self.fleet_dest_value,   self.fleet_dest_gate)
 
         # --- 2. Local Attention (fleet ↔ 행성) ---
         local_tokens = torch.cat([p_t, f_t], dim=1)               # (B, P+F, E)

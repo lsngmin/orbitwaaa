@@ -2,16 +2,16 @@ model:
   embed_dim: 128
   planet_temporal_layers: 2
   fleet_temporal_layers: 1
-  fleet_temporal: true      # false면 current-step fleet만 local_attn에 입력 (ablation B)
   local_layers: 2
   global_layers: 4
   num_heads: 8
   temporal_window: 20
-  # ── ships head: required_ships 배수 Categorical ──────────────────────────────
-  # ships_to_send = min(int(required × multiplier), src.ships)
-  # required = target.ships + target.production × turns + 1
-  # 1.00 미포함 (필연적 실패) — 1.10부터 시작 (margin 최소 10%)
-  ships_multiplier_bins: [1.10, 1.30, 1.60, 2.00]
+  # ── ships head: surplus fraction Categorical ─────────────────────────────────
+  # surplus = src.ships - required   (required = ETA forward-sim 도착 시 필요 함선)
+  # ships_to_send = required + bin × max(0, surplus)   clipped to [1, src.ships]
+  # bin=0   → just-capture (floor),  bin=1 → 올인 (src.ships 전부)
+  # 모든 bin 이 의미적으로 다른 행동을 만들어내 gradient density 가 빡빡 (multiplier 방식 대비)
+  ships_surplus_bins: [0.0, 0.33, 0.66, 1.0]
 
 training:
   batch_size: 256
@@ -37,13 +37,18 @@ training:
   # 자원 무시 발사 default. cap_bonus_loss(잃을 때)와 별개 채널로 "발사 시점 보존"
   # 인센티브 추가. 0 으로 두면 비활성 (Sprint 1 baseline 재현).
   all_in_penalty: 0.01
+  # 다중 source coordination penalty: 같은 turn 에 한 target 으로 보낸 함선 합이
+  # required 를 초과한 만큼 함선당 패널티. 독립 head sample 의 over-send 협조 실패를
+  # reward 차원에서 억제 (encoder attention 만으로는 sample correlation 이 안 잡힘).
+  # 0 이면 비활성. 시작값은 작게 (0.0005~0.002 권장 — all_in_penalty 와 같은 스케일).
+  over_send_penalty: 0.0
   state_score_ship_weight: 0.1    # timeout 승자 판정(total ships)에 더 가깝게 정렬
   state_score_prod_weight: 0.5    # 생산력은 ships로 이어지는 간접 힌트만 유지
   state_score_planet_weight: 0.5  # planet_count 편향 완화 (기존 2.0에서 축소)
 
 env:
-  max_planets: 40
-  max_fleets: 100
+  max_planets: 44   # 게임 최대 = 40 base (5-10 groups × 4) + 4 comets
+  max_fleets: 200   # 4P 후반 worst-case (30+ planets/player × ~5턴 transit)
   history_turns: 20     # temporal window
 
 selfplay:

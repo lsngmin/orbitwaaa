@@ -28,12 +28,14 @@ MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
 PLANET_DIM      = 16  # 0-14: numeric features, 15: is_valid (1=real, 0=empty/sentinel)
 PLANET_FEAT_DIM = 15  # planet_embed 입력 dim (is_valid 제외)
-FLEET_DIM      = 8   # 0-6: numeric features, 7: src_idx (-2=empty slot, -1=src lookup miss, ≥0=valid src)
+FLEET_DIM      = 9   # 0-6: numeric features, 7: src_idx, 8: dst_idx
+                     # idx 7,8 sentinel: -2=empty slot (둘 다), -1=lookup miss(real fleet), ≥0=valid
 FLEET_FEAT_DIM = 7   # fleet_embed 입력 dim (idx 제외)
 
-# ships head: required_ships 배수 Categorical (commit 2)
-SHIPS_MULTIPLIER_BINS = tuple(CONFIG["model"].get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
-NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
+# ships head: surplus fraction Categorical
+# bin=0 → just-capture (floor=required), bin=1 → 올인 (src.ships 전부)
+SHIPS_SURPLUS_BINS = tuple(CONFIG["model"].get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
+NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
 
 
 ETA_NEAR = 5   # 1~5턴: 즉각 위협
@@ -60,10 +62,16 @@ def update_fleet_slots(fleets, slot_state):
       fleets:     Fleet namedtuple 리스트 (env raw fleets 변환 후)
       slot_state: new_fleet_slot_state() 로 생성한 dict (mutated)
     Returns:
-      fid_to_slot:     {fleet_id: slot_idx} (살아있는 fleet 만)
-      newly_allocated: set[slot_idx] — 이번 턴에 새로 배정된 슬롯
-                       (caller 가 history deque 의 해당 슬롯 과거 데이터를
-                        zero 로 클리어해야 ghost trajectory 학습을 막음)
+      fid_to_slot:    {fleet_id: slot_idx} (살아있는 fleet 만)
+      slots_to_clear: set[slot_idx] — caller 가 history 에서 비워야 할 슬롯.
+                      두 그룹의 union:
+                        (1) newly_allocated   — 새 fleet 에 배정된 슬롯
+                            (이전 거주자 trajectory ghost 차단)
+                        (2) just_freed_no_reuse — 이번 턴 dead 인데 즉시 재할당
+                            안 됐으니 free_slots 에 남는 슬롯
+                            (current step 만 sentinel 이라 H-1 step 에 죽은
+                             함대 잔재 → temporal pool 가 ghost 로 흡수)
+                      두 경우 모두 history 클리어가 필요 → 한 set 으로 묶음.
     """
     fleet_to_slot = slot_state["fleet_to_slot"]
     free_slots    = slot_state["free_slots"]
@@ -71,10 +79,12 @@ def update_fleet_slots(fleets, slot_state):
     alive_ids = {f.id for f in fleets}
 
     # 죽은 fleet 의 슬롯 회수
-    dead_ids = set(fleet_to_slot.keys()) - alive_ids
+    dead_ids   = set(fleet_to_slot.keys()) - alive_ids
+    just_freed = set()
     for fid in dead_ids:
         slot = fleet_to_slot.pop(fid)
         free_slots.append(slot)
+        just_freed.add(slot)
     free_slots.sort()  # 결정론적 할당
 
     fid_to_slot      = {}
@@ -90,7 +100,9 @@ def update_fleet_slots(fleets, slot_state):
         fid_to_slot[f.id]   = slot
         newly_allocated.add(slot)
 
-    return fid_to_slot, newly_allocated
+    # 이번 턴 dead → 즉시 reuse 슬롯은 newly 에 들어가서 just_freed 와 겹쳐도 OK.
+    # 두 set 의 union 이 곧 history 클리어 대상.
+    return fid_to_slot, newly_allocated | just_freed
 
 
 def clear_fleet_history_at_slots(fleet_history, slots):
@@ -105,7 +117,8 @@ def clear_fleet_history_at_slots(fleet_history, slots):
     for arr in fleet_history:
         for slot in slots:
             arr[slot] = 0.0
-            arr[slot, -1] = -2.0   # empty-slot sentinel (real fleet w/ src lookup miss 는 -1)
+            arr[slot, 7] = -2.0   # src_idx empty-slot sentinel
+            arr[slot, 8] = -2.0   # dst_idx empty-slot sentinel
 
 
 def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
@@ -245,22 +258,27 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
 def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
     """fleet 목록을 (MAX_FLEETS, FLEET_DIM) 배열로 인코딩.
 
-    feature layout (FLEET_DIM=8):
+    feature layout (FLEET_DIM=9):
       0,1: x, y                              — `/100` 정규화
       2,3: vx_fleet, vy_fleet                — `fleet_speed(ships) × (cos, sin)`,
                                                `/MAX_SPEED` 정규화로 ~`[-1,1]`
       4:   ships                             — `min(ships/1000, 1.0)` (전투력)
       5,6: is_mine, is_enemy                 — 0/1
-      7:   src_idx                            — source-planet fusion lookup 포인터.
-                                               -2 = 빈 슬롯 (padding mask 대상),
-                                               -1 = real fleet 인데 source lookup 실패
-                                                    (위치/속도/ships 다 valid → padding 안 함,
-                                                     fusion 만 valid mask 로 차단)
-                                               ≥0 = valid src planet idx
+      7:   src_idx                            — source-planet fusion lookup 포인터
+      8:   dst_idx                            — destination-planet fusion lookup 포인터
+                                               (ray-cast 첫 충돌 행성 idx)
+        sentinel (idx 7,8 공통):
+          -2 = 빈 슬롯 (padding mask 대상, 둘 다 -2 로 set)
+          -1 = real fleet 인데 lookup 실패 (src 못 찾음 / 충돌 행성 없음)
+               → 위치/속도/ships valid → padding 안 함, fusion 만 valid mask 로 차단
+          ≥0 = valid planet idx
 
     bilinear precomputation: `speed(ships) × direction` 곱셈을 미리 풀어
     모델이 첫 Linear 레이어에서 학습할 필요 없게 만든다 — planet vx/vy 와 같은 논리.
     방향은 atan2(vy, vx) 로 복원 가능 (속도 0 이면 방향 정보 없음 — 빈 슬롯과 동치).
+
+    dst_idx ray-cast 는 encode_planets 의 ETA 집계와 같은 logic (radius * 1.5 lenient
+    margin) — 행성 회전/sweep_fleets 미시뮬 보상.
 
     fid_to_slot:
       None  → enumerate 순서로 슬롯 할당 (stateless; 단발성 인코딩, 테스트 호환)
@@ -273,10 +291,12 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
 
     fleets    = [Fleet(*f)  for f in raw_fleets]
     planets   = [Planet(*p) for p in raw_planets]
-    id_to_idx = {p.id: idx for idx, p in enumerate(planets[:MAX_PLANETS])}
+    truncated = planets[:MAX_PLANETS]
+    id_to_idx = {p.id: idx for idx, p in enumerate(truncated)}
 
     arr = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
-    arr[:, -1] = -2.0   # empty-slot sentinel (real fleet 의 lookup miss 는 -1, 아래 loop 에서 덮어씀)
+    arr[:, 7] = -2.0   # src_idx empty-slot sentinel
+    arr[:, 8] = -2.0   # dst_idx empty-slot sentinel
     for i, f in enumerate(fleets):
         if fid_to_slot is None:
             if i >= MAX_FLEETS:
@@ -287,9 +307,29 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
             if slot is None or slot >= MAX_FLEETS:
                 continue
         src_idx = id_to_idx.get(f.from_planet_id, -1)
-        speed   = fleet_speed(f.ships)
-        vx      = speed * math.cos(f.angle)
-        vy      = speed * math.sin(f.angle)
+
+        # destination ray-cast: 첫 충돌 행성 idx (게임 규칙: 첫 충돌에서 소멸)
+        dx = math.cos(f.angle)
+        dy = math.sin(f.angle)
+        dst_idx = -1
+        first_t = math.inf
+        for j, p in enumerate(truncated):
+            fx = f.x - p.x
+            fy = f.y - p.y
+            t  = -(fx * dx + fy * dy)
+            if t <= 0:
+                continue
+            cx = f.x + t * dx
+            cy = f.y + t * dy
+            if math.hypot(cx - p.x, cy - p.y) > p.radius * 1.5:
+                continue
+            if t < first_t:
+                first_t = t
+                dst_idx = j
+
+        speed = fleet_speed(f.ships)
+        vx    = speed * math.cos(f.angle)
+        vy    = speed * math.sin(f.angle)
         arr[slot] = [
             f.x / 100.0,
             f.y / 100.0,
@@ -299,6 +339,7 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
             1.0 if f.owner == player else 0.0,
             1.0 if f.owner not in (-1, player) else 0.0,
             float(src_idx),
+            float(dst_idx),
         ]
     return arr
 
@@ -312,13 +353,14 @@ class OrbitWarsEnv(gym.Env):
     행동 공간:
       (MAX_PLANETS, 1 + NUM_SHIPS_BINS + MAX_PLANETS)
       action[i, 0]                        = 발사 여부 (0~1, 0.5 이상이면 발사)
-      action[i, 1:1+NUM_SHIPS_BINS]       = ships_bin one-hot (required 배수 선택)
+      action[i, 1:1+NUM_SHIPS_BINS]       = ships_bin one-hot (surplus fraction)
       action[i, 1+NUM_SHIPS_BINS:]        = 타겟 one-hot (argmax로 선택)
 
-    ships 계산 (decode 시):
-      multiplier   = SHIPS_MULTIPLIER_BINS[ships_bin]
-      required     = target.ships + target.production × turns + 1
-      ships_needed = min(max(int(required × multiplier), 1), src.ships)
+    ships 계산 (decode 시, surplus-based):
+      bin_value    = SHIPS_SURPLUS_BINS[ships_bin]
+      required     = ETA forward sim 기반 도착 시 필요 함선
+      surplus      = max(0, src.ships - required)
+      ships_needed = clip(required + bin_value × surplus, 1, src.ships)
     """
 
     metadata = {"render_modes": []}
@@ -393,8 +435,8 @@ class OrbitWarsEnv(gym.Env):
         새로 배정된 슬롯의 history 를 클리어해 ghost trajectory 를 막는다."""
         from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
         fleets = [Fleet(*f) for f in raw_fleets]
-        fid_to_slot, newly = update_fleet_slots(fleets, self._fleet_slot_state)
-        clear_fleet_history_at_slots(self._fleet_history, newly)
+        fid_to_slot, slots_to_clear = update_fleet_slots(fleets, self._fleet_slot_state)
+        clear_fleet_history_at_slots(self._fleet_history, slots_to_clear)
         return encode_fleets(raw_fleets, raw_planets, self._player, fid_to_slot)
 
     def reset(self, seed=None, options=None):
@@ -414,7 +456,8 @@ class OrbitWarsEnv(gym.Env):
         )
         # init sentinel 채우기 — zero padding 도 빈 슬롯으로 인식되도록 (-2 = empty)
         for arr in self._fleet_history:
-            arr[:, -1] = -2.0
+            arr[:, 7] = -2.0   # src_idx
+            arr[:, 8] = -2.0   # dst_idx
         self._fleet_slot_state = new_fleet_slot_state()
 
         self._av = 0.0
@@ -428,11 +471,12 @@ class OrbitWarsEnv(gym.Env):
         return self._build_tensor(), {}
 
     def step(self, action):
-        from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+        from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
         from prediction import aim, crosses_sun, resolve_ships_for_capture
 
         raw_planets, raw_fleets, comet_ids, comets = self._current_obs()
         planets = [Planet(*p) for p in raw_planets]
+        fleets  = [Fleet(*f) for f in raw_fleets]
         raw = self._get_obs_raw()
         av  = raw.get("angular_velocity", 0) if isinstance(raw, dict) else getattr(raw, "angular_velocity", 0)
         self._av = av
@@ -462,13 +506,15 @@ class OrbitWarsEnv(gym.Env):
             target_idx = int(np.argmax(target_probs))
             target     = planets[target_idx]
 
-            # ships_bin → multiplier → ships_needed
-            ships_bin  = int(np.argmax(ships_bin_logits))
-            multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
+            # ships_bin → surplus fraction → ships_needed
+            ships_bin = int(np.argmax(ships_bin_logits))
+            bin_value = float(SHIPS_SURPLUS_BINS[ships_bin])
 
-            # 고정점 반복으로 (ships_needed, required) 동시 해결 (commit 3).
+            # 고정점 반복으로 (ships_needed, required) 동시 해결.
+            # 동적: in-flight fleet 효과를 ETA forward sim 으로 반영.
             ships_needed, angle, tx, ty, _, _, _ = resolve_ships_for_capture(
-                p, target, av, multiplier, p.ships,
+                p, target, av, bin_value, p.ships,
+                fleets=fleets, planets=planets,
             )
             if ships_needed <= 0:
                 continue

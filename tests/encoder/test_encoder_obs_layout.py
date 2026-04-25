@@ -29,12 +29,12 @@ import model as mdl
 
 
 def test_fleet_dim_synced_across_modules():
-    """FLEET_DIM 이 4개 모듈에서 동일."""
-    assert ew.FLEET_DIM == sf.FLEET_DIM == sa.FLEET_DIM == mdl.FLEET_DIM == 8
+    """FLEET_DIM 이 4개 모듈에서 동일 (idx 0-6 numeric, 7 src_idx, 8 dst_idx)."""
+    assert ew.FLEET_DIM == sf.FLEET_DIM == sa.FLEET_DIM == mdl.FLEET_DIM == 9
 
 
 def test_fleet_feat_dim_synced():
-    """FLEET_FEAT_DIM 도 동기 (FLEET_DIM - 1)."""
+    """FLEET_FEAT_DIM 도 동기 (= 7, embed 입력 dim)."""
     assert ew.FLEET_FEAT_DIM == sf.FLEET_FEAT_DIM == sa.FLEET_FEAT_DIM == mdl.FLEET_FEAT_DIM == 7
 
 
@@ -139,6 +139,21 @@ def test_env_build_tensor_matches_model_view():
             f"_build_tensor fleet h={h} drift"
 
 
+def test_planet_fusion_params_present():
+    """source + destination fusion 파라미터 둘 다 state_dict 에 있어야 함.
+
+    회귀: fleet 의 출발지/목적지 행성 컨텍스트 양방향 fusion. 한쪽만 있으면 학습-제출 mismatch.
+    """
+    keys = set(mdl.OrbitWarsPolicy().state_dict().keys())
+    for k in ("fleet_source_value.weight", "fleet_source_gate.weight",
+              "fleet_dest_value.weight",   "fleet_dest_gate.weight"):
+        assert k in keys, f"{k} 누락"
+    keys_a = set(sa.OrbitWarsActor().state_dict().keys())
+    for k in ("fleet_source_value.weight", "fleet_source_gate.weight",
+              "fleet_dest_value.weight",   "fleet_dest_gate.weight"):
+        assert k in keys_a, f"actor 에 {k} 누락"
+
+
 def test_attention_pool_params_present():
     """Attention pool query + cross-attn 파라미터가 state_dict 에 존재.
 
@@ -150,9 +165,8 @@ def test_attention_pool_params_present():
     # MultiheadAttention 의 in_proj_weight, out_proj.weight 등이 들어있어야 함
     assert any(k.startswith("planet_pool_attn.") for k in sd_keys), \
         "planet_pool_attn 파라미터 누락"
-    if mdl.FLEET_TEMPORAL:
-        assert "fleet_pool_query" in sd_keys
-        assert any(k.startswith("fleet_pool_attn.") for k in sd_keys)
+    assert "fleet_pool_query" in sd_keys
+    assert any(k.startswith("fleet_pool_attn.") for k in sd_keys)
 
 
 def test_attention_pool_query_independent_of_input_last_turn():
@@ -185,15 +199,16 @@ def test_fleet_padding_mask_separates_empty_from_lookup_miss():
     PD, FD  = mdl.PLANET_DIM, mdl.FLEET_DIM
 
     f_raw = torch.zeros(1, H, F, FD)
+    # idx 7 = src_idx (padding mask 기준)
     # slot 0: real fleet, src lookup miss → -1
-    f_raw[0, :, 0, -1] = -1.0
+    f_raw[0, :, 0, 7] = -1.0
     # slot 1: 빈 슬롯 → -2
-    f_raw[0, :, 1, -1] = -2.0
+    f_raw[0, :, 1, 7] = -2.0
     # slot 2: valid src (idx=3) → 3
-    f_raw[0, :, 2, -1] = 3.0
+    f_raw[0, :, 2, 7] = 3.0
 
-    # model.py 와 동일 mask 로직
-    fleet_pad_h = (f_raw[..., -1] == -2)
+    # model.py 와 동일 mask 로직 (src_idx 기준)
+    fleet_pad_h = (f_raw[..., 7] == -2)
     # slot 0 (real, miss) 은 padding 아님
     assert not fleet_pad_h[0, -1, 0].item(), "real fleet w/ src=-1 이 padding 으로 잡혔음"
     # slot 1 (empty) 은 padding

@@ -73,7 +73,9 @@ def test_valid_idx_gathers_correct_source(model):
     for b, f, p in valid_pairs:
         fp_idx[b, f] = float(p)
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(p_t.shape[0], MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
 
     # valid 위치: out == tanh(p_t[fp_idx])  (gather + axis 검증)
     for b, f, p in valid_pairs:
@@ -108,7 +110,9 @@ def test_gather_with_swapped_batch_axis_would_fail(model):
     fp_idx[0, 0] = 5.0
     fp_idx[1, 0] = 30.0
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(p_t.shape[0], MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
 
     # 각 배치는 자기 p_t 의 해당 idx 를 봐야 함 (cross-batch leak 없어야)
     assert torch.allclose(out[0, 0], torch.tanh(p_t[0, 5]),  atol=1e-4)
@@ -124,7 +128,9 @@ def test_invalid_sentinel_blocks_fusion(model):
     p_t, f_t = _setup_pf(B)
     fp_idx = torch.full((B, MAX_FLEETS), -1.0)
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(p_t.shape[0], MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     assert torch.equal(out, f_t), \
         "invalid(-1) sentinel 인데 f_t 가 변경됨 — valid mask 가 fusion 을 차단해야 함"
 
@@ -133,13 +139,15 @@ def test_out_of_range_idx_blocks_fusion(model):
     """범위 초과 idx (음/양 양쪽) → clamp 되더라도 fusion 차단."""
     B = 2
     p_t, f_t = _setup_pf(B)
-    # MAX_PLANETS=40 기준 양/음 둘 다 out-of-range
+    # 양/음 둘 다 [0, MAX_PLANETS) 범위 밖
     fp_idx = torch.tensor([
         [999.0] * MAX_FLEETS,           # +∞ 쪽
         [-100.0] * MAX_FLEETS,          # -∞ 쪽
     ])
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(p_t.shape[0], MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     assert torch.equal(out, f_t), \
         "out-of-range idx 인데 f_t 가 변경됨 — clamp 만으로는 안 되고 valid mask 가 차단해야 함"
 
@@ -150,7 +158,9 @@ def test_boundary_idx_treated_as_invalid(model):
     p_t, f_t = _setup_pf(B)
     fp_idx = torch.full((B, MAX_FLEETS), float(MAX_PLANETS))   # = MAX_PLANETS
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(p_t.shape[0], MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
     assert torch.equal(out, f_t), \
         "idx == MAX_PLANETS 는 valid 범위 [0, MAX_PLANETS) 밖 — invalid 처리되어야 함"
 
@@ -168,7 +178,9 @@ def test_mixed_valid_invalid_per_fleet(model):
     fp_idx[0, 10] = 35.0
     fp_idx[0, 50] = 0.0
 
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(p_t.shape[0], MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
 
     # invalid 위치는 변화 없음
     invalid_mask = torch.ones(MAX_FLEETS, dtype=torch.bool)
@@ -189,7 +201,9 @@ def test_zero_idx_is_valid_not_sentinel(model):
 
     # 모든 fleet 의 source = planet 0
     fp_idx = torch.zeros(B, MAX_FLEETS)
-    out = model._fleet_source_fuse(f_t, p_t, fp_idx)
+    no_pad = torch.zeros(p_t.shape[0], MAX_PLANETS, dtype=torch.bool)
+    out = model._gated_planet_fuse(f_t, p_t, no_pad, fp_idx,
+                                    model.fleet_source_value, model.fleet_source_gate)
 
     # idx=0 valid → fusion 발생 → f_t 변화 있어야 함
     assert not torch.equal(out, f_t), \

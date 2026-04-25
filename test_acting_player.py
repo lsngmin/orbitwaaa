@@ -238,15 +238,15 @@ def test_smoke_both_players_act():
         hp_opp, hf_opp = fresh_history()
 
         while not env.done:
-            obs_t, raw_p, av = get_obs_tensor(env.state[0].observation, 0, hp, hf)
+            obs_t, raw_p, raw_f, av = get_obs_tensor(env.state[0].observation, 0, hp, hf)
             with torch.no_grad():
                 action_t, *_ = main_model.get_action_and_value(obs_t.unsqueeze(0))
             moves_main = decode_action_to_moves(
                 action_t.squeeze(0).cpu().numpy(), raw_p, av, acting_player=0
             )
 
-            obs_o, raw_po, avo = get_obs_tensor(env.state[1].observation, 1, hp_opp, hf_opp)
-            moves_opp = _opp_moves(opp_model, obs_o, raw_po, avo, device)
+            obs_o, raw_po, raw_fo, avo = get_obs_tensor(env.state[1].observation, 1, hp_opp, hf_opp)
+            moves_opp = _opp_moves(opp_model, obs_o, raw_po, raw_fo, avo, device)
 
             if moves_main:
                 main_acted += 1

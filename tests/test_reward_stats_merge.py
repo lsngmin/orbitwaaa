@@ -113,33 +113,36 @@ def test_single_worker_passthrough():
         assert abs(stats[k] - direct[k]) < 1e-9, f"key={k}: {stats[k]} != {direct[k]}"
 
 
-# ── 5. pooled variance for chosen_multiplier ─────────────────────────────────
+# ── 5. pooled variance for chosen_surplus_frac ───────────────────────────────
 
-def test_chosen_multiplier_pooled_variance():
+def test_chosen_surplus_frac_pooled_variance():
     """E[X²] - E[X]² 공식은 counter 합산 후에도 유효.
 
-    Worker A: launched=2, mult 값 [1.1, 1.3] → sum=2.4, sq_sum=2.9
-    Worker B: launched=2, mult 값 [1.6, 2.0] → sum=3.6, sq_sum=6.56
-    합산: launched=4, sum=6.0, sq_sum=9.46
-      mean = 6.0/4 = 1.5
-      var  = 9.46/4 - 1.5² = 2.365 - 2.25 = 0.115
-      std  = sqrt(0.115) ≈ 0.339
+    surplus-fraction 값 (0~1) 도 동일한 pooled variance 가 유효.
+    Worker A: launched=2, frac 값 [0.0, 0.33] → sum=0.33, sq_sum=0.1089
+    Worker B: launched=2, frac 값 [0.66, 1.0] → sum=1.66, sq_sum=1.4356
+    합산: launched=4, sum=1.99, sq_sum=1.5445
+      mean = 1.99/4 = 0.4975
+      var  = 1.5445/4 - 0.4975² = 0.386125 - 0.247506 = 0.138619
+      std  ≈ 0.3723
     """
     import math
     raw_a = _make_raw(n_steps=100, episodes=1, dense=0.0, cap=0.0, terminal=0.0,
-                      launched=2, chosen_multiplier_sum=2.4,
-                      chosen_multiplier_sq_sum=1.1**2 + 1.3**2)
+                      launched=2, chosen_surplus_frac_sum=0.0 + 0.33,
+                      chosen_surplus_frac_sq_sum=0.0**2 + 0.33**2)
     raw_b = _make_raw(n_steps=100, episodes=1, dense=0.0, cap=0.0, terminal=0.0,
-                      launched=2, chosen_multiplier_sum=3.6,
-                      chosen_multiplier_sq_sum=1.6**2 + 2.0**2)
+                      launched=2, chosen_surplus_frac_sum=0.66 + 1.0,
+                      chosen_surplus_frac_sq_sum=0.66**2 + 1.0**2)
 
     stats = _finalize_reward_stats([raw_a, raw_b])
-    expected_mean = 1.5
-    expected_var  = 9.46 / 4 - 1.5**2
+    pooled_sum    = (0.0 + 0.33) + (0.66 + 1.0)
+    pooled_sq_sum = (0.0**2 + 0.33**2) + (0.66**2 + 1.0**2)
+    expected_mean = pooled_sum / 4
+    expected_var  = pooled_sq_sum / 4 - expected_mean**2
     expected_std  = math.sqrt(expected_var)
 
-    assert abs(stats["chosen_multiplier_mean"] - expected_mean) < 1e-9
-    assert abs(stats["chosen_multiplier_std"]  - expected_std)  < 1e-6
+    assert abs(stats["chosen_surplus_frac_mean"] - expected_mean) < 1e-9
+    assert abs(stats["chosen_surplus_frac_std"]  - expected_std)  < 1e-6
 
 
 # ── 6. 회귀 방지: worker-평균이 편향된다는 사실 문서화 ────────────────────────
