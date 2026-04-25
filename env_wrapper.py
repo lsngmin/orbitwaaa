@@ -28,7 +28,7 @@ MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
 PLANET_DIM      = 16  # 0-14: numeric features, 15: is_valid (1=real, 0=empty/sentinel)
 PLANET_FEAT_DIM = 15  # planet_embed 입력 dim (is_valid 제외)
-FLEET_DIM      = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid/empty)
+FLEET_DIM      = 8   # 0-6: numeric features, 7: src_idx (-2=empty slot, -1=src lookup miss, ≥0=valid src)
 FLEET_FEAT_DIM = 7   # fleet_embed 입력 dim (idx 제외)
 
 # ships head: required_ships 배수 Categorical (commit 2)
@@ -105,7 +105,7 @@ def clear_fleet_history_at_slots(fleet_history, slots):
     for arr in fleet_history:
         for slot in slots:
             arr[slot] = 0.0
-            arr[slot, -1] = -1.0   # from_planet_idx sentinel
+            arr[slot, -1] = -2.0   # empty-slot sentinel (real fleet w/ src lookup miss 는 -1)
 
 
 def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
@@ -251,14 +251,16 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
                                                `/MAX_SPEED` 정규화로 ~`[-1,1]`
       4:   ships                             — `min(ships/1000, 1.0)` (전투력)
       5,6: is_mine, is_enemy                 — 0/1
-      7:   from_planet_idx                   — -1 sentinel (invalid/empty),
-                                               source-planet fusion lookup 포인터
+      7:   src_idx                            — source-planet fusion lookup 포인터.
+                                               -2 = 빈 슬롯 (padding mask 대상),
+                                               -1 = real fleet 인데 source lookup 실패
+                                                    (위치/속도/ships 다 valid → padding 안 함,
+                                                     fusion 만 valid mask 로 차단)
+                                               ≥0 = valid src planet idx
 
     bilinear precomputation: `speed(ships) × direction` 곱셈을 미리 풀어
     모델이 첫 Linear 레이어에서 학습할 필요 없게 만든다 — planet vx/vy 와 같은 논리.
     방향은 atan2(vy, vx) 로 복원 가능 (속도 0 이면 방향 정보 없음 — 빈 슬롯과 동치).
-
-    빈 슬롯/매핑 실패 시 idx -1 sentinel — 모델이 valid mask 로 fusion 차단.
 
     fid_to_slot:
       None  → enumerate 순서로 슬롯 할당 (stateless; 단발성 인코딩, 테스트 호환)
@@ -274,7 +276,7 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
     id_to_idx = {p.id: idx for idx, p in enumerate(planets[:MAX_PLANETS])}
 
     arr = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
-    arr[:, -1] = -1.0   # source idx sentinel (빈 슬롯)
+    arr[:, -1] = -2.0   # empty-slot sentinel (real fleet 의 lookup miss 는 -1, 아래 loop 에서 덮어씀)
     for i, f in enumerate(fleets):
         if fid_to_slot is None:
             if i >= MAX_FLEETS:
@@ -410,9 +412,9 @@ class OrbitWarsEnv(gym.Env):
             [np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)] * HISTORY,
             maxlen=HISTORY
         )
-        # init sentinel 채우기 — zero padding 도 빈 슬롯으로 인식되도록
+        # init sentinel 채우기 — zero padding 도 빈 슬롯으로 인식되도록 (-2 = empty)
         for arr in self._fleet_history:
-            arr[:, -1] = -1.0
+            arr[:, -1] = -2.0
         self._fleet_slot_state = new_fleet_slot_state()
 
         self._av = 0.0

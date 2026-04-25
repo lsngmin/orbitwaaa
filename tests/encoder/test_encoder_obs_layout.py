@@ -139,6 +139,33 @@ def test_env_build_tensor_matches_model_view():
             f"_build_tensor fleet h={h} drift"
 
 
+def test_fleet_padding_mask_separates_empty_from_lookup_miss():
+    """fleet padding mask 가 빈 슬롯(-2) 만 가리고, real fleet w/ src miss(-1)는 통과.
+
+    회귀: 둘 다 -1 로 겹쳐있던 시절엔 lookup miss real fleet 이 attention 에서
+    통째로 사라졌음. 이제 sentinel 분리됨.
+    """
+    P, F, H = mdl.MAX_PLANETS, mdl.MAX_FLEETS, mdl.HISTORY
+    PD, FD  = mdl.PLANET_DIM, mdl.FLEET_DIM
+
+    f_raw = torch.zeros(1, H, F, FD)
+    # slot 0: real fleet, src lookup miss → -1
+    f_raw[0, :, 0, -1] = -1.0
+    # slot 1: 빈 슬롯 → -2
+    f_raw[0, :, 1, -1] = -2.0
+    # slot 2: valid src (idx=3) → 3
+    f_raw[0, :, 2, -1] = 3.0
+
+    # model.py 와 동일 mask 로직
+    fleet_pad_h = (f_raw[..., -1] == -2)
+    # slot 0 (real, miss) 은 padding 아님
+    assert not fleet_pad_h[0, -1, 0].item(), "real fleet w/ src=-1 이 padding 으로 잡혔음"
+    # slot 1 (empty) 은 padding
+    assert fleet_pad_h[0, -1, 1].item(), "빈 슬롯이 padding 안 잡힘"
+    # slot 2 (valid) 은 padding 아님
+    assert not fleet_pad_h[0, -1, 2].item()
+
+
 def test_submission_actor_loads_state_from_policy():
     """OrbitWarsPolicy state_dict → OrbitWarsActor (critic 제외 strict=False) load 무결.
 

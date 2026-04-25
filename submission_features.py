@@ -63,7 +63,7 @@ def clear_fleet_history_at_slots(fleet_history, slots):
     for arr in fleet_history:
         for slot in slots:
             arr[slot] = 0.0
-            arr[slot, -1] = -1.0
+            arr[slot, -1] = -2.0   # empty-slot sentinel (real fleet w/ src miss 는 -1)
 
 def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
                    angular_velocity=0.0):
@@ -194,7 +194,7 @@ def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
     id_to_idx = {p.id: idx for idx, p in enumerate(planets[:MAX_PLANETS])}
 
     arr = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
-    arr[:, -1] = -1.0
+    arr[:, -1] = -2.0   # empty-slot sentinel (real fleet 의 lookup miss 는 -1)
     for i, f in enumerate(fleets):
         if fid_to_slot is None:
             if i >= MAX_FLEETS:

@@ -93,7 +93,7 @@ def _fresh_history():
         maxlen=HISTORY,
     )
     for arr in f_hist:
-        arr[:, -1] = -1.0   # fleet sentinel
+        arr[:, -1] = -2.0   # empty-slot sentinel (-1 = real fleet w/ src miss)
     return (
         deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY),
         f_hist,

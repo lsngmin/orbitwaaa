@@ -34,7 +34,7 @@ MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
 PLANET_DIM      = 16  # 0-14: numeric features, 15: is_valid (1=real, 0=empty)
 PLANET_FEAT_DIM = 15  # planet_embed 입력 dim (is_valid 제외)
-FLEET_DIM       = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
+FLEET_DIM       = 8   # 0-6: numeric features, 7: src_idx (-2=empty slot, -1=src lookup miss, ≥0=valid)
 FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 
 # ships head: required_ships 배수 Categorical (commit 2)
@@ -160,8 +160,10 @@ class OrbitWarsPolicy(nn.Module):
         fp_idx_raw = f_raw[:, -1, :, -1]                        # (B, F) — 현재 step idx
 
         # --- Padding masks (sentinel 기반, 명시적) ---
+        # fleet: -2 = empty slot (mask 대상). -1 = real fleet 인데 src lookup miss
+        # (위치/속도/ships 다 valid → mask 안 함, fusion 만 차단됨)
         planet_pad_h = (p_raw[..., -1] == 0)                     # (B, H, P)
-        fleet_pad_h  = (f_raw[..., -1] < 0)                      # (B, H, F)
+        fleet_pad_h  = (f_raw[..., -1] == -2)                    # (B, H, F)
         planet_pad_now = planet_pad_h[:, -1, :]                  # (B, P)
         fleet_pad_now  = fleet_pad_h[:, -1, :]                   # (B, F)
 

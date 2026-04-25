@@ -65,15 +65,31 @@ def test_unknown_id_maps_to_sentinel():
 
 
 def test_empty_slots_have_sentinel():
-    """빈 fleet 슬롯 (fleet 리스트가 짧음) → 마지막 dim = -1.0."""
+    """빈 fleet 슬롯 (fleet 리스트가 짧음) → 마지막 dim = -2.0 (empty-slot sentinel)."""
     raw_planets = [_planet(0)]
     raw_fleets  = []   # 전부 빈 슬롯
     arr = encode_fleets(raw_fleets, raw_planets, player=0)
     assert arr.shape == (MAX_FLEETS, FLEET_DIM)
-    # 모든 슬롯의 마지막 dim 은 -1
-    assert np.all(arr[:, -1] == -1.0)
+    # 모든 슬롯의 마지막 dim 은 -2 (empty-slot sentinel)
+    assert np.all(arr[:, -1] == -2.0)
     # 앞 numeric feature 들은 0
     assert np.all(arr[:, :FLEET_FEAT_DIM] == 0.0)
+
+
+def test_lookup_miss_real_fleet_keeps_minus_one():
+    """real fleet 의 source lookup 실패 → -1 (NOT -2). padding mask 에 안 잡혀야 함.
+
+    회귀: src_idx=-1 sentinel 이 빈 슬롯(-2)과 분리되어 attention 에 살아남는지.
+    """
+    raw_planets = [_planet(0), _planet(1)]
+    raw_fleets  = [_fleet(0, owner=0, from_pid=999)]   # 없는 src id
+    arr = encode_fleets(raw_fleets, raw_planets, player=0)
+    # slot 0: real fleet, src lookup miss → -1
+    assert arr[0, -1] == -1.0, "real fleet w/ src miss 는 -1 sentinel 유지해야 함"
+    # 다른 슬롯들: 빈 슬롯 → -2
+    assert np.all(arr[1:, -1] == -2.0), "빈 슬롯은 -2 sentinel"
+    # real fleet 의 다른 feature 는 valid (위치/ships 등)
+    assert arr[0, 4] > 0.0 or arr[0, 5] == 1.0, "real fleet 의 numeric feature 는 살아있어야 함"
 
 
 def test_fleet_features_layout():

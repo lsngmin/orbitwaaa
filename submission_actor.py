@@ -36,7 +36,7 @@ MAX_PLANETS            = ENV["max_planets"]
 MAX_FLEETS             = ENV["max_fleets"]
 PLANET_DIM             = 16   # 0-14: numeric features, 15: is_valid (submission_features 동기화)
 PLANET_FEAT_DIM        = 15
-FLEET_DIM              = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
+FLEET_DIM              = 8   # 0-6: numeric features, 7: src_idx (-2=empty slot, -1=src lookup miss, ≥0=valid)
 FLEET_FEAT_DIM         = 7
 
 SHIPS_MULTIPLIER_BINS = tuple(M.get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
@@ -115,8 +115,9 @@ class OrbitWarsActor(nn.Module):
         fp_idx_raw = f_raw[:, -1, :, -1]
 
         # Padding masks (sentinel 기반, model.py 와 동일)
+        # fleet: -2 = empty slot. -1 = real fleet w/ src miss (mask 안 함)
         planet_pad_h   = (p_raw[..., -1] == 0)
-        fleet_pad_h    = (f_raw[..., -1] < 0)
+        fleet_pad_h    = (f_raw[..., -1] == -2)
         planet_pad_now = planet_pad_h[:, -1, :]
         fleet_pad_now  = fleet_pad_h[:, -1, :]
 
