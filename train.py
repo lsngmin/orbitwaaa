@@ -325,8 +325,16 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                "filtered_zero_ships": 0, "filtered_sun": 0,
                "filtered_path": 0, "launched": 0, "launched_high_prod": 0,
                # ── ships 분포 실측 (Categorical surplus-fraction head) ──────
-               "chosen_surplus_frac_sum": 0.0,     # 선택된 surplus fraction 평균 (0~1)
-               "chosen_surplus_frac_sq_sum": 0.0,  # std 계산용
+               # chosen_surplus_frac_*: bin 선택값 (0~1). capacity-short 케이스에서는
+               #   bin 이 무의미 (ships_needed=src.ships 강제) 라 분모/분자에서 제외 →
+               #   bin_effective_count = launched - under_invested 로 정규화.
+               # send_fraction_of_src_*: floor 포함 실제 자원 소진률 (ships_sent/src.ships).
+               #   bin=0&여유 → required/src, bin=1 OR capacity-short → 1.0.
+               "chosen_surplus_frac_sum": 0.0,
+               "chosen_surplus_frac_sq_sum": 0.0,
+               "bin_effective_count": 0,         # capacity-short 제외 launch 수 (chosen_surplus_frac 분모)
+               "send_fraction_of_src_sum": 0.0,
+               "send_fraction_of_src_sq_sum": 0.0,
                "ships_to_send_sum": 0,           # 실제 발사 ships 수 평균
                "required_ships_sum": 0.0,        # 필요 병력 추정치 평균
                "send_required_ratio_sum": 0.0,   # ships_to_send / required 평균
@@ -409,8 +417,14 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         #   이 분기는 src capacity 가 부족한 경우만.
         srr = ships_needed / max(required, 1)
         under_invested = p.ships < required
-        counts["chosen_surplus_frac_sum"]    += bin_value
-        counts["chosen_surplus_frac_sq_sum"] += bin_value ** 2
+        send_frac_src = ships_needed / max(p.ships, 1)
+        # chosen_surplus_frac 은 bin 이 실제 영향을 준 launch (non-capacity-short) 만 누적.
+        if not under_invested:
+            counts["chosen_surplus_frac_sum"]    += bin_value
+            counts["chosen_surplus_frac_sq_sum"] += bin_value ** 2
+            counts["bin_effective_count"]        += 1
+        counts["send_fraction_of_src_sum"]    += send_frac_src
+        counts["send_fraction_of_src_sq_sum"] += send_frac_src ** 2
         counts["ships_to_send_sum"]        += ships_needed
         counts["required_ships_sum"]       += required
         counts["send_required_ratio_sum"]  += srr
@@ -1340,6 +1354,8 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 early_neutral_launch_to_cap_rate=rew_stats.get("early_neutral_launch_to_cap_rate", 0.0),
                 chosen_surplus_frac_mean=rew_stats.get("chosen_surplus_frac_mean", 0.0),
                 chosen_surplus_frac_std=rew_stats.get("chosen_surplus_frac_std", 0.0),
+                send_fraction_of_src_mean=rew_stats.get("send_fraction_of_src_mean", 0.0),
+                send_fraction_of_src_std=rew_stats.get("send_fraction_of_src_std", 0.0),
                 ships_to_send_mean=rew_stats.get("ships_to_send_mean", 0.0),
                 required_ships_mean=rew_stats.get("required_ships_mean", 0.0),
                 send_required_ratio_mean=rew_stats.get("send_required_ratio_mean", 0.0),

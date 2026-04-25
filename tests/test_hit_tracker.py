@@ -97,6 +97,8 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
         assert counts[k] == v, f"{k}: expected {v}, got {counts[k]}"
     # ships 실측 필드 존재 확인 (값 검증은 별도 테스트)
     for k in ("chosen_surplus_frac_sum", "chosen_surplus_frac_sq_sum",
+              "bin_effective_count",
+              "send_fraction_of_src_sum", "send_fraction_of_src_sq_sum",
               "ships_to_send_sum", "required_ships_sum",
               "send_required_ratio_sum", "under_invested_count",
               "over_send_excess_sum", "over_send_target_count"):
@@ -487,14 +489,23 @@ def test_ships_distribution_metrics_computed_from_launched_aggregates():
     surplus-fraction head: decode counts에 누적한 chosen_surplus_frac_sum/
     ships_to_send_sum/required_ships_sum/send_required_ratio_sum/ships_bin_hist_*를
     summary()가 launched로 나눠 평균/표준편차/히스토그램으로 환산.
+
+    chosen_surplus_frac_*는 bin_effective_count(non-capacity-short)로 정규화,
+    send_fraction_of_src_*는 launched로 정규화.
     """
     tracker = HitRateTracker()
     # 2번의 launch 시뮬: bin_value 0.0 & 0.66, ships 26 & 40, required 26 & 25
+    # 둘 다 capacity 충족 → bin_effective_count=2
+    # send_frac: 26/30=0.8667, 40/80=0.5 → mean=0.6833
+    sf_a, sf_b = 26 / 30, 40 / 80
     record = {
         "attempts": 2,
         "launched": 2,
         "chosen_surplus_frac_sum": 0.0 + 0.66,        # mean 0.33
         "chosen_surplus_frac_sq_sum": 0.0 + 0.4356,   # E[X²]=0.2178, var=0.2178-0.1089=0.1089 → std=0.33
+        "bin_effective_count": 2,                     # 둘 다 non-capacity-short
+        "send_fraction_of_src_sum": sf_a + sf_b,
+        "send_fraction_of_src_sq_sum": sf_a ** 2 + sf_b ** 2,
         "ships_to_send_sum": 26 + 40,                 # mean 33
         "required_ships_sum": 26 + 25,                # mean 25.5
         "send_required_ratio_sum": 1.0 + 1.60,        # mean 1.30
@@ -507,6 +518,11 @@ def test_ships_distribution_metrics_computed_from_launched_aggregates():
     s = tracker.summary()
     assert abs(s["chosen_surplus_frac_mean"] - 0.33) < 1e-6
     assert abs(s["chosen_surplus_frac_std"] - 0.33) < 1e-6
+    expected_sf_mean = (sf_a + sf_b) / 2
+    expected_sf_var  = (sf_a ** 2 + sf_b ** 2) / 2 - expected_sf_mean ** 2
+    expected_sf_std  = math.sqrt(max(expected_sf_var, 0.0))
+    assert abs(s["send_fraction_of_src_mean"] - expected_sf_mean) < 1e-6
+    assert abs(s["send_fraction_of_src_std"] - expected_sf_std) < 1e-6
     assert abs(s["ships_to_send_mean"] - 33.0) < 1e-6
     assert abs(s["required_ships_mean"] - 25.5) < 1e-6
     assert abs(s["send_required_ratio_mean"] - 1.30) < 1e-6
@@ -524,7 +540,9 @@ def test_ships_distribution_metrics_zero_when_no_launches():
     tracker = HitRateTracker()
     tracker.record({"attempts": 1, "launched": 0})
     s = tracker.summary()
-    for k in ("chosen_surplus_frac_mean", "chosen_surplus_frac_std", "ships_to_send_mean",
+    for k in ("chosen_surplus_frac_mean", "chosen_surplus_frac_std",
+              "send_fraction_of_src_mean", "send_fraction_of_src_std",
+              "ships_to_send_mean",
               "required_ships_mean", "send_required_ratio_mean", "under_invested_rate",
               "over_send_excess_per_launch"):
         assert s[k] == 0.0, f"{k} should be 0 when launched=0, got {s[k]}"

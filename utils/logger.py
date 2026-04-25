@@ -62,7 +62,10 @@ class TrainingLogger:
             "early_launch_neutral_captured_per_episode",
             "early_neutral_launch_to_cap_rate",
             # ── ships 분포 실측 (Categorical surplus-fraction head) ─────────
+            # chosen_surplus_frac_*: capacity-short 제외한 bin 선택 분포
+            # send_fraction_of_src_*: floor 포함 실제 자원 소진률 (ships/src.ships)
             "chosen_surplus_frac_mean", "chosen_surplus_frac_std",
+            "send_fraction_of_src_mean", "send_fraction_of_src_std",
             "ships_to_send_mean", "required_ships_mean",
             "send_required_ratio_mean", "under_invested_rate",
             "over_send_excess_per_launch", "over_send_target_rate",
@@ -226,6 +229,8 @@ class TrainingLogger:
 
         cm_mean   = kwargs.get("chosen_surplus_frac_mean", "")
         cm_std    = kwargs.get("chosen_surplus_frac_std", "")
+        sf_mean   = kwargs.get("send_fraction_of_src_mean", "")
+        sf_std    = kwargs.get("send_fraction_of_src_std", "")
         sts_mean  = kwargs.get("ships_to_send_mean", "")
         req_mean  = kwargs.get("required_ships_mean", "")
         srr_mean  = kwargs.get("send_required_ratio_mean", "")
@@ -240,8 +245,11 @@ class TrainingLogger:
                     bin_rates.append(f"{_SHIPS_BINS[k]:.2f}={r:.0%}")
             bin_str = " | bins=[" + "/".join(bin_rates) + "]" if bin_rates else ""
             os_str = f" | os={os_excess:.1f}" if _is_num(os_excess) else ""
+            # surf: bin 값 (capacity-short 제외) — 정책의 bin 선택 분포
+            # send%: floor 포함 실제 ships_sent/src.ships — 자원 소진률
+            sf_str = f" | send%={sf_mean:.0%}±{sf_std:.0%}" if _is_num(sf_mean) else ""
             line5 = (
-                f"ships=[surf={cm_mean:.2f}±{cm_std:.2f}"
+                f"ships=[surf={cm_mean:.2f}±{cm_std:.2f}{sf_str}"
                 f" | send={sts_mean:.1f}/req={req_mean:.1f}"
                 f" | s/r={srr_mean:.2f}/under={under:.0%}{os_str}]"
                 f"{bin_str}"

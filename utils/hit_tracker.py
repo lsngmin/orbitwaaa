@@ -65,9 +65,14 @@ class HitRateTracker:
         "early_launch_neutral_captured",  # 초반 20턴 내 발사된 중립 타겟의 실제 점령 수
                                           # (resolve 시점 무관 — fleet 비행시간 영향 X)
         # ── ships 분포 실측 (Categorical surplus-fraction head) ──────────
-        # chosen_surplus_frac: bin 값 (0~1, surplus 중 발사 비율) 평균/std
+        # chosen_surplus_frac: bin 값 (0~1). capacity-short 제외하고 누적 →
+        #   분모는 bin_effective_count (= launched - under_invested).
+        # send_fraction_of_src: floor 포함 실제 자원 소진률 (ships_sent/src.ships).
+        #   분모는 launched.
         # over_send_excess_sum: per-target Σships - required 의 양수 초과분 누적
         "chosen_surplus_frac_sum", "chosen_surplus_frac_sq_sum",
+        "bin_effective_count",
+        "send_fraction_of_src_sum", "send_fraction_of_src_sq_sum",
         "ships_to_send_sum", "required_ships_sum",
         "send_required_ratio_sum", "under_invested_count",
         "over_send_excess_sum", "over_send_target_count",
@@ -381,17 +386,29 @@ class HitRateTracker:
         # over_send_excess_rate: target 당 합산 ships - required 평균 초과 (다중 source waste)
         cm_sum   = counters.get("chosen_surplus_frac_sum", 0.0)
         cm_sq    = counters.get("chosen_surplus_frac_sq_sum", 0.0)
+        bin_eff  = counters.get("bin_effective_count", 0)
+        sf_sum   = counters.get("send_fraction_of_src_sum", 0.0)
+        sf_sq    = counters.get("send_fraction_of_src_sq_sum", 0.0)
         sts_sum  = counters.get("ships_to_send_sum", 0)
         req_sum  = counters.get("required_ships_sum", 0.0)
         srr_sum  = counters.get("send_required_ratio_sum", 0.0)
         under    = counters.get("under_invested_count", 0)
         os_sum   = counters.get("over_send_excess_sum", 0)
         os_tgts  = counters.get("over_send_target_count", 0)
-        if launched > 0:
-            cm_mean = cm_sum / launched
-            cm_var  = max(cm_sq / launched - cm_mean ** 2, 0.0)
+        # chosen_surplus_frac 은 capacity-short 제외 분모 (bin_effective_count)
+        if bin_eff > 0:
+            cm_mean = cm_sum / bin_eff
+            cm_var  = max(cm_sq / bin_eff - cm_mean ** 2, 0.0)
             out["chosen_surplus_frac_mean"] = cm_mean
             out["chosen_surplus_frac_std"]  = math.sqrt(cm_var)
+        else:
+            out["chosen_surplus_frac_mean"] = 0.0
+            out["chosen_surplus_frac_std"]  = 0.0
+        if launched > 0:
+            sf_mean = sf_sum / launched
+            sf_var  = max(sf_sq / launched - sf_mean ** 2, 0.0)
+            out["send_fraction_of_src_mean"] = sf_mean
+            out["send_fraction_of_src_std"]  = math.sqrt(sf_var)
             out["ships_to_send_mean"]       = sts_sum / launched
             out["required_ships_mean"]      = req_sum / launched
             out["send_required_ratio_mean"] = srr_sum / launched
@@ -400,7 +417,7 @@ class HitRateTracker:
             for k in range(NUM_SHIPS_BINS):
                 out[f"ships_bin_rate_{k}"] = counters.get(f"ships_bin_hist_{k}", 0) / launched
         else:
-            for k in ("chosen_surplus_frac_mean", "chosen_surplus_frac_std",
+            for k in ("send_fraction_of_src_mean", "send_fraction_of_src_std",
                       "ships_to_send_mean", "required_ships_mean",
                       "send_required_ratio_mean", "under_invested_rate",
                       "over_send_excess_per_launch"):

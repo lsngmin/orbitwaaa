@@ -127,11 +127,15 @@ def test_chosen_surplus_frac_pooled_variance():
       std  ≈ 0.3723
     """
     import math
+    # 새 시맨틱: chosen_surplus_frac_*는 bin_effective_count(non-capacity-short
+    # launches)로 정규화. 모든 launch 가 bin 영향 범위에 든다고 가정 → bin_eff=launched.
     raw_a = _make_raw(n_steps=100, episodes=1, dense=0.0, cap=0.0, terminal=0.0,
-                      launched=2, chosen_surplus_frac_sum=0.0 + 0.33,
+                      launched=2, bin_effective_count=2,
+                      chosen_surplus_frac_sum=0.0 + 0.33,
                       chosen_surplus_frac_sq_sum=0.0**2 + 0.33**2)
     raw_b = _make_raw(n_steps=100, episodes=1, dense=0.0, cap=0.0, terminal=0.0,
-                      launched=2, chosen_surplus_frac_sum=0.66 + 1.0,
+                      launched=2, bin_effective_count=2,
+                      chosen_surplus_frac_sum=0.66 + 1.0,
                       chosen_surplus_frac_sq_sum=0.66**2 + 1.0**2)
 
     stats = _finalize_reward_stats([raw_a, raw_b])
