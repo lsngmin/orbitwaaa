@@ -32,6 +32,11 @@ training:
   dense_reward_coef: 0.004  # 중간 shaping은 약한 힌트만 주도록 축소
   cap_bonus_gain: 0.008     # 중립 → 내 점령 시 prod * 이 값 보너스
   cap_bonus_loss: 0.025     # 내 → 상실 시 prod * 이 값 페널티 (1차: 0.012→0.025, 방어 비용 강화)
+  # Sprint 2: 발사 시 source 의 80%+ 비우는(all-in) 발사 페널티.
+  # 1차 측정에서 all_in_launch_rate=0.94, remaining_ships_after_launch≈8 — policy가
+  # 자원 무시 발사 default. cap_bonus_loss(잃을 때)와 별개 채널로 "발사 시점 보존"
+  # 인센티브 추가. 0 으로 두면 비활성 (Sprint 1 baseline 재현).
+  all_in_penalty: 0.01
   state_score_ship_weight: 0.1    # timeout 승자 판정(total ships)에 더 가깝게 정렬
   state_score_prod_weight: 0.5    # 생산력은 ships로 이어지는 간접 힌트만 유지
   state_score_planet_weight: 0.5  # planet_count 편향 완화 (기존 2.0에서 축소)

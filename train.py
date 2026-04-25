@@ -476,6 +476,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     launch_mask_list, target_mask_list = [], []
     hit_tracker = HitRateTracker()
     sum_dense = sum_cap = sum_terminal = 0.0
+    sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
     # win_rate 계측: episode 종료 시 main(player=0) reward로 win/draw/loss 집계.
     # draw는 0.5 가중치 (eval과 동일 규약).
     sum_wins = 0.0
@@ -491,6 +492,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
     dense_coef = T["dense_reward_coef"]
     terminal_win_reward = float(T.get("terminal_win_reward", 1.0))
+    # Sprint 2: 발사 시 source 80%+ 비우는 발사당 페널티 (음수). 0 이면 비활성.
+    all_in_penalty_coef = float(T.get("all_in_penalty", 0.0))
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
@@ -539,8 +542,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
                             - state_score(env.state[1].observation, player=1))
             dense_r        = dense_coef * (curr_score - prev_score)
             cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0)
+            # Sprint 2: 이번 step 의 all-in 발사 수에 비례한 페널티 (decode 시 이미 카운트됨).
+            #   penalty = -coef × n_all_in   (coef=0 이면 비활성, Sprint 1 baseline 동일)
+            all_in_penalty = -all_in_penalty_coef * decode_counts.get("all_in_launches", 0)
             terminal_r     = 0.0
-            reward         = dense_r + cap_bonus
+            reward         = dense_r + cap_bonus + all_in_penalty
             prev_score     = curr_score
 
             if ep_done:
@@ -553,6 +559,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
             sum_dense    += dense_r
             sum_cap      += cap_bonus
+            sum_all_in_penalty += all_in_penalty
             sum_terminal += terminal_r
 
             obs_list.append(obs_t)
@@ -605,6 +612,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "episodes":     hit_tracker.episodes,
         "sum_dense":    sum_dense,
         "sum_cap":      sum_cap,
+        "sum_all_in_penalty": sum_all_in_penalty,
         "sum_terminal": sum_terminal,
         "sum_wins":     sum_wins,
     }
@@ -669,6 +677,7 @@ def _finalize_reward_stats(raw_list):
     total_n_steps = 0
     total_episodes = 0
     total_dense = total_cap = total_terminal = 0.0
+    total_all_in_penalty = 0.0
     total_wins = 0.0
     for r in raw_list:
         for k, v in r["counters"].items():
@@ -677,6 +686,7 @@ def _finalize_reward_stats(raw_list):
         total_episodes += r["episodes"]
         total_dense    += r["sum_dense"]
         total_cap      += r["sum_cap"]
+        total_all_in_penalty += r.get("sum_all_in_penalty", 0.0)
         total_terminal += r["sum_terminal"]
         total_wins     += r.get("sum_wins", 0.0)
 
@@ -687,6 +697,8 @@ def _finalize_reward_stats(raw_list):
     stats["mean_dense"]    = total_dense    / steps_safe
     stats["mean_cap"]      = total_cap      / steps_safe
     stats["mean_terminal"] = total_terminal / steps_safe
+    # Sprint 2: per-step all-in launch penalty (음수). all_in_penalty=0 이면 0.
+    stats["mean_all_in_penalty"] = total_all_in_penalty / steps_safe
     # rollout 내 main(player=0) 승률. on-policy sampling이라 eval보다 noisy지만,
     # match_type별 log로 분포별 성능을 바로 볼 수 있는 이점.
     stats["win_rate"]      = total_wins / max(total_episodes, 1)
@@ -1240,6 +1252,8 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_dense_rew=rew_stats["mean_dense"],
                 mean_cap_bonus=rew_stats["mean_cap"],
                 mean_terminal_rew=rew_stats["mean_terminal"],
+                # Sprint 2: 발사 시 자원 보존 페널티 (음수). all_in_penalty=0 이면 0.
+                mean_all_in_penalty=rew_stats.get("mean_all_in_penalty", 0.0),
                 mean_attempts=rew_stats["mean_attempts"],
                 mean_launched=rew_stats["mean_launched"],
                 launch_rate=rew_stats["launch_rate"],
