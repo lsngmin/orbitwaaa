@@ -222,6 +222,29 @@ def test_comet_velocity_zero_at_last_path_index():
     assert arr[0, 10] == pytest.approx(0.0)
 
 
+def test_comet_velocity_zero_at_negative_path_index():
+    """`path_index < 0` → encoder 의 `if idx < 0: continue` 가드 → velocity 0.
+
+    spawn 직후 미초기화나 미정의 corner case (예: 외부 호출자가 -1 default 를
+    그대로 넘김) 에서 lookup 이 안 터지고 안전하게 0 으로 fallback 하는지 회귀.
+    `_at_last_path_index` 와 짝을 이루는 boundary 회귀.
+    """
+    comet = make_planet(7, owner=-1, x=30.0, y=50.0, radius=1.0)
+    comets = [{
+        "planet_ids": [7],
+        "paths": [[
+            [30.0, 50.0],
+            [33.0, 52.0],
+            [36.0, 56.0],
+        ]],
+        "path_index": -1,   # ← 가드 대상
+    }]
+    arr = encode_planets([comet], [], player=PLAYER, comet_ids={7},
+                         comets=comets, angular_velocity=0.0)
+    assert arr[0, 9]  == pytest.approx(0.0)
+    assert arr[0, 10] == pytest.approx(0.0)
+
+
 def test_comet_velocity_independent_of_other_planets_orbit_velocity():
     """non-comet orbiting 행성은 comets 인자 영향 없음 — 기존 ω 기반 식 그대로."""
     from prediction import MAX_SPEED

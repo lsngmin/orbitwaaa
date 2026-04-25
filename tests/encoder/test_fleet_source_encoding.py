@@ -160,20 +160,26 @@ def test_velocity_magnitude_scales_with_ships():
     assert mags[0] == pytest.approx(fleet_speed(10) / MAX_SPEED, abs=1e-5)
 
 
-def test_zero_ships_yields_zero_velocity():
-    """ships <= 1 → fleet_speed = 1.0, |v|/MAX_SPEED = 1/6 (cos/sin scale 만 적용).
+def test_low_ships_yields_minimum_velocity():
+    """ships ≤ 1 → fleet_speed fallback 1.0 (log(0)/log(1) 0-div 가드).
+    |v|/MAX_SPEED = 1/6 (cos/sin scale 만 적용). encoder 가 안 터지는지 회귀.
 
-    실제 게임에선 ships<=1 인 fleet 이 거의 없지만, encoder 가 0 division 등으로
-    터지지 않는지 회귀.
+    이름이 ‘zero_velocity’ 였던 이전 버전은 본문과 의미가 어긋났음 (실제로는
+    nonzero minimum 단언) → 이름 정정.
     """
     from prediction import fleet_speed, MAX_SPEED
 
     raw_planets = [_planet(0)]
-    raw_fleets  = [_fleet(0, owner=0, from_pid=0, ships=1, angle=0.0)]
-    arr = encode_fleets(raw_fleets, raw_planets, player=0)
-
-    assert arr[0, 2] == pytest.approx(fleet_speed(1) / MAX_SPEED, abs=1e-5)
-    assert arr[0, 3] == pytest.approx(0.0, abs=1e-6)
+    # ships=1: fleet_speed(1) = 1.0 (가드)
+    raw_fleets_1 = [_fleet(0, owner=0, from_pid=0, ships=1, angle=0.0)]
+    arr_1 = encode_fleets(raw_fleets_1, raw_planets, player=0)
+    assert arr_1[0, 2] == pytest.approx(fleet_speed(1) / MAX_SPEED, abs=1e-5)
+    assert arr_1[0, 3] == pytest.approx(0.0, abs=1e-6)
+    # 추가: ships=0 도 같은 fallback (가드 분기 robust 회귀)
+    raw_fleets_0 = [_fleet(0, owner=0, from_pid=0, ships=0, angle=0.0)]
+    arr_0 = encode_fleets(raw_fleets_0, raw_planets, player=0)
+    assert arr_0[0, 2] == pytest.approx(1.0 / MAX_SPEED, abs=1e-5)
+    assert arr_0[0, 3] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_planets_overflow_beyond_max_maps_to_sentinel():
