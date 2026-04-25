@@ -367,9 +367,21 @@ class OrbitWarsEnv(gym.Env):
         return raw_planets, raw_fleets, comet_ids, comets
 
     def _build_tensor(self):
-        p_hist = np.stack(list(self._planet_history), axis=0)  # (H, P, Dp)
-        f_hist = np.stack(list(self._fleet_history),  axis=0)  # (H, F, Df)
-        return np.concatenate([p_hist.flatten(), f_hist.flatten()]).astype(np.float32)
+        """flat layout: 턴별 interleave (model.forward 의 view 가정과 일치).
+
+        per_turn = [planet_block(P*PD), fleet_block(F*FD)]
+        flat     = per_turn[h=0] || per_turn[h=1] || ... || per_turn[H-1]
+
+        과거: `[p_all, f_all]` 분리 concat → model.view(B, H, p_size+f_size)
+        와 misalign, h=H-1 의 fleet 만 우연히 맞아 temporal attention 이
+        무의미한 데이터로 학습되던 버그를 수정.
+        """
+        p_hist = np.stack(list(self._planet_history), axis=0)  # (H, P, PD)
+        f_hist = np.stack(list(self._fleet_history),  axis=0)  # (H, F, FD)
+        p_flat = p_hist.reshape(HISTORY, MAX_PLANETS * PLANET_DIM)  # (H, p_size)
+        f_flat = f_hist.reshape(HISTORY, MAX_FLEETS  * FLEET_DIM)   # (H, f_size)
+        per_turn = np.concatenate([p_flat, f_flat], axis=1)         # (H, p_size+f_size)
+        return per_turn.reshape(-1).astype(np.float32)              # (H*(p_size+f_size),)
 
     def _encode_fleets_stable(self, raw_fleets, raw_planets):
         """Slot-stable fleet encoding. fleet_id → 고정 슬롯 매핑 갱신 후

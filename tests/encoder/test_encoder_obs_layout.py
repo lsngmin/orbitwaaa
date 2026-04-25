@@ -63,27 +63,80 @@ def test_obs_dim_formula():
 
 
 def test_flatten_restore_round_trip():
-    """encode → flatten → unflatten 후에도 idx 가 last dim 에 보존."""
+    """env_wrapper._build_tensor flatten → model forward unflatten 의 layout 일치 회귀.
+
+    과거 버그: `np.concatenate([p_hist.flatten(), f_hist.flatten()])` (=p_all||f_all)
+    + `obs.view(B, H, p_size+f_size)` 가 misalign 해서 temporal attention 이 garbage
+    를 보던 문제. 이 테스트는 모든 턴/슬롯/dim 에서 round-trip 이 보존되는지 확인한다.
+    """
     P, F, H = mdl.MAX_PLANETS, mdl.MAX_FLEETS, mdl.HISTORY
     PD, FD  = mdl.PLANET_DIM, mdl.FLEET_DIM
 
-    p_hist = np.random.randn(H, P, PD).astype(np.float32)
-    f_hist = np.random.randn(H, F, FD).astype(np.float32)
-    # idx 자리에 의도적 값
-    f_hist[H - 1, 0, -1] = 7.0
-    f_hist[H - 1, 5, -1] = -1.0
+    rng = np.random.default_rng(0)
+    p_hist = rng.standard_normal((H, P, PD)).astype(np.float32)
+    f_hist = rng.standard_normal((H, F, FD)).astype(np.float32)
+    # 턴별 고유 마커 — 모든 턴이 따로 보존되는지 확인
+    for h in range(H):
+        p_hist[h, 0, 0] = float(h + 1)
+        f_hist[h, 0, -1] = float(h + 100)
 
-    flat = np.concatenate([p_hist.flatten(), f_hist.flatten()])
-    obs  = torch.from_numpy(flat).unsqueeze(0)
+    # env_wrapper._build_tensor 와 동일한 turn-interleave layout
+    p_flat   = p_hist.reshape(H, P * PD)
+    f_flat   = f_hist.reshape(H, F * FD)
+    per_turn = np.concatenate([p_flat, f_flat], axis=1)
+    flat     = per_turn.reshape(-1)
+    obs      = torch.from_numpy(flat).unsqueeze(0)
 
-    # model forward 와 동일한 reshape 로직 검증
+    # model forward 의 view 와 동일
     p_size = P * PD
     f_size = F * FD
     obs_v = obs.view(1, H, p_size + f_size)
+    p_raw = obs_v[:, :, :p_size].view(1, H, P, PD)
     f_raw = obs_v[:, :, p_size:].view(1, H, F, FD)
 
-    assert f_raw[0, H - 1, 0, -1].item() == pytest.approx(7.0)
-    assert f_raw[0, H - 1, 5, -1].item() == pytest.approx(-1.0)
+    # 모든 턴에서 마커 보존
+    for h in range(H):
+        assert p_raw[0, h, 0, 0].item() == pytest.approx(float(h + 1)), \
+            f"planet h={h} marker lost"
+        assert f_raw[0, h, 0, -1].item() == pytest.approx(float(h + 100)), \
+            f"fleet h={h} marker lost"
+
+    # 전체 데이터 round-trip
+    assert torch.allclose(p_raw[0], torch.from_numpy(p_hist))
+    assert torch.allclose(f_raw[0], torch.from_numpy(f_hist))
+
+
+def test_env_build_tensor_matches_model_view():
+    """env_wrapper._build_tensor 가 만든 flat 이 model.view 와 정확히 align."""
+    from collections import deque
+    env = ew.OrbitWarsEnv()
+
+    # 턴별 distinct array 로 history 재구성 + 마커
+    p_list = []
+    f_list = []
+    for h in range(mdl.HISTORY):
+        p = np.zeros((mdl.MAX_PLANETS, mdl.PLANET_DIM), dtype=np.float32)
+        f = np.zeros((mdl.MAX_FLEETS,  mdl.FLEET_DIM),  dtype=np.float32)
+        p[0, 0]  = float(h + 1)
+        f[0, -1] = float(h + 100)
+        p_list.append(p)
+        f_list.append(f)
+    env._planet_history = deque(p_list, maxlen=mdl.HISTORY)
+    env._fleet_history  = deque(f_list, maxlen=mdl.HISTORY)
+
+    flat = env._build_tensor()
+    obs  = torch.from_numpy(flat).unsqueeze(0)
+    p_size = mdl.MAX_PLANETS * mdl.PLANET_DIM
+    f_size = mdl.MAX_FLEETS  * mdl.FLEET_DIM
+    obs_v = obs.view(1, mdl.HISTORY, p_size + f_size)
+    p_raw = obs_v[:, :, :p_size].view(1, mdl.HISTORY, mdl.MAX_PLANETS, mdl.PLANET_DIM)
+    f_raw = obs_v[:, :, p_size:].view(1, mdl.HISTORY, mdl.MAX_FLEETS,  mdl.FLEET_DIM)
+
+    for h in range(mdl.HISTORY):
+        assert p_raw[0, h, 0, 0].item() == pytest.approx(float(h + 1)), \
+            f"_build_tensor planet h={h} drift"
+        assert f_raw[0, h, 0, -1].item() == pytest.approx(float(h + 100)), \
+            f"_build_tensor fleet h={h} drift"
 
 
 def test_submission_actor_loads_state_from_policy():

@@ -184,11 +184,14 @@ def agent(obs):
     clear_fleet_history_at_slots(f_hist, newly)
     f_hist.append(encode_fleets(raw_fleets, raw_planets, player, fid_to_slot))
 
-    # 학습 obs 레이아웃: (H * (P*PD + F*FD),) flat
-    p_stack = np.stack(list(p_hist), axis=0)              # (H, P, PD)
-    f_stack = np.stack(list(f_hist), axis=0)              # (H, F, FD)
-    flat    = np.concatenate([p_stack.reshape(-1), f_stack.reshape(-1)]).astype(np.float32)
-    obs_t   = torch.from_numpy(flat).unsqueeze(0).to(_DEVICE)   # (1, ...)
+    # 학습 obs 레이아웃: 턴별 interleave (env_wrapper._build_tensor 와 동일).
+    p_stack  = np.stack(list(p_hist), axis=0)            # (H, P, PD)
+    f_stack  = np.stack(list(f_hist), axis=0)            # (H, F, FD)
+    p_flat   = p_stack.reshape(HISTORY, MAX_PLANETS * PLANET_DIM)
+    f_flat   = f_stack.reshape(HISTORY, MAX_FLEETS  * FLEET_DIM)
+    per_turn = np.concatenate([p_flat, f_flat], axis=1)
+    flat     = per_turn.reshape(-1).astype(np.float32)
+    obs_t    = torch.from_numpy(flat).unsqueeze(0).to(_DEVICE)  # (1, ...)
 
     with torch.no_grad():
         action_logits = model(obs_t).cpu()               # (1, P, ACTION_DIM)
