@@ -26,9 +26,13 @@ TRAIN_CONFIG = CONFIG["training"]
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
-PLANET_DIM   = 21  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
+PLANET_DIM   = 23  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
                    # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
+                   # +2: source_enemy_pressure_norm, source_nearest_enemy_eta_norm (own-planet defensive)
 FLEET_DIM    = 7
+
+# F21/F22 source-side feature window: 적 행성 ETA가 이 값 이내면 pressure 합산 대상
+SOURCE_PRESSURE_ETA_WINDOW = 30
 
 # ships head: required_ships 배수 Categorical (commit 2)
 SHIPS_MULTIPLIER_BINS = tuple(CONFIG["model"].get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
@@ -151,6 +155,28 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
             required_norm    = 0.0
             feasibility_norm = 0.0
 
+        # ── Source-side defensive features (own planets only) ──────────────
+        # F21 source_enemy_pressure_norm: 이 source 주변(eta≤W) 적 행성 ships 합 / 1000
+        # F22 source_nearest_enemy_eta_norm: 이 source까지 가장 가까운 적 행성의 eta / 50
+        # 비-아군 행성에는 0(pressure) / 1.0(safe eta) — owner_me 플래그와 결합 사용.
+        # 의도: 모델이 "이 source는 적 압력 높음 → 비우면 안 됨"을 인식할 표현 채널.
+        source_enemy_pressure_norm    = 0.0
+        source_nearest_enemy_eta_norm = 1.0
+        if p.owner == player:
+            pressure_sum = 0
+            nearest_eta  = 50.0
+            for ep in planets:
+                if ep.owner == player or ep.owner == -1 or ep.id == p.id:
+                    continue
+                ep_dist = math.hypot(p.x - ep.x, p.y - ep.y)
+                ep_eta  = estimate_arrival_turn(ep_dist, 50)
+                if ep_eta <= SOURCE_PRESSURE_ETA_WINDOW:
+                    pressure_sum += ep.ships
+                if ep_eta < nearest_eta:
+                    nearest_eta = float(ep_eta)
+            source_enemy_pressure_norm    = min(pressure_sum / 1000.0, 1.0)
+            source_nearest_enemy_eta_norm = min(nearest_eta / 50.0, 1.0)
+
         arr[i] = [
             p.x / 100.0,
             p.y / 100.0,
@@ -176,6 +202,9 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
             required_norm,
             best_src_ships_norm,
             feasibility_norm,
+            # ── Source-side defensive (own planets only, else 0/1) ──
+            source_enemy_pressure_norm,
+            source_nearest_enemy_eta_norm,
         ]
     return arr
 

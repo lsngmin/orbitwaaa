@@ -12,12 +12,14 @@ import numpy as np
 MAX_PLANETS = 40
 MAX_FLEETS = 100
 HISTORY = 20
-PLANET_DIM = 21   # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
+PLANET_DIM = 23   # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
                   # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
+                  # +2: source_enemy_pressure_norm, source_nearest_enemy_eta_norm
 FLEET_DIM = 7
 
 ETA_NEAR = 5
 ETA_MID = 15
+SOURCE_PRESSURE_ETA_WINDOW = 30
 
 
 def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=0.0):
@@ -127,6 +129,26 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
             required_norm    = 0.0
             feasibility_norm = 0.0
 
+        # ── Source-side defensive features (own planets only) ──────────────
+        # F21 source_enemy_pressure_norm / F22 source_nearest_enemy_eta_norm
+        # 학습 env_wrapper와 동일 로직 — submission parity 보장.
+        source_enemy_pressure_norm    = 0.0
+        source_nearest_enemy_eta_norm = 1.0
+        if p.owner == player:
+            pressure_sum = 0
+            nearest_eta  = 50.0
+            for ep in planets:
+                if ep.owner == player or ep.owner == -1 or ep.id == p.id:
+                    continue
+                ep_dist = math.hypot(p.x - ep.x, p.y - ep.y)
+                ep_eta  = estimate_arrival_turn(ep_dist, 50)
+                if ep_eta <= SOURCE_PRESSURE_ETA_WINDOW:
+                    pressure_sum += ep.ships
+                if ep_eta < nearest_eta:
+                    nearest_eta = float(ep_eta)
+            source_enemy_pressure_norm    = min(pressure_sum / 1000.0, 1.0)
+            source_nearest_enemy_eta_norm = min(nearest_eta / 50.0, 1.0)
+
         arr[i] = [
             p.x / 100.0,
             p.y / 100.0,
@@ -152,6 +174,9 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
             required_norm,
             best_src_ships_norm,
             feasibility_norm,
+            # ── Source-side defensive (own planets only, else 0/1) ──
+            source_enemy_pressure_norm,
+            source_nearest_enemy_eta_norm,
         ]
     return arr
 

@@ -69,6 +69,13 @@ class TrainingLogger:
             # 연계 공격 (단발 실패 vs 연속 압박 구분)
             "repeat_target_rate",
             "launch_to_cap_rate_neutral", "launch_to_cap_rate_enemy",
+            # ── 1차 진단 metric (단발 점령 + 유지 + 자원 보존) ────────────
+            "single_shot_capture_rate",
+            "capture_hold_k_rate",
+            "post_capture_reloss_rate_k",
+            "all_in_launch_rate",
+            "remaining_ships_after_launch_mean",
+            "distinct_targets_per_turn",
             # eval 전용: 승리/패배 게임 분리 (under-invest ↔ 패배 상관관계)
             "eval_under_win", "eval_under_loss",
             "eval_sr_win", "eval_sr_loss",

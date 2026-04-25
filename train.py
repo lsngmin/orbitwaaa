@@ -320,7 +320,13 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                "ships_to_send_sum_neutral": 0,   "ships_to_send_sum_enemy": 0,
                "required_ships_sum_neutral": 0.0, "required_ships_sum_enemy": 0.0,
                "send_required_ratio_sum_neutral": 0.0, "send_required_ratio_sum_enemy": 0.0,
-               "under_invested_count_neutral": 0, "under_invested_count_enemy": 0}
+               "under_invested_count_neutral": 0, "under_invested_count_enemy": 0,
+               # ── 1차 진단 metric (자원 보존 측정) ──────────────────────────
+               # all_in_launches: ships_needed >= 0.8 * src.ships (source를 거의 비움)
+               # remaining_ships_after_launch_sum: 발사 후 source에 남은 ships 합
+               #   둘 다 launched 분모로 나눠 rate/mean 산출.
+               "all_in_launches": 0,
+               "remaining_ships_after_launch_sum": 0}
     # ships_bin 선택 히스토그램 (K bins): counts["ships_bin_hist_k"] = count
     for k in range(NUM_SHIPS_BINS):
         counts[f"ships_bin_hist_{k}"] = 0
@@ -398,6 +404,13 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         counts[f"send_required_ratio_sum_{suffix}"] += srr
         if under_invested:
             counts[f"under_invested_count_{suffix}"] += 1
+
+        # ── 1차 진단: all-in / 잔여 ships ─────────────────────────────────
+        # all-in: 한 번에 source의 80%+ 비우는 발사 (자원 무시 직접 지표).
+        # remaining_ships: 발사 후 source 잔여 (= 방어 reserve / 다음 턴 여력).
+        if p.ships > 0 and ships_needed >= HitRateTracker.ALL_IN_THRESHOLD * p.ships:
+            counts["all_in_launches"] += 1
+        counts["remaining_ships_after_launch_sum"] += max(p.ships - ships_needed, 0)
 
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
@@ -1284,6 +1297,15 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 repeat_target_rate=rew_stats.get("repeat_target_rate", 0.0),
                 launch_to_cap_rate_neutral=rew_stats.get("launch_to_cap_rate_neutral", 0.0),
                 launch_to_cap_rate_enemy=rew_stats.get("launch_to_cap_rate_enemy", 0.0),
+                # 1차 진단 metric 묶음 (단발 점령 + 유지 + 자원 보존)
+                # 이 6개가 main rollout row(self/league/exploiter)에 찍혀야
+                # Sprint 1 baseline → Sprint 2 비교가 가능. 빠지면 row 빈칸 → 측정 의미 상실.
+                single_shot_capture_rate=rew_stats.get("single_shot_capture_rate", 0.0),
+                capture_hold_k_rate=rew_stats.get("capture_hold_k_rate", 0.0),
+                post_capture_reloss_rate_k=rew_stats.get("post_capture_reloss_rate_k", 0.0),
+                all_in_launch_rate=rew_stats.get("all_in_launch_rate", 0.0),
+                remaining_ships_after_launch_mean=rew_stats.get("remaining_ships_after_launch_mean", 0.0),
+                distinct_targets_per_turn=rew_stats.get("distinct_targets_per_turn", 0.0),
                 **{f"ships_bin_rate_{k}": rew_stats.get(f"ships_bin_rate_{k}", 0.0)
                    for k in range(NUM_SHIPS_BINS)},
                 **head_metrics,

@@ -78,6 +78,21 @@ class HitRateTracker:
         # launch_to_cap_k_{neu,enm}: 발사 후 LAUNCH_TO_CAP_K턴 내 그 target이 결국 점령된 launch 수
         "repeat_target",
         "launch_to_cap_k_neutral", "launch_to_cap_k_enemy",
+        # ── 1차 진단 metric 묶음 (방향: 단발 점령 + 유지 + 자원 보존 측정) ───
+        # decode-time:
+        #   all_in_launches              : ships_needed >= ALL_IN_THRESHOLD * src.ships
+        #   remaining_ships_after_launch_sum : 발사 후 source에 남은 ships (per-launch)
+        #   distinct_targets_sum         : per-step distinct target_id 수 (같은 턴 분산도)
+        # resolve-time:
+        #   captured_single_shot         : capture가 일어난 step에 우리 fleet 1개만 충돌
+        #   capture_hold_k_total/success : 점령 후 K턴 보유 추적 (denom/num)
+        #   post_reloss_k_total/count    : 점령 후 K턴 안에 한 번이라도 재상실됐나
+        "all_in_launches",
+        "remaining_ships_after_launch_sum",
+        "distinct_targets_sum",
+        "captured_single_shot",
+        "capture_hold_k_total", "capture_hold_k_success",
+        "post_reloss_k_total", "post_reloss_k_count",
         "unknown_removal",
     ) + tuple(f"ships_bin_hist_{k}" for k in range(NUM_SHIPS_BINS))
     HOME_EXPAND_TURNS = 20
@@ -85,6 +100,9 @@ class HitRateTracker:
     # 연계 공격 윈도우 (평균 flight time이 대략 10~15턴 이므로 20턴이면 fleet 도착 커버)
     REPEAT_K = 20
     LAUNCH_TO_CAP_K = 20
+    # 단발 점령 + 자원 보존 진단 윈도우
+    ALL_IN_THRESHOLD = 0.8       # ships_needed / src.ships 가 이 이상이면 all-in
+    CAPTURE_HOLD_K = 5           # 점령 후 K턴 후 보유/재상실 판정
 
     def __init__(self, player_id=0):
         self.counters = defaultdict(int)
@@ -100,6 +118,9 @@ class HitRateTracker:
         #                                  (launch_to_cap_k 검출 — 윈도우 만료 시 제거)
         self.last_launch_turn = {}
         self.launches_by_target = defaultdict(list)
+        # 점령 후 유지/재상실 추적: planet_id -> {"captured_turn": int, "ever_lost": bool}
+        # CAPTURE_HOLD_K턴 경과 시 hold/reloss 카운트로 flush.
+        self.capture_pending = {}
 
     def reset_episode(self, obs):
         self.pending.clear()
@@ -108,6 +129,7 @@ class HitRateTracker:
         self.home_positions = []
         self.last_launch_turn = {}
         self.launches_by_target = defaultdict(list)
+        self.capture_pending = {}
         for p in _get(obs, "planets", []):
             owner = p[1] if isinstance(p, (list, tuple)) else p.owner
             if owner != self.player_id:
@@ -135,6 +157,10 @@ class HitRateTracker:
         동시에 target_owner 기반 launch 분포/초반 attempt 계측도 여기서 수행.
         """
         is_early = self.episode_turn < self.HOME_EXPAND_TURNS
+        # distinct_targets_per_turn: 같은 턴에 몇 개 다른 target에 분산 발사하는지.
+        # 1등 패턴(여러 source → 1 target 동시발사)이면 작고, 난사(여러 source → 여러 target)면 큼.
+        if launches:
+            self.counters["distinct_targets_sum"] += len({m["target_id"] for m in launches})
         for i, meta in enumerate(launches):
             fid = next_fleet_id + i
             self.pending[fid] = {
@@ -236,6 +262,15 @@ class HitRateTracker:
                     ):
                         counted_capture_planets.add(planet_id)
                         self.counters[f"captured_{suffix}"] += 1
+                        # single-shot: 우리 fleet 1개만이 이 planet에 충돌해 점령 성사
+                        # (ambiguous 분류와 별개 — 적 fleet 동시 충돌은 무시. 우리 측 분산 여부만).
+                        if len(my_hits_by_planet[planet_id]) == 1:
+                            self.counters["captured_single_shot"] += 1
+                        # hold/reloss 추적 시작
+                        self.capture_pending[planet_id] = {
+                            "captured_turn": self.episode_turn,
+                            "ever_lost": False,
+                        }
                         if prev_owner == -1:
                             self.counters["captured_neutral"] += 1
                             # 발사 시점 기준: "초반 20턴에 쏜 중립이 점령으로 이어졌나"
@@ -281,6 +316,28 @@ class HitRateTracker:
             ]
             if not self.launches_by_target[pid]:
                 del self.launches_by_target[pid]
+
+        # ── capture_hold_k / post_reloss_k flush ──────────────────────────
+        # 1) 모든 pending 점령에 대해 "이번 step에 잃었나" 갱신
+        # 2) captured_turn에서 K턴 경과한 항목은 hold/reloss 결과 카운트로 flush
+        # K턴 미만에 episode 종료 시 미flush — 짧은 게임 편향 방지.
+        for pid, info in self.capture_pending.items():
+            curr = curr_planet_map.get(pid)
+            if curr is not None and curr[1] != self.player_id:
+                info["ever_lost"] = True
+        for pid in list(self.capture_pending.keys()):
+            info = self.capture_pending[pid]
+            age  = self.episode_turn - info["captured_turn"]
+            if age >= self.CAPTURE_HOLD_K:
+                curr = curr_planet_map.get(pid)
+                still_owned = (curr is not None and curr[1] == self.player_id)
+                self.counters["capture_hold_k_total"] += 1
+                if still_owned:
+                    self.counters["capture_hold_k_success"] += 1
+                self.counters["post_reloss_k_total"] += 1
+                if info["ever_lost"]:
+                    self.counters["post_reloss_k_count"] += 1
+                del self.capture_pending[pid]
 
         self.episode_turn += 1
 
@@ -373,6 +430,40 @@ class HitRateTracker:
         # (첫 발사는 repeat 아니므로 최대값 ≈ (launched-unique_targets)/launched)
         # 높으면 계획된 연속 압박, 낮으면 산발적 단발 시도.
         out["repeat_target_rate"] = counters.get("repeat_target", 0) / max(launched, 1)
+
+        # ── 1차 진단 metric 묶음 (단발 점령 + 유지 + 자원 보존) ─────────────
+        # all_in_launch_rate: 발사 중 ALL_IN_THRESHOLD 이상 비율
+        #                    (자원 보존 못 하고 비우는 패턴 직접 지표)
+        # remaining_ships_after_launch_mean: 평균 발사 후 잔여 ships (방어 reserve)
+        # distinct_targets_per_turn: 한 턴 평균 distinct 타겟 수
+        #                          1등 패턴(분산 X, 집중 O)이면 작음, 난사면 큼
+        out["all_in_launch_rate"] = counters.get("all_in_launches", 0) / max(launched, 1)
+        out["remaining_ships_after_launch_mean"] = (
+            counters.get("remaining_ships_after_launch_sum", 0) / max(launched, 1)
+        )
+        out["distinct_targets_per_turn"] = (
+            counters.get("distinct_targets_sum", 0) / steps
+        )
+
+        # single_shot_capture_rate: 점령 중 우리 fleet 단발로 성사된 비율
+        # (멀티-source 동시점령은 0으로 카운트 — 1등은 양쪽 다 쓰지만 단발이 dominant)
+        total_caps = (counters.get("captured_exclusive", 0)
+                      + counters.get("captured_ambiguous", 0))
+        out["single_shot_capture_rate"] = (
+            counters.get("captured_single_shot", 0) / max(total_caps, 1)
+        )
+
+        # capture_hold_k_rate: 점령 후 K턴 시점 보유 성공률 (분모: 만료된 점령건만)
+        # post_capture_reloss_rate_k: 점령 후 K턴 안에 한 번이라도 잃은 비율
+        # 둘은 독립: 잃었다 되찾으면 hold=1, reloss=1. 1등 행동(점령→유지)을 쪼갠 신호.
+        hold_total   = counters.get("capture_hold_k_total", 0)
+        reloss_total = counters.get("post_reloss_k_total", 0)
+        out["capture_hold_k_rate"] = (
+            counters.get("capture_hold_k_success", 0) / max(hold_total, 1)
+        )
+        out["post_capture_reloss_rate_k"] = (
+            counters.get("post_reloss_k_count", 0) / max(reloss_total, 1)
+        )
         return out
 
     def summary(self):
