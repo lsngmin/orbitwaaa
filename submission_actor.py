@@ -27,7 +27,6 @@ ENV = CFG["env"]
 EMBED_DIM              = M["embed_dim"]
 PLANET_TEMPORAL_LAYERS = M["planet_temporal_layers"]
 FLEET_TEMPORAL_LAYERS  = M["fleet_temporal_layers"]
-FLEET_TEMPORAL         = M["fleet_temporal"]
 LOCAL_LAYERS           = M["local_layers"]
 GLOBAL_LAYERS          = M["global_layers"]
 NUM_HEADS              = M["num_heads"]
@@ -86,18 +85,17 @@ class OrbitWarsActor(nn.Module):
         self.fleet_temporal_pos  = nn.Embedding(HISTORY, EMBED_DIM)
 
         self.planet_temporal_attn = _make_transformer(PLANET_TEMPORAL_LAYERS)
-        self.fleet_temporal_attn  = _make_transformer(FLEET_TEMPORAL_LAYERS) if FLEET_TEMPORAL else None
+        self.fleet_temporal_attn  = _make_transformer(FLEET_TEMPORAL_LAYERS)
 
         # Attention pool — H턴 시퀀스를 학습된 query 로 weighted-sum (model.py 와 동기)
         self.planet_pool_query = nn.Parameter(torch.randn(1, 1, EMBED_DIM) * 0.02)
         self.planet_pool_attn  = nn.MultiheadAttention(
             EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
         )
-        if FLEET_TEMPORAL:
-            self.fleet_pool_query = nn.Parameter(torch.randn(1, 1, EMBED_DIM) * 0.02)
-            self.fleet_pool_attn  = nn.MultiheadAttention(
-                EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
-            )
+        self.fleet_pool_query = nn.Parameter(torch.randn(1, 1, EMBED_DIM) * 0.02)
+        self.fleet_pool_attn  = nn.MultiheadAttention(
+            EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
+        )
 
         self.local_attn  = _make_transformer(LOCAL_LAYERS)
         self.global_attn = _make_transformer(GLOBAL_LAYERS)
@@ -148,19 +146,16 @@ class OrbitWarsActor(nn.Module):
                                         key_padding_mask=_safe_pad_mask(p_pad_seq))
         p_t   = p_t.squeeze(1).view(B, MAX_PLANETS, EMBED_DIM)
 
-        # Fleet temporal (optional) + attention pool
-        if FLEET_TEMPORAL:
-            f_pos = self.fleet_temporal_pos(t_idx)
-            f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
-            f_t   = f_t + f_pos.unsqueeze(0)
-            f_pad_seq = fleet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_FLEETS, HISTORY)
-            f_t   = self.fleet_temporal_attn(f_t, src_key_padding_mask=_safe_pad_mask(f_pad_seq))
-            f_q   = self.fleet_pool_query.expand(B * MAX_FLEETS, 1, EMBED_DIM)
-            f_t, _ = self.fleet_pool_attn(f_q, f_t, f_t,
-                                           key_padding_mask=_safe_pad_mask(f_pad_seq))
-            f_t   = f_t.squeeze(1).view(B, MAX_FLEETS, EMBED_DIM)
-        else:
-            f_t = f_emb[:, -1, :, :]
+        # Fleet temporal + attention pool
+        f_pos = self.fleet_temporal_pos(t_idx)
+        f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
+        f_t   = f_t + f_pos.unsqueeze(0)
+        f_pad_seq = fleet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_FLEETS, HISTORY)
+        f_t   = self.fleet_temporal_attn(f_t, src_key_padding_mask=_safe_pad_mask(f_pad_seq))
+        f_q   = self.fleet_pool_query.expand(B * MAX_FLEETS, 1, EMBED_DIM)
+        f_t, _ = self.fleet_pool_attn(f_q, f_t, f_t,
+                                       key_padding_mask=_safe_pad_mask(f_pad_seq))
+        f_t   = f_t.squeeze(1).view(B, MAX_FLEETS, EMBED_DIM)
 
         # Source planet fusion (model.py 와 동일)
         fp_idx      = fp_idx_raw.long()

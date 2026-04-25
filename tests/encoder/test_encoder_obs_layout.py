@@ -150,9 +150,8 @@ def test_attention_pool_params_present():
     # MultiheadAttention 의 in_proj_weight, out_proj.weight 등이 들어있어야 함
     assert any(k.startswith("planet_pool_attn.") for k in sd_keys), \
         "planet_pool_attn 파라미터 누락"
-    if mdl.FLEET_TEMPORAL:
-        assert "fleet_pool_query" in sd_keys
-        assert any(k.startswith("fleet_pool_attn.") for k in sd_keys)
+    assert "fleet_pool_query" in sd_keys
+    assert any(k.startswith("fleet_pool_attn.") for k in sd_keys)
 
 
 def test_attention_pool_query_independent_of_input_last_turn():

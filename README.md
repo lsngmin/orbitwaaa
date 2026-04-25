@@ -318,8 +318,6 @@ f_fused  = f_t + gate * cand * valid       # residual + gated
 
 `valid_mask = (0 <= from_planet_idx < P)` 이므로 invalid sentinel(-1) 인 padding fleet 의 fusion 은 자연스럽게 차단되고 (residual identity), source 가 살아있는 fleet 만 source 정보를 흡수한다.
 
-> **ablation B (`fleet_temporal=false`)**: temporal attention 을 건너뛰고 마지막 step embedding 만 쓴다. `config.yaml` 의 `fleet_temporal` 로 토글.
-
 ### Local & Global Attention
 
 토큰별 contextual embedding 이 만들어지면 두 종류 토큰을 한 시퀀스에 합쳐 정책 시야를 넓힌다.
