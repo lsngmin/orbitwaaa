@@ -41,8 +41,8 @@ training:
   state_score_planet_weight: 0.5  # planet_count 편향 완화 (기존 2.0에서 축소)
 
 env:
-  max_planets: 40
-  max_fleets: 100
+  max_planets: 44   # 게임 최대 = 40 base (5-10 groups × 4) + 4 comets
+  max_fleets: 200   # 4P 후반 worst-case (30+ planets/player × ~5턴 transit)
   history_turns: 20     # temporal window
 
 selfplay:

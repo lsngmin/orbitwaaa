@@ -9,8 +9,8 @@ import os
 import math
 import numpy as np
 
-MAX_PLANETS = 40
-MAX_FLEETS = 100
+MAX_PLANETS = 44    # 게임 최대 = 40 base + 4 comets (env_wrapper 와 동기)
+MAX_FLEETS = 200    # 4P 대응 (env_wrapper 와 동기)
 HISTORY = 20
 PLANET_DIM      = 16
 PLANET_FEAT_DIM = 15

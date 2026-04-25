@@ -139,7 +139,7 @@ def test_out_of_range_idx_blocks_fusion(model):
     """범위 초과 idx (음/양 양쪽) → clamp 되더라도 fusion 차단."""
     B = 2
     p_t, f_t = _setup_pf(B)
-    # MAX_PLANETS=40 기준 양/음 둘 다 out-of-range
+    # 양/음 둘 다 [0, MAX_PLANETS) 범위 밖
     fp_idx = torch.tensor([
         [999.0] * MAX_FLEETS,           # +∞ 쪽
         [-100.0] * MAX_FLEETS,          # -∞ 쪽
