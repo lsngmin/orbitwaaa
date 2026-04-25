@@ -41,7 +41,9 @@ FLEET_FEAT_DIM         = 7
 
 SHIPS_SURPLUS_BINS = tuple(M.get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
 NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
-ACTION_DIM         = 1 + NUM_SHIPS_BINS + MAX_PLANETS
+# 5-way action: idx 0 = skip, 1..K = bin (k-1). model.py 와 동기.
+NUM_ACTIONS        = 1 + NUM_SHIPS_BINS
+ACTION_DIM         = NUM_ACTIONS + MAX_PLANETS
 
 
 def _make_transformer(layers):

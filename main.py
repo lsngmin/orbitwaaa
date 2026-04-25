@@ -31,7 +31,7 @@ from submission_features import (
     new_fleet_slot_state, update_fleet_slots, clear_fleet_history_at_slots,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
 )
-from submission_actor import OrbitWarsActor, NUM_SHIPS_BINS, SHIPS_SURPLUS_BINS
+from submission_actor import OrbitWarsActor, NUM_SHIPS_BINS, NUM_ACTIONS, SHIPS_SURPLUS_BINS
 from train import analyze_action_space, decode_action_to_moves
 
 
@@ -124,28 +124,24 @@ def _sample_action(action_logits, analysis):
 
     action_logits: (1, MAX_PLANETS, ACTION_DIM) CPU tensor
     return: (MAX_PLANETS, ACTION_DIM) numpy
+
+    Layout: [action_5way(NUM_ACTIONS), target(MAX_PLANETS)] — 5-way idx 0=skip.
     """
-    launch_logits = action_logits[0, :, 0].clone()
-    ships_logits  = action_logits[0, :, 1:1 + NUM_SHIPS_BINS]
-    target_logits = action_logits[0, :, 1 + NUM_SHIPS_BINS:].clone()
+    a_logits = action_logits[0, :, :NUM_ACTIONS].clone()
+    t_logits = action_logits[0, :, NUM_ACTIONS:].clone()
 
-    launch_logits = launch_logits.masked_fill(~analysis.launch_mask, -1e9)
-    target_logits = target_logits.masked_fill(~analysis.target_mask, -1e9)
+    a_logits = a_logits.masked_fill(~analysis.action_mask, -1e9)
+    t_logits = t_logits.masked_fill(~analysis.target_mask, -1e9)
 
-    launch = torch.distributions.Bernoulli(logits=launch_logits).sample()
-    ships  = torch.distributions.Categorical(logits=ships_logits).sample()
-    target = torch.distributions.Categorical(logits=target_logits).sample()
+    a_idx  = torch.distributions.Categorical(logits=a_logits).sample()
+    target = torch.distributions.Categorical(logits=t_logits).sample()
 
-    ships_onehot = torch.zeros_like(ships_logits)
-    ships_onehot.scatter_(-1, ships.unsqueeze(-1), 1.0)
-    target_onehot = torch.zeros_like(target_logits)
-    target_onehot.scatter_(-1, target.unsqueeze(-1), 1.0)
+    a_onehot = torch.zeros_like(a_logits)
+    a_onehot.scatter_(-1, a_idx.unsqueeze(-1), 1.0)
+    t_onehot = torch.zeros_like(t_logits)
+    t_onehot.scatter_(-1, target.unsqueeze(-1), 1.0)
 
-    action = torch.cat([
-        launch.unsqueeze(-1),
-        ships_onehot,
-        target_onehot,
-    ], dim=-1)
+    action = torch.cat([a_onehot, t_onehot], dim=-1)
     return action.numpy()
 
 

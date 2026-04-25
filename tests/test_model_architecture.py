@@ -66,7 +66,7 @@ def test_get_action_and_value_shapes(model):
     assert action.shape   == (2, MAX_PLANETS, ACTION_DIM)
     assert log_prob.shape == (2,)
     assert value.shape    == (2, 1)
-    assert lp_heads.shape == (2, 3)
+    assert lp_heads.shape == (2, 2)
 
 
 def test_planet_gradient_does_not_flow_to_fleet_temporal(model):

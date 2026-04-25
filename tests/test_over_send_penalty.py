@@ -14,16 +14,16 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from env_wrapper import MAX_PLANETS, NUM_SHIPS_BINS
+from env_wrapper import MAX_PLANETS, NUM_SHIPS_BINS, NUM_ACTIONS
 from train import decode_action_to_moves
 
-ACTION_DIM = 1 + NUM_SHIPS_BINS + MAX_PLANETS
+ACTION_DIM = NUM_ACTIONS + MAX_PLANETS
 
 
 def _set_action(action_np, src_idx, ships_bin, target_idx, launch=1.0):
-    action_np[src_idx, 0] = launch
-    action_np[src_idx, 1 + ships_bin] = 1.0
-    action_np[src_idx, 1 + NUM_SHIPS_BINS + target_idx] = 1.0
+    action_idx = (1 + ships_bin) if launch >= 0.5 else 0
+    action_np[src_idx, action_idx] = 1.0
+    action_np[src_idx, NUM_ACTIONS + target_idx] = 1.0
 
 
 class FakePlanet:

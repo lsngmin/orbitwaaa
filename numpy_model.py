@@ -17,7 +17,9 @@ FLEET_FEAT_DIM         = 7
 # ships head: surplus fraction Categorical
 SHIPS_SURPLUS_BINS     = (0.0, 0.33, 0.66, 1.0)
 NUM_SHIPS_BINS         = len(SHIPS_SURPLUS_BINS)
-ACTION_DIM             = 1 + NUM_SHIPS_BINS + MAX_PLANETS   # 1 + 4 + 44 = 49
+# 5-way action: idx 0 = skip, 1..K = bin (k-1). 학습 head 와 동기.
+NUM_ACTIONS            = 1 + NUM_SHIPS_BINS
+ACTION_DIM             = NUM_ACTIONS + MAX_PLANETS          # 5 + 44 = 49
 PLANET_TEMPORAL_LAYERS = 2
 FLEET_TEMPORAL_LAYERS  = 1
 FLEET_TEMPORAL         = True
@@ -173,30 +175,28 @@ def get_action(obs_flat, w):
     obs_flat : (1, obs_dim) float32 numpy array
     returns  : (MAX_PLANETS, ACTION_DIM) float32 numpy array
 
-    Layout: [launch(1), ships_bin_onehot(K), target_onehot(P)]
+    Layout: [action_5way(NUM_ACTIONS), target_onehot(P)]
+      action_5way idx 0 = skip, idx 1..K = bin (k-1).
     """
     logits = forward(obs_flat, w)[0]   # (P, ACTION_DIM)
 
-    # Launch: Bernoulli
-    launch = (np.random.random(MAX_PLANETS) < _sigmoid(logits[:, 0])).astype(np.float32)
-
-    # Ships bin: Categorical over K bins
-    ships_bin = np.array([
-        _sample_categorical(logits[i, 1:1 + NUM_SHIPS_BINS])
+    # 5-way action: Categorical over (skip + K bins)
+    a_idx = np.array([
+        _sample_categorical(logits[i, :NUM_ACTIONS])
         for i in range(MAX_PLANETS)
     ])
-    ships_oh = np.zeros((MAX_PLANETS, NUM_SHIPS_BINS), dtype=np.float32)
-    ships_oh[np.arange(MAX_PLANETS), ships_bin] = 1.0
+    a_oh = np.zeros((MAX_PLANETS, NUM_ACTIONS), dtype=np.float32)
+    a_oh[np.arange(MAX_PLANETS), a_idx] = 1.0
 
     # Target: Categorical
     target = np.array([
-        _sample_categorical(logits[i, 1 + NUM_SHIPS_BINS:])
+        _sample_categorical(logits[i, NUM_ACTIONS:])
         for i in range(MAX_PLANETS)
     ])
     target_oh = np.zeros((MAX_PLANETS, MAX_PLANETS), dtype=np.float32)
     target_oh[np.arange(MAX_PLANETS), target] = 1.0
 
-    return np.concatenate([launch[:, None], ships_oh, target_oh], axis=-1)
+    return np.concatenate([a_oh, target_oh], axis=-1)
 
 
 # ── Weight loading ────────────────────────────────────────────────────────────

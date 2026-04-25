@@ -30,9 +30,9 @@ class TrainingLogger:
             "generation", "total_steps", "match_type",
             "policy_loss", "value_loss", "entropy_loss",
             "approx_kl", "clip_frac", "epochs_done",
-            "ent_launch", "ent_ships", "ent_target",
-            "kl_launch", "kl_ships", "kl_target",
-            "cf_launch", "cf_ships", "cf_target",
+            "ent_action", "ent_target",
+            "kl_action", "kl_target",
+            "cf_action", "cf_target",
             "mean_dense_rew", "mean_cap_bonus", "mean_terminal_rew",
             # Sprint 2: 발사 시 자원 보존 페널티 (음수 mean). all_in_penalty=0 이면 0.
             "mean_all_in_penalty",
@@ -112,8 +112,7 @@ class TrainingLogger:
         approx_kl   = kwargs.get("approx_kl", "")
         clip_frac   = kwargs.get("clip_frac", "")
         epochs_done = kwargs.get("epochs_done", "")
-        ent_launch  = kwargs.get("ent_launch", "")
-        ent_ships   = kwargs.get("ent_ships", "")
+        ent_action  = kwargs.get("ent_action", "")
         ent_target  = kwargs.get("ent_target", "")
         mean_dense  = kwargs.get("mean_dense_rew", "")
         mean_cap    = kwargs.get("mean_cap_bonus", "")
@@ -127,16 +126,14 @@ class TrainingLogger:
         mean_filtered_zero    = kwargs.get("mean_filtered_zero_ships", "")
         mean_filtered_sun     = kwargs.get("mean_filtered_sun", "")
         mean_filtered_path    = kwargs.get("mean_filtered_path", "")
-        kl_l = kwargs.get("kl_launch", "")
-        kl_s = kwargs.get("kl_ships", "")
+        kl_a = kwargs.get("kl_action", "")
         kl_t = kwargs.get("kl_target", "")
-        cf_l = kwargs.get("cf_launch", "")
-        cf_s = kwargs.get("cf_ships", "")
+        cf_a = kwargs.get("cf_action", "")
         cf_t = kwargs.get("cf_target", "")
         kl_str  = (f" | kl={approx_kl:.4f} | cf={clip_frac:.3f}"
                    f" | ep={epochs_done}") if _is_num(approx_kl) else ""
-        ent_str = (f" | el={ent_launch:.2f} | es={ent_ships:.2f} | et={ent_target:.2f}"
-                   ) if _is_num(ent_launch) else ""
+        ent_str = (f" | ea={ent_action:.2f} | et={ent_target:.2f}"
+                   ) if _is_num(ent_action) else ""
         # aip = all-in penalty (Sprint 2). osp = over-send penalty (다중 source 협조).
         # 둘 다 0 이면 비활성. 음수로 찍힘.
         aip_str = f" | aip={mean_aip:+.4f}" if _is_num(mean_aip) else ""
@@ -144,9 +141,9 @@ class TrainingLogger:
         rew_str = (f" | dr={mean_dense:+.4f} | cb={mean_cap:+.4f} | tr={mean_term:+.4f}"
                    f"{aip_str}{osp_str}"
                    ) if _is_num(mean_dense) else ""
-        head_str = (f" | klh=[{kl_l:.3f}/{kl_s:.3f}/{kl_t:.3f}]"
-                    f" | cfh=[{cf_l:.2f}/{cf_s:.2f}/{cf_t:.2f}]"
-                    ) if _is_num(kl_l) else ""
+        head_str = (f" | klh=[{kl_a:.3f}/{kl_t:.3f}]"
+                    f" | cfh=[{cf_a:.2f}/{cf_t:.2f}]"
+                    ) if _is_num(kl_a) else ""
         decode_str = (
             f" | dec=[a={mean_attempts:.2f}/l={mean_launched:.2f}/r={launch_rate:.0%}"
             f"/inv={mean_filtered_invalid:.2f}/z={mean_filtered_zero:.2f}/sun={mean_filtered_sun:.2f}"
