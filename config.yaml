@@ -41,7 +41,7 @@ training:
   # required 를 초과한 만큼 함선당 패널티. 독립 head sample 의 over-send 협조 실패를
   # reward 차원에서 억제 (encoder attention 만으로는 sample correlation 이 안 잡힘).
   # 0 이면 비활성. 시작값은 작게 (0.0005~0.002 권장 — all_in_penalty 와 같은 스케일).
-  over_send_penalty: 0.0
+  over_send_penalty: 0.002
   state_score_ship_weight: 0.1    # timeout 승자 판정(total ships)에 더 가깝게 정렬
   state_score_prod_weight: 0.5    # 생산력은 ships로 이어지는 간접 힌트만 유지
   state_score_planet_weight: 0.5  # planet_count 편향 완화 (기존 2.0에서 축소)
