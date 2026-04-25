@@ -32,9 +32,8 @@ NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
-PLANET_DIM      = 23  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
+PLANET_DIM      = 21  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
                       # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
-                      # +2: source_enemy_pressure_norm, source_nearest_enemy_eta_norm (own planets only)
 FLEET_DIM       = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
 FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 

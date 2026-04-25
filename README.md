@@ -55,7 +55,7 @@ orbitwaaa/
   - `HISTORY = 20`
   - `MAX_PLANETS = 40`
   - `MAX_FLEETS = 100`
-  - `PLANET_DIM = 23`
+  - `PLANET_DIM = 21`
   - `FLEET_DIM = 8`  (마지막 dim = `from_planet_idx`, -1 sentinel)
 
 ## Encoder
@@ -81,10 +81,6 @@ orbitwaaa/
 - `required_to_capture_norm`
 - `best_src_ships_norm`
 - `feasibility_ratio`
-
-4. source-side 방어 정보
-- `source_enemy_pressure_norm`
-- `source_nearest_enemy_eta_norm`
 
 의도는 전략을 직접 주입하는 게 아니라, **정책이 판단할 원시 사실을 계산해서 제공**하는 것이다.
 

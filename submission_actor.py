@@ -34,7 +34,7 @@ NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS            = ENV["max_planets"]
 MAX_FLEETS             = ENV["max_fleets"]
-PLANET_DIM             = 23   # submission_features 와 동기화 (+2: source defensive)
+PLANET_DIM             = 21   # submission_features 와 동기화
 FLEET_DIM              = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
 FLEET_FEAT_DIM         = 7
 
