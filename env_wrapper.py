@@ -469,11 +469,12 @@ class OrbitWarsEnv(gym.Env):
         return self._build_tensor(), {}
 
     def step(self, action):
-        from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+        from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
         from prediction import aim, crosses_sun, resolve_ships_for_capture
 
         raw_planets, raw_fleets, comet_ids, comets = self._current_obs()
         planets = [Planet(*p) for p in raw_planets]
+        fleets  = [Fleet(*f) for f in raw_fleets]
         raw = self._get_obs_raw()
         av  = raw.get("angular_velocity", 0) if isinstance(raw, dict) else getattr(raw, "angular_velocity", 0)
         self._av = av
@@ -508,8 +509,10 @@ class OrbitWarsEnv(gym.Env):
             multiplier = float(SHIPS_MULTIPLIER_BINS[ships_bin])
 
             # 고정점 반복으로 (ships_needed, required) 동시 해결 (commit 3).
+            # 동적: in-flight fleet 효과를 ETA forward sim 으로 반영.
             ships_needed, angle, tx, ty, _, _, _ = resolve_ships_for_capture(
                 p, target, av, multiplier, p.ships,
+                fleets=fleets, planets=planets,
             )
             if ships_needed <= 0:
                 continue

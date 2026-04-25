@@ -35,7 +35,10 @@ from env_wrapper import (
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
     SHIPS_MULTIPLIER_BINS, NUM_SHIPS_BINS,
 )
-from prediction import aim, crosses_sun, first_collision_on_path, PositionCache, resolve_ships_for_capture
+from prediction import (
+    aim, crosses_sun, first_collision_on_path, PositionCache,
+    resolve_ships_for_capture, project_target_at_eta,
+)
 
 with open("config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -213,11 +216,12 @@ class ActionSpace:
                                   (decode는 actual ships로 별도 viability 재확인)
     """
 
-    __slots__ = ("planets", "pos_cache", "launch_mask", "target_mask",
+    __slots__ = ("planets", "fleets", "pos_cache", "launch_mask", "target_mask",
                  "av", "acting_player")
 
-    def __init__(self, planets, pos_cache, launch_mask, target_mask, av, acting_player):
+    def __init__(self, planets, fleets, pos_cache, launch_mask, target_mask, av, acting_player):
         self.planets       = planets
+        self.fleets        = fleets
         self.pos_cache     = pos_cache
         self.launch_mask   = launch_mask
         self.target_mask   = target_mask
@@ -225,7 +229,7 @@ class ActionSpace:
         self.acting_player = acting_player
 
 
-def analyze_action_space(raw_planets, av, acting_player):
+def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
     """공통 분석 1회 + masks 생성.
 
     재사용 의도:
@@ -234,8 +238,14 @@ def analyze_action_space(raw_planets, av, acting_player):
 
     viability는 ships_rep=src.ships(최대값, permissive)로 평가.
     decode는 actual ships_needed로 fcop를 다시 호출 (속도가 다르면 path도 다름).
+
+    동적 mask (Guard A):
+      - in-flight fleet 효과를 ETA 까지 시뮬해 도착 시점 owner 가 acting_player 면
+        target 에서 제외 (이미 내 거 될 예정 → 추가 launch 무의미).
+        repeat 발사 / 같은 target 중복 commit 을 mask 차원에서 차단.
     """
     planets      = [Planet(*p) for p in raw_planets[:MAX_PLANETS]]
+    fleets       = [Fleet(*f)  for f in raw_fleets]
     pos_cache    = PositionCache(planets, av)
     launch_mask  = torch.zeros(MAX_PLANETS, dtype=torch.bool)
     target_mask  = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
@@ -255,8 +265,16 @@ def analyze_action_space(raw_planets, av, acting_player):
                 src, angle, ships_rep, planets, av, max_turns=max_turns,
                 pos_cache=pos_cache,
             )
-            if cause == "planet" and hit_pid == tgt.id:
-                target_mask[i, j] = True
+            if cause != "planet" or hit_pid != tgt.id:
+                continue
+            # Guard A: 도착 시점에 이미 내 행성이 될 예정이면 mask off
+            eff_turns = turns if turns else 1
+            proj_owner, _proj_ships = project_target_at_eta(
+                tgt, eff_turns, planets, fleets,
+            )
+            if proj_owner == acting_player:
+                continue
+            target_mask[i, j] = True
 
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
@@ -270,16 +288,16 @@ def analyze_action_space(raw_planets, av, acting_player):
         if not target_mask[i].any():
             target_mask[i, i] = True
 
-    return ActionSpace(planets, pos_cache, launch_mask, target_mask, av, acting_player)
+    return ActionSpace(planets, fleets, pos_cache, launch_mask, target_mask, av, acting_player)
 
 
-def build_action_masks(raw_planets, av, acting_player):
+def build_action_masks(raw_planets, raw_fleets, av, acting_player):
     """Backward-compat 래퍼: analyze_action_space의 (launch_mask, target_mask)만 노출.
 
     신규 코드는 analyze_action_space를 직접 사용하고 ActionSpace를
     decode_action_to_moves에 그대로 넘겨 planets/pos_cache 재사용 권장.
     """
-    a = analyze_action_space(raw_planets, av, acting_player)
+    a = analyze_action_space(raw_planets, raw_fleets, av, acting_player)
     return a.launch_mask, a.target_mask
 
 
@@ -356,8 +374,11 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         # 고정점 반복으로 (ships_needed, required) 동시 해결.
         # 과거 1-pass 근사(p.ships로 turns 추정)는 느린 함대의 추가 production을
         # 과소평가해 bin=1.10x가 상습 under-invested였음 → commit 3에서 수정.
+        # 동적: fleets/planets 전달 시 in-flight 효과를 ETA forward sim 으로 반영.
         ships_needed, angle, tx, ty, turns, required, _ = resolve_ships_for_capture(
             p, target, av, multiplier, p.ships, pos_cache=pos_cache,
+            fleets=(analysis.fleets if analysis is not None else None),
+            planets=(planets if analysis is not None else None),
         )
         if ships_needed <= 0:
             counts["filtered_zero_ships"] += 1
@@ -430,11 +451,11 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     return moves
 
 
-def _opp_moves(opponent_model, obs_tensor, raw_planets, av, device):
+def _opp_moves(opponent_model, obs_tensor, raw_planets, raw_fleets, av, device):
     """상대(player 1) 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
     if opponent_model is None:
         return []
-    analysis = analyze_action_space(raw_planets, av, acting_player=1)
+    analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=1)
     with torch.no_grad():
         action, *_ = opponent_model.get_action_and_value(
             obs_tensor.unsqueeze(0).to(device),
@@ -467,7 +488,7 @@ def get_obs_tensor(raw_obs, player, history_p, history_f):
     p_hist = np.stack(list(history_p), axis=0)
     f_hist = np.stack(list(history_f), axis=0)
     flat   = np.concatenate([p_hist.flatten(), f_hist.flatten()]).astype(np.float32)
-    return torch.from_numpy(flat), raw_planets, av
+    return torch.from_numpy(flat), raw_planets, raw_fleets, av
 
 
 # ── 단일 env rollout (CPU/GPU 모두 지원) ─────────────────────────────────────
@@ -509,9 +530,9 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         ep_done = False
         while not ep_done:
             raw_obs_main = env.state[0].observation
-            obs_t, raw_planets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
+            obs_t, raw_planets, raw_fleets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
-            analysis = analyze_action_space(raw_planets, av, acting_player=0)
+            analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=0)
             launch_mask, target_mask = analysis.launch_mask, analysis.target_mask
             with torch.no_grad():
                 action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
@@ -527,8 +548,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             hit_tracker.record(decode_counts)
 
             raw_obs_opp = env.state[1].observation
-            obs_opp, raw_planets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
-            moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, av_opp, device)
+            obs_opp, raw_planets_opp, raw_fleets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
+            moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, raw_fleets_opp, av_opp, device)
 
             # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
             prev_map      = _snapshot_planet_owners(env.state[0].observation)
@@ -940,8 +961,8 @@ def evaluate(main_model, opponent_model, n_games=20):
 
         while not env.done:
             raw_main = env.state[0].observation
-            obs_t, raw_p, av = get_obs_tensor(raw_main, 0, history_p, history_f)
-            analysis_e = analyze_action_space(raw_p, av, acting_player=0)
+            obs_t, raw_p, raw_f, av = get_obs_tensor(raw_main, 0, history_p, history_f)
+            analysis_e = analyze_action_space(raw_p, raw_f, av, acting_player=0)
             with torch.no_grad():
                 action_t, _, _, _ = main_model.get_action_and_value(
                     obs_t.unsqueeze(0).to(DEVICE),
@@ -969,8 +990,8 @@ def evaluate(main_model, opponent_model, n_games=20):
                     game_enemy_l += 1
 
             raw_opp = env.state[1].observation
-            obs_o, raw_po, avo = get_obs_tensor(raw_opp, 1, history_p_opp, history_f_opp)
-            moves_opp = _opp_moves(opponent_model, obs_o, raw_po, avo, DEVICE)
+            obs_o, raw_po, raw_fo, avo = get_obs_tensor(raw_opp, 1, history_p_opp, history_f_opp)
+            moves_opp = _opp_moves(opponent_model, obs_o, raw_po, raw_fo, avo, DEVICE)
 
             env.step([moves_main, moves_opp])
 
@@ -1033,8 +1054,8 @@ def _run_eval_game(p0_model, p1_model, tracker):
 
     while not env.done:
         raw_obs_p0 = env.state[0].observation
-        obs_t, raw_p, av = get_obs_tensor(raw_obs_p0, 0, history_p, history_f)
-        analysis = analyze_action_space(raw_p, av, acting_player=0)
+        obs_t, raw_p, raw_f, av = get_obs_tensor(raw_obs_p0, 0, history_p, history_f)
+        analysis = analyze_action_space(raw_p, raw_f, av, acting_player=0)
         with torch.no_grad():
             action_t, _, _, _ = p0_model.get_action_and_value(
                 obs_t.unsqueeze(0).to(DEVICE),
@@ -1056,8 +1077,8 @@ def _run_eval_game(p0_model, p1_model, tracker):
                 game_enemy_l += 1
 
         raw_obs_p1 = env.state[1].observation
-        obs_o, raw_po, avo = get_obs_tensor(raw_obs_p1, 1, history_p_opp, history_f_opp)
-        moves_p1 = _opp_moves(p1_model, obs_o, raw_po, avo, DEVICE)
+        obs_o, raw_po, raw_fo, avo = get_obs_tensor(raw_obs_p1, 1, history_p_opp, history_f_opp)
+        moves_p1 = _opp_moves(p1_model, obs_o, raw_po, raw_fo, avo, DEVICE)
 
         prev_obs_snap = _snapshot_obs_for_resolve(raw_obs_p0)
         tracker.register_launches(launches, prev_obs_snap["next_fleet_id"])

@@ -197,7 +197,7 @@ def agent(obs):
     with torch.no_grad():
         action_logits = model(obs_t).cpu()               # (1, P, ACTION_DIM)
 
-    analysis = analyze_action_space(raw_planets, av, acting_player=player)
+    analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=player)
     action_np = _sample_action(action_logits, analysis)
     moves = decode_action_to_moves(
         action_np, raw_planets, av, acting_player=player, analysis=analysis
