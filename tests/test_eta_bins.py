@@ -139,6 +139,36 @@ def test_orbit_velocity_features_zero_for_static_planet():
     assert arr[0, 10] == pytest.approx(0.0)
 
 
+def test_is_orbiting_flag_off_for_comet_regardless_of_distance():
+    """comet 은 sun 거리가 perihelion/aphelion 사이에서 변동 → is_orbiting (idx 7)
+    이 깜빡이지 않도록 comet 이면 강제 0.
+
+    회귀: idx 7 의 의미를 "ω 로 회전 중인 일반 행성" 으로 고정.
+    is_comet (idx 8) 이 comet 정체성을 안정적으로 알린다.
+    """
+    # 같은 comet 이 두 위치 (sun 가까이 / 멀리) 에 있을 때 둘 다 idx 7 = 0 이어야 함.
+    near_sun = make_planet(7, owner=-1, x=55.0, y=50.0, radius=3.0)   # is_orbiting==True 인 거리
+    far_sun  = make_planet(8, owner=-1, x=95.0, y=50.0, radius=3.0)   # is_orbiting==False 인 거리
+
+    arr = encode_planets(
+        [near_sun, far_sun], [], player=PLAYER,
+        comet_ids={7, 8}, angular_velocity=0.0,
+    )
+    # idx 7 = is_orbiting, idx 8 = is_comet
+    assert arr[0, 7] == 0.0, "comet (sun 가까이) 는 is_orbiting=0 이어야 함"
+    assert arr[1, 7] == 0.0, "comet (sun 멀리) 는 is_orbiting=0 이어야 함"
+    assert arr[0, 8] == 1.0
+    assert arr[1, 8] == 1.0
+
+
+def test_is_orbiting_flag_on_for_non_comet_orbiting_planet():
+    """일반 (non-comet) 회전 행성은 idx 7 = 1 (sanity)."""
+    p = make_planet(0, owner=PLAYER, x=70.0, y=50.0, radius=4.0)
+    arr = encode_planets([p], [], player=PLAYER, comet_ids=set(), angular_velocity=0.05)
+    assert arr[0, 7] == 1.0
+    assert arr[0, 8] == 0.0
+
+
 def test_comet_velocity_zero_when_no_path_data():
     """comet 인데 `comets` 인자가 비어있으면 (= path 미상) velocity 0 fallback.
 

@@ -142,8 +142,11 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
 
     arr = np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)
     for i, p in enumerate(planets[:MAX_PLANETS]):
-        orbiting = is_orbiting(p)
         is_comet = (p.id in comet_ids)
+        # comet 의 타원 궤도는 sun 거리가 변동 → is_orbiting 이 깜빡임.
+        # encoder feature 차원에선 "ω 로 회전 중인 일반 행성" 만 1 로 둔다.
+        # (env_wrapper 와 parity)
+        orbiting = is_orbiting(p) and not is_comet
         owner_me = 1.0 if p.owner == player else 0.0
         owner_enemy = 1.0 if p.owner not in (-1, player) else 0.0
         owner_neutral = 1.0 if p.owner == -1 else 0.0

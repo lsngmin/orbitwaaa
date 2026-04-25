@@ -200,8 +200,11 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
 
     arr = np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)
     for i, p in enumerate(planets[:MAX_PLANETS]):
-        orbiting      = is_orbiting(p)
         is_comet      = (p.id in comet_ids)
+        # is_orbiting 은 sun 거리 < 50 인 기하학적 사실. comet 은 타원 궤도라
+        # perihelion/aphelion 사이에서 같은 행성이 0/1 깜빡임 → token feature
+        # noise. 의미상 "ω 로 회전 중인 일반 행성" 만 1 로 두려고 comet 을 제외.
+        orbiting      = is_orbiting(p) and not is_comet
         owner_me      = 1.0 if p.owner == player else 0.0
         owner_enemy   = 1.0 if p.owner not in (-1, player) else 0.0
         owner_neutral = 1.0 if p.owner == -1 else 0.0
