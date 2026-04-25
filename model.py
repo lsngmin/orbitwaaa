@@ -32,8 +32,7 @@ NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
-PLANET_DIM      = 21  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
-                      # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
+PLANET_DIM      = 15
 FLEET_DIM       = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
 FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 
@@ -51,10 +50,21 @@ def make_transformer(layers):
         d_model=EMBED_DIM,
         nhead=NUM_HEADS,
         dim_feedforward=EMBED_DIM * 4,
-        dropout=0.1,
+        dropout=0.0,
         batch_first=True,
     )
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
+
+
+def _safe_pad_mask(pad_mask):
+    """src_key_padding_mask 안전화: 시퀀스 전체가 padding 인 경우 NaN 회피.
+
+    nn.MultiheadAttention 는 모든 key 가 masked 면 softmax NaN. 빈 행성/슬롯은
+    어차피 다운스트림에서 valid mask 로 무시되므로, all-masked 행은 mask 를
+    전부 False 로 덮어 attention 출력을 0-input 그대로 통과시킨다.
+    """
+    fully = pad_mask.all(dim=-1, keepdim=True)
+    return pad_mask & ~fully
 
 
 class OrbitWarsPolicy(nn.Module):
@@ -145,6 +155,14 @@ class OrbitWarsPolicy(nn.Module):
         f_features = f_raw[..., :FLEET_FEAT_DIM]                # (B, H, F, 7)
         fp_idx_raw = f_raw[:, -1, :, -1]                        # (B, F) — 현재 step idx
 
+        # --- Padding masks ---
+        # planet: zero-row 면 빈 슬롯 (raw feature 합 == 0 으로 검출)
+        # fleet : 마지막 dim(idx) 가 -1 이면 빈/유령 슬롯
+        planet_pad_h = (p_raw.abs().sum(dim=-1) == 0)            # (B, H, P)
+        fleet_pad_h  = (f_raw[..., -1] < 0)                      # (B, H, F)
+        planet_pad_now = planet_pad_h[:, -1, :]                  # (B, P)
+        fleet_pad_now  = fleet_pad_h[:, -1, :]                   # (B, F)
+
         # --- 임베딩 ---
         p_emb = self.planet_embed(p_raw)       # (B, H, P, E)
         f_emb = self.fleet_embed(f_features)   # (B, H, F, E)
@@ -156,7 +174,8 @@ class OrbitWarsPolicy(nn.Module):
         p_pos = self.planet_temporal_pos(t_idx)
         p_t   = p_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_PLANETS, HISTORY, EMBED_DIM)
         p_t   = p_t + p_pos.unsqueeze(0)
-        p_t   = self.planet_temporal_attn(p_t)
+        p_pad_seq = planet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_PLANETS, HISTORY)
+        p_t   = self.planet_temporal_attn(p_t, src_key_padding_mask=_safe_pad_mask(p_pad_seq))
         p_t   = p_t[:, -1, :].view(B, MAX_PLANETS, EMBED_DIM)
 
         # fleet: ablation A=temporal encoding, ablation B=current-step only
@@ -164,7 +183,8 @@ class OrbitWarsPolicy(nn.Module):
             f_pos = self.fleet_temporal_pos(t_idx)
             f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
             f_t   = f_t + f_pos.unsqueeze(0)
-            f_t   = self.fleet_temporal_attn(f_t)
+            f_pad_seq = fleet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_FLEETS, HISTORY)
+            f_t   = self.fleet_temporal_attn(f_t, src_key_padding_mask=_safe_pad_mask(f_pad_seq))
             f_t   = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
         else:
             # current-step fleet embedding만 사용 (마지막 턴)
@@ -174,12 +194,13 @@ class OrbitWarsPolicy(nn.Module):
         f_t = self._fleet_source_fuse(f_t, p_t, fp_idx_raw)
 
         # --- 2. Local Attention (fleet ↔ 행성) ---
-        local_tokens = torch.cat([p_t, f_t], dim=1)  # (B, P+F, E)
-        local_out    = self.local_attn(local_tokens)  # (B, P+F, E)
+        local_tokens = torch.cat([p_t, f_t], dim=1)               # (B, P+F, E)
+        local_pad    = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
+        local_out    = self.local_attn(local_tokens, src_key_padding_mask=_safe_pad_mask(local_pad))
         p_local = local_out[:, :MAX_PLANETS, :]       # (B, P, E)
 
         # --- 3. Global Attention ---
-        global_out = self.global_attn(p_local)        # (B, P, E)
+        global_out = self.global_attn(p_local, src_key_padding_mask=_safe_pad_mask(planet_pad_now))
 
         # --- Actor ---
         action_logits = self.actor(global_out)         # (B, P, ACTION_DIM)

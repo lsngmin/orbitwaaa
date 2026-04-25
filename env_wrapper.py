@@ -26,8 +26,7 @@ TRAIN_CONFIG = CONFIG["training"]
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
-PLANET_DIM   = 21  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
-                   # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
+PLANET_DIM   = 15
 FLEET_DIM      = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid/empty)
 FLEET_FEAT_DIM = 7   # fleet_embed 입력 dim (idx 제외)
 
@@ -40,14 +39,119 @@ ETA_NEAR = 5   # 1~5턴: 즉각 위협
 ETA_MID  = 15  # 6~15턴: 중기 계획
 
 
-def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=0.0):
-    """행성 목록을 (MAX_PLANETS, PLANET_DIM) 배열로 인코딩."""
+def new_fleet_slot_state():
+    """Fleet 슬롯 안정화용 상태 컨테이너.
+
+    fleet_id → 고정 슬롯 매핑을 유지해 temporal attention 이 같은 슬롯에서
+    같은 fleet 의 시간 궤적을 보게 한다. 함대 파괴 시 슬롯 회수, 새 fleet 에
+    빈 슬롯 재할당.
+    """
+    return {
+        "fleet_to_slot": {},
+        "free_slots": list(range(MAX_FLEETS)),
+    }
+
+
+def update_fleet_slots(fleets, slot_state):
+    """slot_state 를 in-place 갱신. 살아있는 fleet 에 안정 슬롯 부여.
+
+    Args:
+      fleets:     Fleet namedtuple 리스트 (env raw fleets 변환 후)
+      slot_state: new_fleet_slot_state() 로 생성한 dict (mutated)
+    Returns:
+      fid_to_slot:     {fleet_id: slot_idx} (살아있는 fleet 만)
+      newly_allocated: set[slot_idx] — 이번 턴에 새로 배정된 슬롯
+                       (caller 가 history deque 의 해당 슬롯 과거 데이터를
+                        zero 로 클리어해야 ghost trajectory 학습을 막음)
+    """
+    fleet_to_slot = slot_state["fleet_to_slot"]
+    free_slots    = slot_state["free_slots"]
+
+    alive_ids = {f.id for f in fleets}
+
+    # 죽은 fleet 의 슬롯 회수
+    dead_ids = set(fleet_to_slot.keys()) - alive_ids
+    for fid in dead_ids:
+        slot = fleet_to_slot.pop(fid)
+        free_slots.append(slot)
+    free_slots.sort()  # 결정론적 할당
+
+    fid_to_slot      = {}
+    newly_allocated  = set()
+    for f in fleets:
+        if f.id in fleet_to_slot:
+            fid_to_slot[f.id] = fleet_to_slot[f.id]
+            continue
+        if not free_slots:
+            continue   # MAX_FLEETS 초과 — 무시 (cap 제한)
+        slot = free_slots.pop(0)
+        fleet_to_slot[f.id] = slot
+        fid_to_slot[f.id]   = slot
+        newly_allocated.add(slot)
+
+    return fid_to_slot, newly_allocated
+
+
+def clear_fleet_history_at_slots(fleet_history, slots):
+    """deque 내 모든 과거 turn 의 지정 슬롯을 빈-슬롯 sentinel 로 리셋.
+
+    새 fleet 이 이전에 다른 fleet 이 쓰던 슬롯을 받을 때, 그 슬롯의 과거 데이터는
+    완전히 다른 fleet 의 궤적이라 ghost noise. zero+sentinel 로 덮어 써서 padding
+    mask 가 attention 에서 제외할 수 있게 한다.
+    """
+    if not slots:
+        return
+    for arr in fleet_history:
+        for slot in slots:
+            arr[slot] = 0.0
+            arr[slot, -1] = -1.0   # from_planet_idx sentinel
+
+
+def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
+                   angular_velocity=0.0):
+    """행성 목록을 (MAX_PLANETS, PLANET_DIM) 배열로 인코딩.
+
+    velocity feature (idx 9,10):
+      - 일반 orbiting 행성: `(vx, vy) = (-ω*(y-50), +ω*(x-50))` — 원형 접선 속도,
+        `vel_scale = max(1, 50*|ω|)` 로 정규화
+      - **comet (PR3)**: 엔진의 사전 계산된 `paths[i]` 의 다음 step 변위로 실제
+        속도를 산출 (`comet_speed=4.0` 단위/턴 등속). `MAX_SPEED=6.0` 정규화 후
+        clip [-1, 1]. 마지막 path 인덱스 (다음 턴 만료) 또는 path 데이터 부재 시 0.
+      - 그 외 정적 행성: 0
+
+    `comets` (optional): `obs.comets` — list of groups,
+      group = `{"planet_ids": [...], "paths": [path0, ...], "path_index": int}`,
+      `paths[i][path_index]` 가 i-번째 planet_id 의 현재 위치 `[x, y]`.
+      None / [] 이면 comet velocity 는 0 (fallback — 학습 obs 에선 항상 채워짐).
+    """
     from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
-    from prediction import is_orbiting, estimate_arrival_turn, predict_position, crosses_sun, sun_approach_distance
+    from prediction import CENTER_X, CENTER_Y, MAX_SPEED, is_orbiting, estimate_arrival_turn
 
     planets    = [Planet(*p) for p in raw_planets]
     fleets     = [Fleet(*f) for f in raw_fleets]
-    my_planets = [p for p in planets if p.owner == player]
+    vel_scale  = max(1.0, 50.0 * abs(float(angular_velocity)))
+
+    # ── Comet velocity map: pid → (vx, vy) ──────────────────────────────────
+    # 엔진은 paths 를 comet_speed (=4.0) arc-length 간격으로 샘플하므로
+    # paths[i][idx+1] - paths[i][idx] = 다음 턴 변위 = 현재 턴 속도 벡터.
+    # path_index 가 마지막 인덱스면 다음 턴 expire — 0 으로 둔다.
+    comet_vel = {}
+    if comets:
+        for group in comets:
+            pids   = group.get("planet_ids", []) if isinstance(group, dict) else getattr(group, "planet_ids", [])
+            paths  = group.get("paths", [])      if isinstance(group, dict) else getattr(group, "paths", [])
+            idx    = group.get("path_index", -1) if isinstance(group, dict) else getattr(group, "path_index", -1)
+            if idx < 0:
+                continue
+            for j, pid in enumerate(pids):
+                if j >= len(paths):
+                    continue
+                p_path = paths[j]
+                if idx + 1 >= len(p_path):
+                    continue   # 다음 턴 expire → velocity 0
+                cur = p_path[idx]
+                nxt = p_path[idx + 1]
+                comet_vel[pid] = (float(nxt[0] - cur[0]), float(nxt[1] - cur[1]))
 
     # 행성별 ETA bin 집계: near(1~5턴) / mid(6~15턴)
     enemy_near = {p.id: 0 for p in planets}
@@ -95,62 +199,23 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
 
     arr = np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)
     for i, p in enumerate(planets[:MAX_PLANETS]):
+        orbiting      = is_orbiting(p)
+        is_comet      = (p.id in comet_ids)
         owner_me      = 1.0 if p.owner == player else 0.0
         owner_enemy   = 1.0 if p.owner not in (-1, player) else 0.0
         owner_neutral = 1.0 if p.owner == -1 else 0.0
-
-        # ETA feature: 내 행성 중 가장 가까운 곳에서 이 행성까지의 최소 ETA
-        # 자기 자신은 스킵 (공격 대상이 아님 → 거리 0이면 feature 무의미)
-        # same-source bundle: best_src는 min_eta를 달성한 바로 그 행성
-        min_eta  = 50.0
-        best_src = None
-        if my_planets:
-            for src in my_planets:
-                if src.id == p.id:
-                    continue
-                dist = math.hypot(p.x - src.x, p.y - src.y)
-                eta_to = estimate_arrival_turn(dist, 50)  # 50 ships 기준 근사
-                if eta_to < min_eta:
-                    min_eta  = float(eta_to)
-                    best_src = src
-        min_eta_norm = min(min_eta / 50.0, 1.0)
-
-        # 예상 도착 위치: min_eta 턴 후 이 행성의 위치
-        pred_x, pred_y = predict_position(p, angular_velocity, int(min_eta))
-
-        # 태양 위험도: 내 행성 → 이 행성 경로 기준 (자기 자신은 스킵)
-        sun_block = 0.0
-        sun_dist_min = 50.0
-        if my_planets:
-            for src in my_planets:
-                if src.id == p.id:
-                    continue
-                sd = sun_approach_distance(src.x, src.y, pred_x, pred_y)
-                if sd < sun_dist_min:
-                    sun_dist_min = sd
-                if crosses_sun(src.x, src.y, pred_x, pred_y):
-                    sun_block = 1.0
-        sun_dist_norm = min(sun_dist_min / 50.0, 1.0)
-
-        # ── Target feasibility bundle (same best_src 기준) ──────────────────
-        # F20: 가장 가까운 아군의 ships — 공격 탄약(적/중립) 또는 증원 원천(자기)
-        # F19: required to capture — 적/중립만 (자기 행성은 0)
-        # F21: feasibility = best_src.ships / required — 적/중립만 (자기 행성은 0)
-        # 철학: raw fact만 제공, 전략 prescription 없음. own=0은 owner_me 플래그와 결합.
-        if best_src is not None:
-            best_src_ships_norm = min(best_src.ships / 1000.0, 1.0)
+        if is_comet:
+            cvx, cvy = comet_vel.get(p.id, (0.0, 0.0))
+            vx_norm = float(np.clip(cvx / MAX_SPEED, -1.0, 1.0))
+            vy_norm = float(np.clip(cvy / MAX_SPEED, -1.0, 1.0))
+        elif orbiting:
+            vx = -float(angular_velocity) * (p.y - CENTER_Y)
+            vy =  float(angular_velocity) * (p.x - CENTER_X)
+            vx_norm = float(np.clip(vx / vel_scale, -1.0, 1.0))
+            vy_norm = float(np.clip(vy / vel_scale, -1.0, 1.0))
         else:
-            best_src_ships_norm = 0.0
-
-        is_attackable = (p.owner != player) and (best_src is not None)
-        if is_attackable:
-            required         = p.ships + p.production * min_eta + 1
-            required_norm    = min(required / 1000.0, 1.0)
-            feasibility      = best_src.ships / max(required, 1.0)
-            feasibility_norm = min(feasibility / 4.0, 1.0)
-        else:
-            required_norm    = 0.0
-            feasibility_norm = 0.0
+            vx_norm = 0.0
+            vy_norm = 0.0
 
         arr[i] = [
             p.x / 100.0,
@@ -160,34 +225,44 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
             owner_neutral,
             min(p.ships / 1000.0, 1.0),
             p.production / 5.0,
-            1.0 if is_orbiting(p) else 0.0,
-            1.0 if p.id in comet_ids else 0.0,
+            1.0 if orbiting else 0.0,
+            1.0 if is_comet else 0.0,
+            vx_norm,
+            vy_norm,
             min(enemy_near[p.id] / 1000.0, 1.0),
             min(enemy_mid[p.id]  / 1000.0, 1.0),
             min(mine_near[p.id]  / 1000.0, 1.0),
             min(mine_mid[p.id]   / 1000.0, 1.0),
-            # ── ETA / 궤도 ──
-            min_eta_norm,
-            pred_x / 100.0,
-            pred_y / 100.0,
-            # ── 태양 위험도 ──
-            sun_block,
-            sun_dist_norm,
-            # ── Target feasibility (same best_src) ──
-            required_norm,
-            best_src_ships_norm,
-            feasibility_norm,
         ]
     return arr
 
 
-def encode_fleets(raw_fleets, raw_planets, player):
+def encode_fleets(raw_fleets, raw_planets, player, fid_to_slot=None):
     """fleet 목록을 (MAX_FLEETS, FLEET_DIM) 배열로 인코딩.
 
-    마지막 dim은 source planet 의 obs index (raw_planets[:MAX_PLANETS] 내 위치).
-    빈 슬롯/매핑 실패 시 -1 sentinel — 모델이 valid mask 로 fusion 차단.
+    feature layout (FLEET_DIM=8):
+      0,1: x, y                              — `/100` 정규화
+      2,3: vx_fleet, vy_fleet                — `fleet_speed(ships) × (cos, sin)`,
+                                               `/MAX_SPEED` 정규화로 ~`[-1,1]`
+      4:   ships                             — `min(ships/1000, 1.0)` (전투력)
+      5,6: is_mine, is_enemy                 — 0/1
+      7:   from_planet_idx                   — -1 sentinel (invalid/empty),
+                                               source-planet fusion lookup 포인터
+
+    bilinear precomputation: `speed(ships) × direction` 곱셈을 미리 풀어
+    모델이 첫 Linear 레이어에서 학습할 필요 없게 만든다 — planet vx/vy 와 같은 논리.
+    방향은 atan2(vy, vx) 로 복원 가능 (속도 0 이면 방향 정보 없음 — 빈 슬롯과 동치).
+
+    빈 슬롯/매핑 실패 시 idx -1 sentinel — 모델이 valid mask 로 fusion 차단.
+
+    fid_to_slot:
+      None  → enumerate 순서로 슬롯 할당 (stateless; 단발성 인코딩, 테스트 호환)
+      dict  → {fleet_id: slot_idx} 안정 매핑 (env wrapper / submission agent 가
+              update_fleet_slots 로 생성). 매 턴 같은 fleet 이 같은 슬롯에 들어가
+              temporal attention 이 진짜 궤적을 학습.
     """
     from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
+    from prediction import fleet_speed, MAX_SPEED
 
     fleets    = [Fleet(*f)  for f in raw_fleets]
     planets   = [Planet(*p) for p in raw_planets]
@@ -195,13 +270,24 @@ def encode_fleets(raw_fleets, raw_planets, player):
 
     arr = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
     arr[:, -1] = -1.0   # source idx sentinel (빈 슬롯)
-    for i, f in enumerate(fleets[:MAX_FLEETS]):
+    for i, f in enumerate(fleets):
+        if fid_to_slot is None:
+            if i >= MAX_FLEETS:
+                break
+            slot = i
+        else:
+            slot = fid_to_slot.get(f.id)
+            if slot is None or slot >= MAX_FLEETS:
+                continue
         src_idx = id_to_idx.get(f.from_planet_id, -1)
-        arr[i] = [
+        speed   = fleet_speed(f.ships)
+        vx      = speed * math.cos(f.angle)
+        vy      = speed * math.sin(f.angle)
+        arr[slot] = [
             f.x / 100.0,
             f.y / 100.0,
-            math.cos(f.angle),
-            math.sin(f.angle),
+            vx / MAX_SPEED,
+            vy / MAX_SPEED,
             min(f.ships / 1000.0, 1.0),
             1.0 if f.owner == player else 0.0,
             1.0 if f.owner not in (-1, player) else 0.0,
@@ -261,6 +347,7 @@ class OrbitWarsEnv(gym.Env):
         self._step   = 0
         self._planets_snapshot = []
         self._av     = 0.0
+        self._fleet_slot_state = new_fleet_slot_state()
 
     def _get_obs_raw(self):
         obs = self._env.state[self._player].observation
@@ -273,13 +360,23 @@ class OrbitWarsEnv(gym.Env):
         raw_planets = raw.get("planets", []) if isinstance(raw, dict) else getattr(raw, "planets", [])
         raw_fleets  = raw.get("fleets",  []) if isinstance(raw, dict) else getattr(raw, "fleets",  [])
         comet_ids   = set(raw.get("comet_planet_ids", []) if isinstance(raw, dict) else getattr(raw, "comet_planet_ids", []) or [])
+        comets      = raw.get("comets", []) if isinstance(raw, dict) else getattr(raw, "comets", []) or []
         self._planets_snapshot = raw_planets
-        return raw_planets, raw_fleets, comet_ids
+        return raw_planets, raw_fleets, comet_ids, comets
 
     def _build_tensor(self):
         p_hist = np.stack(list(self._planet_history), axis=0)  # (H, P, Dp)
         f_hist = np.stack(list(self._fleet_history),  axis=0)  # (H, F, Df)
         return np.concatenate([p_hist.flatten(), f_hist.flatten()]).astype(np.float32)
+
+    def _encode_fleets_stable(self, raw_fleets, raw_planets):
+        """Slot-stable fleet encoding. fleet_id → 고정 슬롯 매핑 갱신 후
+        새로 배정된 슬롯의 history 를 클리어해 ghost trajectory 를 막는다."""
+        from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
+        fleets = [Fleet(*f) for f in raw_fleets]
+        fid_to_slot, newly = update_fleet_slots(fleets, self._fleet_slot_state)
+        clear_fleet_history_at_slots(self._fleet_history, newly)
+        return encode_fleets(raw_fleets, raw_planets, self._player, fid_to_slot)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -296,14 +393,18 @@ class OrbitWarsEnv(gym.Env):
             [np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)] * HISTORY,
             maxlen=HISTORY
         )
+        # init sentinel 채우기 — zero padding 도 빈 슬롯으로 인식되도록
+        for arr in self._fleet_history:
+            arr[:, -1] = -1.0
+        self._fleet_slot_state = new_fleet_slot_state()
 
         self._av = 0.0
 
         # 첫 관측
         self._env.reset()
-        raw_planets, raw_fleets, comet_ids = self._current_obs()
-        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, self._av))
-        self._fleet_history.append(encode_fleets(raw_fleets, raw_planets, self._player))
+        raw_planets, raw_fleets, comet_ids, comets = self._current_obs()
+        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, comets, self._av))
+        self._fleet_history.append(self._encode_fleets_stable(raw_fleets, raw_planets))
 
         return self._build_tensor(), {}
 
@@ -311,7 +412,7 @@ class OrbitWarsEnv(gym.Env):
         from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
         from prediction import aim, crosses_sun, resolve_ships_for_capture
 
-        raw_planets, raw_fleets, comet_ids = self._current_obs()
+        raw_planets, raw_fleets, comet_ids, comets = self._current_obs()
         planets = [Planet(*p) for p in raw_planets]
         raw = self._get_obs_raw()
         av  = raw.get("angular_velocity", 0) if isinstance(raw, dict) else getattr(raw, "angular_velocity", 0)
@@ -363,9 +464,9 @@ class OrbitWarsEnv(gym.Env):
         self._step += 1
 
         # 새 관측
-        raw_planets, raw_fleets, comet_ids = self._current_obs()
-        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, self._av))
-        self._fleet_history.append(encode_fleets(raw_fleets, raw_planets, self._player))
+        raw_planets, raw_fleets, comet_ids, comets = self._current_obs()
+        self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, comets, self._av))
+        self._fleet_history.append(self._encode_fleets_stable(raw_fleets, raw_planets))
         obs = self._build_tensor()
 
         # 보상 및 종료

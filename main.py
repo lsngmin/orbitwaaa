@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from submission_features import (
     encode_planets, encode_fleets,
+    new_fleet_slot_state, update_fleet_slots, clear_fleet_history_at_slots,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
 )
 from submission_actor import OrbitWarsActor, NUM_SHIPS_BINS, SHIPS_MULTIPLIER_BINS
@@ -86,11 +87,21 @@ def _load_model():
 # ── History buffer (plater 별 분리) ──────────────────────────────────────────
 
 def _history(player):
-    """같은 프로세스에서 p0/p1 둘 다 agent 로 불릴 수 있음 → player 별로 deque 분리."""
+    """같은 프로세스에서 p0/p1 둘 다 agent 로 불릴 수 있음 → player 별로 deque 분리.
+
+    fleet history 는 슬롯 sentinel(-1) 로 초기화, 안정 슬롯 상태도 player 별 분리.
+    """
     if player not in _HIST:
+        f_hist = deque(
+            [np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)] * HISTORY,
+            maxlen=HISTORY,
+        )
+        for arr in f_hist:
+            arr[:, -1] = -1.0
         _HIST[player] = (
             deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY),
-            deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY),
+            f_hist,
+            new_fleet_slot_state(),
         )
     return _HIST[player]
 
@@ -139,19 +150,27 @@ def agent(obs):
         raw_fleets  = obs.get("fleets", [])
         av          = obs.get("angular_velocity", 0)
         comet_ids   = set(obs.get("comet_planet_ids", []) or [])
+        comets      = obs.get("comets", []) or []
     else:
         player      = obs.player
         raw_planets = list(obs.planets)
         raw_fleets  = list(obs.fleets)
         av          = obs.angular_velocity
         comet_ids   = set(obs.comet_planet_ids or [])
+        comets      = getattr(obs, "comets", []) or []
 
     model = _load_model()
 
     # history 업데이트 (encode 는 학습용 env_wrapper 와 동일한 submission_features 사용)
-    p_hist, f_hist = _history(player)
-    p_hist.append(encode_planets(raw_planets, raw_fleets, player, comet_ids, av))
-    f_hist.append(encode_fleets(raw_fleets, raw_planets, player))
+    p_hist, f_hist, slot_state = _history(player)
+    p_hist.append(encode_planets(raw_planets, raw_fleets, player, comet_ids, comets, av))
+
+    # slot-stable fleet encoding: 안정 매핑 + 새 슬롯 history 클리어
+    from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
+    fleets_nt = [Fleet(*f) for f in raw_fleets]
+    fid_to_slot, newly = update_fleet_slots(fleets_nt, slot_state)
+    clear_fleet_history_at_slots(f_hist, newly)
+    f_hist.append(encode_fleets(raw_fleets, raw_planets, player, fid_to_slot))
 
     # 학습 obs 레이아웃: (H * (P*PD + F*FD),) flat
     p_stack = np.stack(list(p_hist), axis=0)              # (H, P, PD)

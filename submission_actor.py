@@ -7,7 +7,7 @@ critic head 만 제외 — state_dict load 시 critic.* 키는 strict=False 로 
 학습-제출 parity 보장:
   - 동일 config.yaml 읽음 (embed_dim, layers, NUM_HEADS, HISTORY, bins)
   - 동일 forward 경로 (Linear → Temporal → Local → Global → actor head)
-  - PLANET_DIM=21 (submission_features 와 일치)
+  - PLANET_DIM=15 (submission_features 와 일치)
 
 Inference only — torch.no_grad 는 caller 가 감싸도 되고 여기 내부에서도 안전.
 """
@@ -34,7 +34,7 @@ NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS            = ENV["max_planets"]
 MAX_FLEETS             = ENV["max_fleets"]
-PLANET_DIM             = 21   # submission_features 와 동기화
+PLANET_DIM             = 15   # submission_features 와 동기화
 FLEET_DIM              = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
 FLEET_FEAT_DIM         = 7
 
@@ -48,10 +48,16 @@ def _make_transformer(layers):
         d_model=EMBED_DIM,
         nhead=NUM_HEADS,
         dim_feedforward=EMBED_DIM * 4,
-        dropout=0.1,
+        dropout=0.0,
         batch_first=True,
     )
     return nn.TransformerEncoder(enc, num_layers=layers)
+
+
+def _safe_pad_mask(pad_mask):
+    """model._safe_pad_mask 미러 — all-masked 행 NaN 회피."""
+    fully = pad_mask.all(dim=-1, keepdim=True)
+    return pad_mask & ~fully
 
 
 class OrbitWarsActor(nn.Module):
@@ -106,6 +112,12 @@ class OrbitWarsActor(nn.Module):
         f_features = f_raw[..., :FLEET_FEAT_DIM]
         fp_idx_raw = f_raw[:, -1, :, -1]
 
+        # Padding masks (model.py 와 동일)
+        planet_pad_h   = (p_raw.abs().sum(dim=-1) == 0)
+        fleet_pad_h    = (f_raw[..., -1] < 0)
+        planet_pad_now = planet_pad_h[:, -1, :]
+        fleet_pad_now  = fleet_pad_h[:, -1, :]
+
         p_emb = self.planet_embed(p_raw)
         f_emb = self.fleet_embed(f_features)
 
@@ -115,7 +127,8 @@ class OrbitWarsActor(nn.Module):
         p_pos = self.planet_temporal_pos(t_idx)
         p_t   = p_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_PLANETS, HISTORY, EMBED_DIM)
         p_t   = p_t + p_pos.unsqueeze(0)
-        p_t   = self.planet_temporal_attn(p_t)
+        p_pad_seq = planet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_PLANETS, HISTORY)
+        p_t   = self.planet_temporal_attn(p_t, src_key_padding_mask=_safe_pad_mask(p_pad_seq))
         p_t   = p_t[:, -1, :].view(B, MAX_PLANETS, EMBED_DIM)
 
         # Fleet temporal (optional)
@@ -123,7 +136,8 @@ class OrbitWarsActor(nn.Module):
             f_pos = self.fleet_temporal_pos(t_idx)
             f_t   = f_emb.permute(0, 2, 1, 3).contiguous().view(B * MAX_FLEETS, HISTORY, EMBED_DIM)
             f_t   = f_t + f_pos.unsqueeze(0)
-            f_t   = self.fleet_temporal_attn(f_t)
+            f_pad_seq = fleet_pad_h.permute(0, 2, 1).contiguous().view(B * MAX_FLEETS, HISTORY)
+            f_t   = self.fleet_temporal_attn(f_t, src_key_padding_mask=_safe_pad_mask(f_pad_seq))
             f_t   = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
         else:
             f_t = f_emb[:, -1, :, :]
@@ -142,8 +156,9 @@ class OrbitWarsActor(nn.Module):
 
         # Local (fleet ↔ planet) + Global
         local_tokens = torch.cat([p_t, f_t], dim=1)
-        local_out    = self.local_attn(local_tokens)
+        local_pad    = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
+        local_out    = self.local_attn(local_tokens, src_key_padding_mask=_safe_pad_mask(local_pad))
         p_local      = local_out[:, :MAX_PLANETS, :]
-        global_out   = self.global_attn(p_local)
+        global_out   = self.global_attn(p_local, src_key_padding_mask=_safe_pad_mask(planet_pad_now))
 
         return self.actor(global_out)
