@@ -48,7 +48,7 @@ def _make_transformer(layers):
     enc = nn.TransformerEncoderLayer(
         d_model=EMBED_DIM,
         nhead=NUM_HEADS,
-        dim_feedforward=EMBED_DIM * 4,
+        dim_feedforward=EMBED_DIM * 2,   # model.py 와 동기 (표준 ×4 → ×2)
         dropout=0.0,
         batch_first=True,
     )

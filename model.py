@@ -50,7 +50,7 @@ def make_transformer(layers):
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=EMBED_DIM,
         nhead=NUM_HEADS,
-        dim_feedforward=EMBED_DIM * 4,
+        dim_feedforward=EMBED_DIM * 2,   # 표준 ×4 대신 ×2 — 작은 모델 + 짧은 H=20 에 충분, 파라미터 ↓
         dropout=0.0,
         batch_first=True,
     )
