@@ -29,7 +29,8 @@ HISTORY      = CONFIG["env"]["history_turns"]
 PLANET_DIM   = 23  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
                    # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
                    # +2: source_enemy_pressure_norm, source_nearest_enemy_eta_norm (own-planet defensive)
-FLEET_DIM    = 7
+FLEET_DIM      = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid/empty)
+FLEET_FEAT_DIM = 7   # fleet_embed 입력 dim (idx 제외)
 
 # F21/F22 source-side feature window: 적 행성 ETA가 이 값 이내면 pressure 합산 대상
 SOURCE_PRESSURE_ETA_WINDOW = 30
@@ -209,13 +210,22 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
     return arr
 
 
-def encode_fleets(raw_fleets, player):
-    """fleet 목록을 (MAX_FLEETS, FLEET_DIM) 배열로 인코딩."""
-    from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
+def encode_fleets(raw_fleets, raw_planets, player):
+    """fleet 목록을 (MAX_FLEETS, FLEET_DIM) 배열로 인코딩.
 
-    fleets = [Fleet(*f) for f in raw_fleets]
-    arr    = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
+    마지막 dim은 source planet 의 obs index (raw_planets[:MAX_PLANETS] 내 위치).
+    빈 슬롯/매핑 실패 시 -1 sentinel — 모델이 valid mask 로 fusion 차단.
+    """
+    from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
+
+    fleets    = [Fleet(*f)  for f in raw_fleets]
+    planets   = [Planet(*p) for p in raw_planets]
+    id_to_idx = {p.id: idx for idx, p in enumerate(planets[:MAX_PLANETS])}
+
+    arr = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
+    arr[:, -1] = -1.0   # source idx sentinel (빈 슬롯)
     for i, f in enumerate(fleets[:MAX_FLEETS]):
+        src_idx = id_to_idx.get(f.from_planet_id, -1)
         arr[i] = [
             f.x / 100.0,
             f.y / 100.0,
@@ -224,6 +234,7 @@ def encode_fleets(raw_fleets, player):
             min(f.ships / 1000.0, 1.0),
             1.0 if f.owner == player else 0.0,
             1.0 if f.owner not in (-1, player) else 0.0,
+            float(src_idx),
         ]
     return arr
 
@@ -321,7 +332,7 @@ class OrbitWarsEnv(gym.Env):
         self._env.reset()
         raw_planets, raw_fleets, comet_ids = self._current_obs()
         self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, self._av))
-        self._fleet_history.append(encode_fleets(raw_fleets, self._player))
+        self._fleet_history.append(encode_fleets(raw_fleets, raw_planets, self._player))
 
         return self._build_tensor(), {}
 
@@ -383,7 +394,7 @@ class OrbitWarsEnv(gym.Env):
         # 새 관측
         raw_planets, raw_fleets, comet_ids = self._current_obs()
         self._planet_history.append(encode_planets(raw_planets, raw_fleets, self._player, comet_ids, self._av))
-        self._fleet_history.append(encode_fleets(raw_fleets, self._player))
+        self._fleet_history.append(encode_fleets(raw_fleets, raw_planets, self._player))
         obs = self._build_tensor()
 
         # 보상 및 종료

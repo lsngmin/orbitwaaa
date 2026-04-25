@@ -12,7 +12,8 @@ HISTORY                = 20
 MAX_PLANETS            = 40
 MAX_FLEETS             = 100
 PLANET_DIM             = 21   # +3: target feasibility bundle (required, best_src_ships, feasibility)
-FLEET_DIM              = 7
+FLEET_DIM              = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
+FLEET_FEAT_DIM         = 7
 # ships head: required_ships 배수 Categorical (commit 2)
 SHIPS_MULTIPLIER_BINS  = (1.10, 1.30, 1.60, 2.00)
 NUM_SHIPS_BINS         = len(SHIPS_MULTIPLIER_BINS)
@@ -93,16 +94,20 @@ def forward(obs_flat, w):
     obs_flat : (1, HISTORY*(MAX_PLANETS*PLANET_DIM + MAX_FLEETS*FLEET_DIM)) float32
     returns  : action_logits (1, MAX_PLANETS, ACTION_DIM)
     """
-    p_size = MAX_PLANETS * PLANET_DIM   # 520
-    f_size = MAX_FLEETS  * FLEET_DIM    # 700
+    p_size = MAX_PLANETS * PLANET_DIM
+    f_size = MAX_FLEETS  * FLEET_DIM
 
     obs   = obs_flat.reshape(1, HISTORY, p_size + f_size)
     p_raw = obs[:, :, :p_size].reshape(1, HISTORY, MAX_PLANETS, PLANET_DIM)
     f_raw = obs[:, :, p_size:].reshape(1, HISTORY, MAX_FLEETS,  FLEET_DIM)
 
+    # fleet 마지막 dim = from_planet_idx (-1=invalid)
+    f_features = f_raw[..., :FLEET_FEAT_DIM]                            # (1,H,F,7)
+    fp_idx_raw = f_raw[:, -1, :, -1]                                    # (1,F)
+
     # 임베딩
-    p_emb = _linear(p_raw, w['planet_embed.weight'], w['planet_embed.bias'])  # (1,H,P,E)
-    f_emb = _linear(f_raw, w['fleet_embed.weight'],  w['fleet_embed.bias'])   # (1,H,F,E)
+    p_emb = _linear(p_raw,      w['planet_embed.weight'], w['planet_embed.bias'])
+    f_emb = _linear(f_features, w['fleet_embed.weight'],  w['fleet_embed.bias'])
 
     # Temporal positional encoding
     t_idx = np.arange(HISTORY)
@@ -123,6 +128,23 @@ def forward(obs_flat, w):
         f_t   = f_t[:, -1, :].reshape(1, MAX_FLEETS, EMBED_DIM)
     else:
         f_t = f_emb[:, -1, :, :]   # (1, F, E)
+
+    # Source planet fusion (model.py 와 동일 — gated residual)
+    fp_idx      = fp_idx_raw.astype(np.int64)                           # (1, F)
+    valid       = ((fp_idx >= 0) & (fp_idx < MAX_PLANETS)).astype(np.float32)
+    fp_idx_safe = np.clip(fp_idx, 0, MAX_PLANETS - 1)                   # (1, F)
+    src_t       = np.take_along_axis(
+        p_t, fp_idx_safe[..., None], axis=1
+    )                                                                    # (1, F, E)
+
+    fused_in = np.concatenate([f_t, src_t], axis=-1)                    # (1, F, 2E)
+    gate     = _sigmoid(_linear(fused_in,
+                                w['fleet_source_gate.weight'],
+                                w['fleet_source_gate.bias']))
+    cand     = np.tanh(_linear(fused_in,
+                                w['fleet_source_value.weight'],
+                                w['fleet_source_value.bias']))
+    f_t      = f_t + gate * cand * valid[..., None]
 
     # Local attention: (1, P+F, E)
     local = np.concatenate([p_t, f_t], axis=1)

@@ -15,7 +15,8 @@ HISTORY = 20
 PLANET_DIM = 23   # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
                   # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
                   # +2: source_enemy_pressure_norm, source_nearest_enemy_eta_norm
-FLEET_DIM = 7
+FLEET_DIM      = 8
+FLEET_FEAT_DIM = 7
 
 ETA_NEAR = 5
 ETA_MID = 15
@@ -181,12 +182,17 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, angular_velocity=
     return arr
 
 
-def encode_fleets(raw_fleets, player):
-    from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
+def encode_fleets(raw_fleets, raw_planets, player):
+    from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 
-    fleets = [Fleet(*f) for f in raw_fleets]
+    fleets    = [Fleet(*f)  for f in raw_fleets]
+    planets   = [Planet(*p) for p in raw_planets]
+    id_to_idx = {p.id: idx for idx, p in enumerate(planets[:MAX_PLANETS])}
+
     arr = np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)
+    arr[:, -1] = -1.0
     for i, f in enumerate(fleets[:MAX_FLEETS]):
+        src_idx = id_to_idx.get(f.from_planet_id, -1)
         arr[i] = [
             f.x / 100.0,
             f.y / 100.0,
@@ -195,5 +201,6 @@ def encode_fleets(raw_fleets, player):
             min(f.ships / 1000.0, 1.0),
             1.0 if f.owner == player else 0.0,
             1.0 if f.owner not in (-1, player) else 0.0,
+            float(src_idx),
         ]
     return arr

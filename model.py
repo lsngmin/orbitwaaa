@@ -35,7 +35,8 @@ MAX_FLEETS      = ENV["max_fleets"]
 PLANET_DIM      = 23  # +3: min_eta_norm, pred_x, pred_y / +2: sun_block, sun_dist_norm
                       # +3: required_norm, best_src_ships_norm, feasibility_norm (same-source bundle)
                       # +2: source_enemy_pressure_norm, source_nearest_enemy_eta_norm (own planets only)
-FLEET_DIM       = 7
+FLEET_DIM       = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
+FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 
 # ships head: required_ships 배수 Categorical (commit 2)
 # decode: ships_to_send = min(int(required × multiplier), src.ships)
@@ -62,8 +63,15 @@ class OrbitWarsPolicy(nn.Module):
         super().__init__()
 
         # 입력 임베딩
-        self.planet_embed = nn.Linear(PLANET_DIM, EMBED_DIM)
-        self.fleet_embed  = nn.Linear(FLEET_DIM,  EMBED_DIM)
+        self.planet_embed = nn.Linear(PLANET_DIM,      EMBED_DIM)
+        self.fleet_embed  = nn.Linear(FLEET_FEAT_DIM,  EMBED_DIM)
+
+        # Gated source-planet fusion — fleet 가 자기 source planet 의 표현을 참조.
+        # candidate = tanh(Wv [f_t ; src_t])
+        # gate      = sigmoid(Wg [f_t ; src_t])
+        # f_fused   = f_t + gate * candidate    (residual + gated update)
+        self.fleet_source_value = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
+        self.fleet_source_gate  = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
 
         # 위치 인코딩 — planet/fleet 분리
         self.planet_temporal_pos = nn.Embedding(HISTORY, EMBED_DIM)
@@ -94,6 +102,30 @@ class OrbitWarsPolicy(nn.Module):
             nn.Linear(EMBED_DIM, 1),
         )
 
+    def _fleet_source_fuse(self, f_t, p_t, fp_idx_raw):
+        """Gated residual fusion — fleet 가 source planet 표현을 참조.
+
+        invalid(-1)/out-of-range 는 valid mask 로 fusion 차단 → residual identity.
+
+        Args:
+          f_t        : (B, F, E)
+          p_t        : (B, P, E)
+          fp_idx_raw : (B, F) — float; 마지막 dim 그대로 (cast 전)
+        Returns:
+          (B, F, E)  — f_t + gate * tanh(Wv [f_t;src]) * valid
+        """
+        fp_idx      = fp_idx_raw.long()
+        valid       = (fp_idx >= 0) & (fp_idx < MAX_PLANETS)
+        fp_idx_safe = fp_idx.clamp(0, MAX_PLANETS - 1)
+        gather_idx  = fp_idx_safe.unsqueeze(-1).expand(-1, -1, EMBED_DIM)
+        src_t       = p_t.gather(1, gather_idx)
+
+        fused_in = torch.cat([f_t, src_t], dim=-1)
+        gate     = torch.sigmoid(self.fleet_source_gate(fused_in))
+        cand     = torch.tanh(self.fleet_source_value(fused_in))
+        valid_f  = valid.unsqueeze(-1).to(f_t.dtype)
+        return f_t + gate * cand * valid_f
+
     def forward(self, obs_flat):
         """
         obs_flat: (B, HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM))
@@ -110,9 +142,13 @@ class OrbitWarsPolicy(nn.Module):
         p_raw = obs[:, :, :p_size].view(B, HISTORY, MAX_PLANETS, PLANET_DIM)
         f_raw = obs[:, :, p_size:].view(B, HISTORY, MAX_FLEETS,  FLEET_DIM)
 
+        # fleet 마지막 dim = from_planet_idx (-1=invalid). embed 입력에서 분리.
+        f_features = f_raw[..., :FLEET_FEAT_DIM]                # (B, H, F, 7)
+        fp_idx_raw = f_raw[:, -1, :, -1]                        # (B, F) — 현재 step idx
+
         # --- 임베딩 ---
-        p_emb = self.planet_embed(p_raw)  # (B, H, P, E)
-        f_emb = self.fleet_embed(f_raw)   # (B, H, F, E)
+        p_emb = self.planet_embed(p_raw)       # (B, H, P, E)
+        f_emb = self.fleet_embed(f_features)   # (B, H, F, E)
 
         # --- 1. Temporal Attention ---
         t_idx = torch.arange(HISTORY, device=obs_flat.device)
@@ -134,6 +170,9 @@ class OrbitWarsPolicy(nn.Module):
         else:
             # current-step fleet embedding만 사용 (마지막 턴)
             f_t = f_emb[:, -1, :, :]  # (B, F, E)
+
+        # --- 1.5 Source planet fusion — fleet 가 자기 source planet 표현 참조 ---
+        f_t = self._fleet_source_fuse(f_t, p_t, fp_idx_raw)
 
         # --- 2. Local Attention (fleet ↔ 행성) ---
         local_tokens = torch.cat([p_t, f_t], dim=1)  # (B, P+F, E)
