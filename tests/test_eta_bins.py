@@ -32,10 +32,10 @@ def make_fleet_heading_to(pid, fleet_id, owner, planet_x, planet_y, distance, sh
 
 
 def get_incoming(raw_planets, raw_fleets):
-    """encode_planets 결과에서 incoming bin 4개 추출 (idx 9~12)."""
+    """encode_planets 결과에서 incoming bin 4개 추출 (idx 11~14)."""
     arr = encode_planets(raw_planets, raw_fleets, player=PLAYER, comet_ids=set())
     # [enemy_near, enemy_mid, mine_near, mine_mid] — 정규화 전 원본 아님 (×1000)
-    return arr[0, 9], arr[0, 10], arr[0, 11], arr[0, 12]
+    return arr[0, 11], arr[0, 12], arr[0, 13], arr[0, 14]
 
 
 # ── near bin (ETA ≤ 5) ────────────────────────────────────────────────────────
@@ -97,17 +97,161 @@ def test_far_fleet_not_counted():
 
 # ── PLANET_DIM 상수 확인 ──────────────────────────────────────────────────────
 
-def test_planet_dim_is_21():
-    """PLANET_DIM이 21인지 확인 (ETA + 궤도 예측 + 태양 위험도 + target feasibility)."""
-    assert PLANET_DIM == 21
+def test_planet_dim_is_16():
+    """PLANET_DIM=16 (15 features + 1 is_valid sentinel)."""
+    assert PLANET_DIM == 16
 
 
 def test_encode_planets_output_shape():
-    """encode_planets 출력이 (MAX_PLANETS, 21) shape인지 확인."""
+    """encode_planets 출력이 (MAX_PLANETS, PLANET_DIM) shape."""
     from env_wrapper import MAX_PLANETS
     planet = make_planet(0, owner=PLAYER)
     arr = encode_planets([planet], [], player=PLAYER, comet_ids=set())
-    assert arr.shape == (MAX_PLANETS, 21)
+    assert arr.shape == (MAX_PLANETS, PLANET_DIM)
+
+
+def test_is_valid_sentinel():
+    """채워진 행 마지막 dim = 1.0, 빈 슬롯 = 0.0."""
+    from env_wrapper import MAX_PLANETS
+    planet = make_planet(0, owner=PLAYER)
+    arr = encode_planets([planet], [], player=PLAYER, comet_ids=set())
+    assert arr[0, -1] == 1.0           # filled
+    assert arr[1:, -1].sum() == 0.0    # rest empty
+
+
+def test_orbit_velocity_features_for_orbiting_planet():
+    """공전 행성은 현재 속도 벡터(vx, vy)를 feature로 가진다."""
+    planet = make_planet(0, owner=PLAYER, x=70.0, y=50.0, radius=4.0)
+    av = 0.10
+    arr = encode_planets([planet], [], player=PLAYER, comet_ids=set(), angular_velocity=av)
+    vx = arr[0, 9]
+    vy = arr[0, 10]
+
+    assert vx == pytest.approx(0.0, abs=1e-6)
+    assert vy == pytest.approx(0.4, abs=1e-6)
+
+
+def test_orbit_velocity_features_zero_for_static_planet():
+    """정적 행성은 vx/vy가 0이어야 한다."""
+    planet = make_planet(0, owner=PLAYER, x=95.0, y=50.0, radius=5.0)
+    arr = encode_planets([planet], [], player=PLAYER, comet_ids=set(), angular_velocity=0.10)
+    assert arr[0, 9] == pytest.approx(0.0)
+    assert arr[0, 10] == pytest.approx(0.0)
+
+
+def test_comet_velocity_zero_when_no_path_data():
+    """comet 인데 `comets` 인자가 비어있으면 (= path 미상) velocity 0 fallback.
+
+    PR3 이전과 동일한 회귀: 학습 obs 가 comets 를 채우지 못하는 corner case
+    (혹은 외부 호출자가 미제공) 에서도 안전하게 0 으로 떨어지는지.
+    """
+    comet = make_planet(7, owner=-1, x=40.0, y=50.0, radius=1.0)
+    arr = encode_planets([comet], [], player=PLAYER, comet_ids={7}, angular_velocity=0.10)
+    assert arr[0, 9] == pytest.approx(0.0)
+    assert arr[0, 10] == pytest.approx(0.0)
+
+
+def test_comet_velocity_from_paths():
+    """comet velocity = `paths[i][idx+1] - paths[i][idx]`, MAX_SPEED 정규화."""
+    from prediction import MAX_SPEED
+
+    comet = make_planet(7, owner=-1, x=30.0, y=50.0, radius=1.0)
+    # 한 group, 한 planet_id, idx=2 → cur=(30,50), next=(33,52) → vx=3, vy=2
+    comets = [{
+        "planet_ids": [7],
+        "paths": [[
+            [10.0, 50.0],
+            [20.0, 50.0],
+            [30.0, 50.0],   # idx=2 (현재)
+            [33.0, 52.0],   # idx=3 (다음)
+            [36.0, 56.0],
+        ]],
+        "path_index": 2,
+    }]
+    arr = encode_planets([comet], [], player=PLAYER, comet_ids={7},
+                         comets=comets, angular_velocity=0.0)
+    assert arr[0, 9]  == pytest.approx(3.0 / MAX_SPEED, abs=1e-5)
+    assert arr[0, 10] == pytest.approx(2.0 / MAX_SPEED, abs=1e-5)
+
+
+def test_comet_velocity_zero_at_last_path_index():
+    """path_index 가 마지막 → 다음 턴 expire → velocity 0 (boundary)."""
+    comet = make_planet(7, owner=-1, x=36.0, y=56.0, radius=1.0)
+    comets = [{
+        "planet_ids": [7],
+        "paths": [[
+            [10.0, 50.0],
+            [20.0, 50.0],
+            [36.0, 56.0],   # idx=2, 마지막 (len=3)
+        ]],
+        "path_index": 2,
+    }]
+    arr = encode_planets([comet], [], player=PLAYER, comet_ids={7},
+                         comets=comets, angular_velocity=0.0)
+    assert arr[0, 9]  == pytest.approx(0.0)
+    assert arr[0, 10] == pytest.approx(0.0)
+
+
+def test_comet_velocity_independent_of_other_planets_orbit_velocity():
+    """non-comet orbiting 행성은 comets 인자 영향 없음 — 기존 ω 기반 식 그대로."""
+    from prediction import MAX_SPEED
+
+    orbiter = make_planet(0, owner=PLAYER, x=70.0, y=50.0, radius=4.0)
+    comet   = make_planet(7, owner=-1,   x=30.0, y=50.0, radius=1.0)
+    comets  = [{
+        "planet_ids": [7],
+        "paths": [[[30.0, 50.0], [33.0, 52.0]]],
+        "path_index": 0,
+    }]
+    av = 0.10
+    arr = encode_planets([orbiter, comet], [], player=PLAYER, comet_ids={7},
+                         comets=comets, angular_velocity=av)
+    # orbiter (idx 0): PR1 회귀 — vx=0, vy=0.4
+    assert arr[0, 9]  == pytest.approx(0.0, abs=1e-6)
+    assert arr[0, 10] == pytest.approx(0.4, abs=1e-6)
+    # comet (idx 1): PR3 — paths-based
+    assert arr[1, 9]  == pytest.approx(3.0 / MAX_SPEED, abs=1e-5)
+    assert arr[1, 10] == pytest.approx(2.0 / MAX_SPEED, abs=1e-5)
+
+
+def test_comet_velocity_uses_correct_path_per_planet_id():
+    """group["planet_ids"][j] ↔ group["paths"][j] 매핑 정확."""
+    from prediction import MAX_SPEED
+
+    # 두 comet, 같은 group: pid=7 → paths[0], pid=8 → paths[1]
+    comet_a = make_planet(7, owner=-1, x=30.0, y=50.0, radius=1.0)
+    comet_b = make_planet(8, owner=-1, x=70.0, y=50.0, radius=1.0)
+    comets = [{
+        "planet_ids": [7, 8],
+        "paths": [
+            [[30.0, 50.0], [34.0, 50.0]],   # pid=7, vx=4
+            [[70.0, 50.0], [70.0, 53.0]],   # pid=8, vy=3
+        ],
+        "path_index": 0,
+    }]
+    arr = encode_planets([comet_a, comet_b], [], player=PLAYER,
+                         comet_ids={7, 8}, comets=comets, angular_velocity=0.0)
+    assert arr[0, 9]  == pytest.approx(4.0 / MAX_SPEED, abs=1e-5)
+    assert arr[0, 10] == pytest.approx(0.0, abs=1e-6)
+    assert arr[1, 9]  == pytest.approx(0.0, abs=1e-6)
+    assert arr[1, 10] == pytest.approx(3.0 / MAX_SPEED, abs=1e-5)
+
+
+def test_comet_velocity_clipped_when_exceeds_max_speed():
+    """비정상적으로 큰 path 변위는 MAX_SPEED 로 clip."""
+    from prediction import MAX_SPEED
+
+    comet = make_planet(7, owner=-1, x=30.0, y=50.0, radius=1.0)
+    # cometSpeed=4 정상보다 큰 변위 (방어적 clip 검증)
+    comets = [{
+        "planet_ids": [7],
+        "paths": [[[30.0, 50.0], [30.0 + MAX_SPEED * 3, 50.0]]],
+        "path_index": 0,
+    }]
+    arr = encode_planets([comet], [], player=PLAYER, comet_ids={7},
+                         comets=comets, angular_velocity=0.0)
+    assert arr[0, 9]  == pytest.approx(1.0)   # clip
+    assert arr[0, 10] == pytest.approx(0.0)
 
 
 # ── P1 회귀: fleet는 레이 상 첫 번째 행성에만 집계 ───────────────────────────
@@ -124,9 +268,9 @@ def test_fleet_hits_only_nearest_planet():
 
     arr = encode_planets([planet_a, planet_b], [fleet], player=PLAYER, comet_ids=set())
     # planet_a(idx 0): enemy_near or enemy_mid 중 하나 > 0
-    a_enemy = arr[0, 9] + arr[0, 10]
+    a_enemy = arr[0, 11] + arr[0, 12]
     # planet_b(idx 1): 아무 bin도 0이어야 함
-    b_enemy = arr[1, 9] + arr[1, 10]
+    b_enemy = arr[1, 11] + arr[1, 12]
 
     assert a_enemy > 0, "가까운 planet_a에 집계되지 않음"
     assert b_enemy == 0, "fleet 소멸 이후 planet_b에 중복 집계됨 (P1 버그 재발)"
@@ -146,8 +290,8 @@ def test_eta_uses_ray_distance_not_center_distance():
     fleet  = (10, 1, 47.0, 46.0, math.pi / 2, 99, 1)
 
     arr = encode_planets([planet], [fleet], player=PLAYER, comet_ids=set())
-    enemy_near = arr[0, 9]
-    enemy_mid  = arr[0, 10]
+    enemy_near = arr[0, 11]
+    enemy_mid  = arr[0, 12]
 
     # t=4 → ETA=4 → near bin이어야 함
     assert enemy_near > 0, f"t=4이므로 near bin에 있어야 함 (near={enemy_near}, mid={enemy_mid})"

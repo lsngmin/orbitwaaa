@@ -32,7 +32,8 @@ NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS     = ENV["max_planets"]
 MAX_FLEETS      = ENV["max_fleets"]
-PLANET_DIM      = 15
+PLANET_DIM      = 16  # 0-14: numeric features, 15: is_valid (1=real, 0=empty)
+PLANET_FEAT_DIM = 15  # planet_embed 입력 dim (is_valid 제외)
 FLEET_DIM       = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
 FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 
@@ -72,7 +73,7 @@ class OrbitWarsPolicy(nn.Module):
         super().__init__()
 
         # 입력 임베딩
-        self.planet_embed = nn.Linear(PLANET_DIM,      EMBED_DIM)
+        self.planet_embed = nn.Linear(PLANET_FEAT_DIM, EMBED_DIM)
         self.fleet_embed  = nn.Linear(FLEET_FEAT_DIM,  EMBED_DIM)
 
         # Gated source-planet fusion — fleet 가 자기 source planet 의 표현을 참조.
@@ -151,20 +152,21 @@ class OrbitWarsPolicy(nn.Module):
         p_raw = obs[:, :, :p_size].view(B, HISTORY, MAX_PLANETS, PLANET_DIM)
         f_raw = obs[:, :, p_size:].view(B, HISTORY, MAX_FLEETS,  FLEET_DIM)
 
-        # fleet 마지막 dim = from_planet_idx (-1=invalid). embed 입력에서 분리.
+        # 마지막 dim 은 sentinel — embed 입력에서 분리.
+        #   planet: idx 15 = is_valid (1=real, 0=empty)
+        #   fleet : idx 7  = from_planet_idx (-1=invalid)
+        p_features = p_raw[..., :PLANET_FEAT_DIM]               # (B, H, P, 15)
         f_features = f_raw[..., :FLEET_FEAT_DIM]                # (B, H, F, 7)
         fp_idx_raw = f_raw[:, -1, :, -1]                        # (B, F) — 현재 step idx
 
-        # --- Padding masks ---
-        # planet: zero-row 면 빈 슬롯 (raw feature 합 == 0 으로 검출)
-        # fleet : 마지막 dim(idx) 가 -1 이면 빈/유령 슬롯
-        planet_pad_h = (p_raw.abs().sum(dim=-1) == 0)            # (B, H, P)
+        # --- Padding masks (sentinel 기반, 명시적) ---
+        planet_pad_h = (p_raw[..., -1] == 0)                     # (B, H, P)
         fleet_pad_h  = (f_raw[..., -1] < 0)                      # (B, H, F)
         planet_pad_now = planet_pad_h[:, -1, :]                  # (B, P)
         fleet_pad_now  = fleet_pad_h[:, -1, :]                   # (B, F)
 
         # --- 임베딩 ---
-        p_emb = self.planet_embed(p_raw)       # (B, H, P, E)
+        p_emb = self.planet_embed(p_features)  # (B, H, P, E)
         f_emb = self.fleet_embed(f_features)   # (B, H, F, E)
 
         # --- 1. Temporal Attention ---
@@ -205,8 +207,13 @@ class OrbitWarsPolicy(nn.Module):
         # --- Actor ---
         action_logits = self.actor(global_out)         # (B, P, ACTION_DIM)
 
-        # --- Critic (전체 평균 풀링) ---
-        value = self.critic(global_out.mean(dim=1))    # (B, 1)
+        # --- Critic (masked mean 풀링) ---
+        # 빈 행성 토큰을 평균에서 배제 — 후반 P_alive ≪ MAX_PLANETS 일 때
+        # 분모를 P 로 고정하면 V 가 인위적으로 줄어들어 advantage 가 부풀어 오름.
+        valid_p     = (~planet_pad_now).to(global_out.dtype).unsqueeze(-1)   # (B, P, 1)
+        valid_sum   = (global_out * valid_p).sum(dim=1)                       # (B, E)
+        valid_count = valid_p.sum(dim=1).clamp(min=1.0)                       # (B, 1)
+        value       = self.critic(valid_sum / valid_count)                    # (B, 1)
 
         return action_logits, value
 

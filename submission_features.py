@@ -12,7 +12,8 @@ import numpy as np
 MAX_PLANETS = 40
 MAX_FLEETS = 100
 HISTORY = 20
-PLANET_DIM = 15
+PLANET_DIM      = 16
+PLANET_FEAT_DIM = 15
 FLEET_DIM      = 8
 FLEET_FEAT_DIM = 7
 
@@ -175,6 +176,7 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
             min(enemy_mid[p.id] / 1000.0, 1.0),
             min(mine_near[p.id] / 1000.0, 1.0),
             min(mine_mid[p.id] / 1000.0, 1.0),
+            1.0,
         ]
     return arr
 

@@ -34,7 +34,8 @@ NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS            = ENV["max_planets"]
 MAX_FLEETS             = ENV["max_fleets"]
-PLANET_DIM             = 15   # submission_features 와 동기화
+PLANET_DIM             = 16   # 0-14: numeric features, 15: is_valid (submission_features 동기화)
+PLANET_FEAT_DIM        = 15
 FLEET_DIM              = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
 FLEET_FEAT_DIM         = 7
 
@@ -74,8 +75,8 @@ class OrbitWarsActor(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.planet_embed = nn.Linear(PLANET_DIM,     EMBED_DIM)
-        self.fleet_embed  = nn.Linear(FLEET_FEAT_DIM, EMBED_DIM)
+        self.planet_embed = nn.Linear(PLANET_FEAT_DIM, EMBED_DIM)
+        self.fleet_embed  = nn.Linear(FLEET_FEAT_DIM,  EMBED_DIM)
 
         # Gated source-planet fusion (model.py 와 키 동일)
         self.fleet_source_value = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
@@ -109,16 +110,17 @@ class OrbitWarsActor(nn.Module):
         p_raw = obs[:, :, :p_size].view(B, HISTORY, MAX_PLANETS, PLANET_DIM)
         f_raw = obs[:, :, p_size:].view(B, HISTORY, MAX_FLEETS,  FLEET_DIM)
 
+        p_features = p_raw[..., :PLANET_FEAT_DIM]
         f_features = f_raw[..., :FLEET_FEAT_DIM]
         fp_idx_raw = f_raw[:, -1, :, -1]
 
-        # Padding masks (model.py 와 동일)
-        planet_pad_h   = (p_raw.abs().sum(dim=-1) == 0)
+        # Padding masks (sentinel 기반, model.py 와 동일)
+        planet_pad_h   = (p_raw[..., -1] == 0)
         fleet_pad_h    = (f_raw[..., -1] < 0)
         planet_pad_now = planet_pad_h[:, -1, :]
         fleet_pad_now  = fleet_pad_h[:, -1, :]
 
-        p_emb = self.planet_embed(p_raw)
+        p_emb = self.planet_embed(p_features)
         f_emb = self.fleet_embed(f_features)
 
         t_idx = torch.arange(HISTORY, device=obs_flat.device)

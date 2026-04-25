@@ -26,7 +26,8 @@ TRAIN_CONFIG = CONFIG["training"]
 MAX_PLANETS  = CONFIG["env"]["max_planets"]
 MAX_FLEETS   = CONFIG["env"]["max_fleets"]
 HISTORY      = CONFIG["env"]["history_turns"]
-PLANET_DIM   = 15
+PLANET_DIM      = 16  # 0-14: numeric features, 15: is_valid (1=real, 0=empty/sentinel)
+PLANET_FEAT_DIM = 15  # planet_embed 입력 dim (is_valid 제외)
 FLEET_DIM      = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid/empty)
 FLEET_FEAT_DIM = 7   # fleet_embed 입력 dim (idx 제외)
 
@@ -233,6 +234,7 @@ def encode_planets(raw_planets, raw_fleets, player, comet_ids, comets=None,
             min(enemy_mid[p.id]  / 1000.0, 1.0),
             min(mine_near[p.id]  / 1000.0, 1.0),
             min(mine_mid[p.id]   / 1000.0, 1.0),
+            1.0,   # is_valid sentinel (빈 슬롯은 zero-init 으로 0)
         ]
     return arr
 

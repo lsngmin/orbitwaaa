@@ -37,7 +37,8 @@ from train import analyze_action_space, decode_action_to_moves
 
 _DEVICE = torch.device("cpu")     # Kaggle = CPU-only
 _MODEL  = None
-_HIST: dict = {}                  # player_id -> (planet_hist_deque, fleet_hist_deque)
+_HIST: dict = {}                  # player_id -> (planet_hist_deque, fleet_hist_deque, slot_state)
+_LAST_STEP: dict = {}             # player_id -> 마지막 본 obs.step (game boundary 감지)
 
 
 # ── Weights loader ───────────────────────────────────────────────────────────
@@ -86,23 +87,32 @@ def _load_model():
 
 # ── History buffer (plater 별 분리) ──────────────────────────────────────────
 
-def _history(player):
-    """같은 프로세스에서 p0/p1 둘 다 agent 로 불릴 수 있음 → player 별로 deque 분리.
+def _fresh_history():
+    f_hist = deque(
+        [np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)] * HISTORY,
+        maxlen=HISTORY,
+    )
+    for arr in f_hist:
+        arr[:, -1] = -1.0   # fleet sentinel
+    return (
+        deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY),
+        f_hist,
+        new_fleet_slot_state(),
+    )
 
-    fleet history 는 슬롯 sentinel(-1) 로 초기화, 안정 슬롯 상태도 player 별 분리.
+
+def _history(player, current_step):
+    """같은 프로세스에서 p0/p1 둘 다 agent 로 불릴 수 있음 → player 별 분리.
+
+    Game boundary 감지: 같은 player 의 obs.step 이 비단조(0 으로 떨어지거나 후퇴)면
+    새 게임 시작으로 간주, 이전 게임의 history/slot_state 폐기.
     """
-    if player not in _HIST:
-        f_hist = deque(
-            [np.zeros((MAX_FLEETS, FLEET_DIM), dtype=np.float32)] * HISTORY,
-            maxlen=HISTORY,
-        )
-        for arr in f_hist:
-            arr[:, -1] = -1.0
-        _HIST[player] = (
-            deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY),
-            f_hist,
-            new_fleet_slot_state(),
-        )
+    last = _LAST_STEP.get(player)
+    new_game = (last is None) or (current_step is None) or (current_step <= last)
+    if new_game or player not in _HIST:
+        _HIST[player] = _fresh_history()
+    if current_step is not None:
+        _LAST_STEP[player] = current_step
     return _HIST[player]
 
 
@@ -151,6 +161,7 @@ def agent(obs):
         av          = obs.get("angular_velocity", 0)
         comet_ids   = set(obs.get("comet_planet_ids", []) or [])
         comets      = obs.get("comets", []) or []
+        cur_step    = obs.get("step")
     else:
         player      = obs.player
         raw_planets = list(obs.planets)
@@ -158,11 +169,12 @@ def agent(obs):
         av          = obs.angular_velocity
         comet_ids   = set(obs.comet_planet_ids or [])
         comets      = getattr(obs, "comets", []) or []
+        cur_step    = getattr(obs, "step", None)
 
     model = _load_model()
 
     # history 업데이트 (encode 는 학습용 env_wrapper 와 동일한 submission_features 사용)
-    p_hist, f_hist, slot_state = _history(player)
+    p_hist, f_hist, slot_state = _history(player, cur_step)
     p_hist.append(encode_planets(raw_planets, raw_fleets, player, comet_ids, comets, av))
 
     # slot-stable fleet encoding: 안정 매핑 + 새 슬롯 history 클리어
