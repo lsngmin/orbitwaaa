@@ -1,0 +1,134 @@
+name: Deploy submission
+
+# 트리거:
+#   1) submission 브랜치로 weights.pt 가 push 되면 (= PR merge 도 push 이벤트)
+#   2) Actions UI 에서 수동 실행 (workflow_dispatch)
+on:
+  push:
+    branches: [submission]
+    paths:
+      - "submission.yaml"        # 어떤 .pt 를 ship 할지 가리키는 포인터
+      - "checkpoints/**"         # 선택된 .pt 자체가 갱신된 경우
+      - "build_submission.py"
+      - "main.py"
+      - "submission_features.py"
+      - "submission_actor.py"
+      - "config.yaml"
+      - ".github/workflows/deploy_submission.yml"
+  workflow_dispatch:
+    inputs:
+      message:
+        description: "Submission message (Kaggle 노출용)"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-submission
+  cancel-in-progress: false   # 동시 제출 방지 (Kaggle 일일 한도 보호)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout (with LFS if used)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # CI 의존성 최소 set — verify + forward smoke 만 돌리면 충분
+          pip install \
+            "torch==2.3.1+cpu" --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy pyyaml kaggle
+
+      - name: Resolve checkpoint from submission.yaml
+        id: resolve
+        run: |
+          if [ ! -f submission.yaml ]; then
+            echo "::error::submission.yaml 미존재"
+            exit 1
+          fi
+          # python yaml 로 안전하게 파싱 (jq/yq 불필요)
+          CKPT=$(python -c "import yaml; print(yaml.safe_load(open('submission.yaml'))['checkpoint'])")
+          MSG=$(python -c "import yaml; print(yaml.safe_load(open('submission.yaml')).get('message') or '')")
+          echo "checkpoint=$CKPT" >> "$GITHUB_OUTPUT"
+          echo "yaml_message=$MSG" >> "$GITHUB_OUTPUT"
+          if [ ! -f "$CKPT" ]; then
+            echo "::error::submission.yaml 이 가리키는 checkpoint 없음: $CKPT"
+            echo "  → submission 브랜치에 해당 .pt 가 commit 되어 있는지 확인 (LFS 추적 여부 포함)"
+            exit 1
+          fi
+          ls -lh "$CKPT"
+
+      - name: Build submission archive
+        # CLI arg 없이 호출 → submission.yaml 의 checkpoint 자동 사용
+        # --skip-encode: kaggle_environments orbit_wars env 는 CI 에 없음
+        # verify(차원) + forward smoke 는 정상 수행
+        run: |
+          python build_submission.py \
+            -o submission.tar.gz \
+            --skip-encode
+
+      - name: Configure Kaggle credentials
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+        run: |
+          if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
+            echo "::error::secrets.KAGGLE_USERNAME / KAGGLE_KEY 미설정"
+            echo "  Settings → Secrets and variables → Actions 에서 등록"
+            exit 1
+          fi
+          mkdir -p ~/.kaggle
+          # printf 로 JSON 합성 — 키 값에 따옴표/백슬래시 없다고 가정 (Kaggle key 는 hex)
+          printf '{"username":"%s","key":"%s"}\n' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Compose submission message
+        id: msg
+        run: |
+          # 우선순위: workflow_dispatch input > submission.yaml message > git commit subject > "auto-deploy <sha>"
+          INPUT_MSG="${{ github.event.inputs.message }}"
+          YAML_MSG="${{ steps.resolve.outputs.yaml_message }}"
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          SHA_SHORT=${GITHUB_SHA::7}
+          if   [ -n "$INPUT_MSG"  ]; then MSG="$INPUT_MSG"
+          elif [ -n "$YAML_MSG"   ]; then MSG="$YAML_MSG"
+          elif [ -n "$COMMIT_MSG" ]; then MSG="$COMMIT_MSG"
+          else                            MSG="auto-deploy $SHA_SHORT"
+          fi
+          # Kaggle 메시지는 앞부분만 — 길면 잘림. 1줄·100자 cap.
+          MSG=$(echo "$MSG" | head -n1 | cut -c1-100)
+          echo "msg=$MSG" >> "$GITHUB_OUTPUT"
+          echo "Submission message: $MSG"
+
+      - name: Submit to Kaggle
+        run: |
+          kaggle competitions submit \
+            -c orbit-wars \
+            -f submission.tar.gz \
+            -m "${{ steps.msg.outputs.msg }}"
+
+      - name: Show recent submissions (확인)
+        if: always()
+        run: |
+          # 직전 제출 상태 (PENDING/COMPLETE/ERROR) — 즉시 결과는 보통 PENDING
+          kaggle competitions submissions -c orbit-wars | head -10 || true
+
+      - name: Upload archive as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: submission-${{ github.sha }}
+          path: submission.tar.gz
+          retention-days: 30

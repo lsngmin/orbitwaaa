@@ -1,0 +1,15 @@
+# 어떤 학습 산출물(.pt)을 Kaggle 에 제출할지 가리키는 포인터.
+#
+# 사용법:
+#   - 이 파일의 `checkpoint:` 한 줄만 갈아끼우면 build_submission.py / GitHub
+#     Actions 둘 다 자동 반영.
+#   - 경로는 repo root 기준 상대 경로 또는 절대 경로 (둘 다 OK).
+#   - `python build_submission.py` (인자 0개) → 이 파일 사용
+#   - `python build_submission.py path/to/other.pt` → CLI 가 yaml 을 override.
+
+# 제출할 checkpoint 경로
+checkpoint: checkpoints/full_ep_20260425_0411/main_latest.pt
+
+# Kaggle 제출 메시지 (선택). 비워두면 git commit 메시지 사용.
+# 위 .pt 는 PLANET_DIM=21 시기(1차 변경 전) gen49 산출물 — 현재 코드(PLANET_DIM=23)와 불일치.
+message: "gen49 baseline (legacy PLANET_DIM=21, win_rate=0.548 vs league)"

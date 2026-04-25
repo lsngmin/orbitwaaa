@@ -4,3 +4,6 @@
 __pycache__/
 .ipynb_checkpoints/
 
+# Jupyter — output 셀 박힌 큰 노트북이 repo 에 들어가는 것 방지.
+# 의도적으로 트래킹할 노트북은 `git add -f <name>.ipynb` 로 강제 추가.
+*.ipynb
