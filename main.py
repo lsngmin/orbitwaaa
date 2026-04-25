@@ -151,7 +151,7 @@ def agent(obs):
     # history 업데이트 (encode 는 학습용 env_wrapper 와 동일한 submission_features 사용)
     p_hist, f_hist = _history(player)
     p_hist.append(encode_planets(raw_planets, raw_fleets, player, comet_ids, av))
-    f_hist.append(encode_fleets(raw_fleets, player))
+    f_hist.append(encode_fleets(raw_fleets, raw_planets, player))
 
     # 학습 obs 레이아웃: (H * (P*PD + F*FD),) flat
     p_stack = np.stack(list(p_hist), axis=0)              # (H, P, PD)

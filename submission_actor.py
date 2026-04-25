@@ -35,7 +35,8 @@ HISTORY                = M["temporal_window"]
 MAX_PLANETS            = ENV["max_planets"]
 MAX_FLEETS             = ENV["max_fleets"]
 PLANET_DIM             = 23   # submission_features 와 동기화 (+2: source defensive)
-FLEET_DIM              = 7
+FLEET_DIM              = 8   # 0-6: numeric features, 7: from_planet_idx (-1=invalid)
+FLEET_FEAT_DIM         = 7
 
 SHIPS_MULTIPLIER_BINS = tuple(M.get("ships_multiplier_bins", [1.10, 1.30, 1.60, 2.00]))
 NUM_SHIPS_BINS        = len(SHIPS_MULTIPLIER_BINS)
@@ -67,8 +68,12 @@ class OrbitWarsActor(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.planet_embed = nn.Linear(PLANET_DIM, EMBED_DIM)
-        self.fleet_embed  = nn.Linear(FLEET_DIM,  EMBED_DIM)
+        self.planet_embed = nn.Linear(PLANET_DIM,     EMBED_DIM)
+        self.fleet_embed  = nn.Linear(FLEET_FEAT_DIM, EMBED_DIM)
+
+        # Gated source-planet fusion (model.py 와 키 동일)
+        self.fleet_source_value = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
+        self.fleet_source_gate  = nn.Linear(EMBED_DIM * 2, EMBED_DIM)
 
         self.planet_temporal_pos = nn.Embedding(HISTORY, EMBED_DIM)
         self.fleet_temporal_pos  = nn.Embedding(HISTORY, EMBED_DIM)
@@ -98,8 +103,11 @@ class OrbitWarsActor(nn.Module):
         p_raw = obs[:, :, :p_size].view(B, HISTORY, MAX_PLANETS, PLANET_DIM)
         f_raw = obs[:, :, p_size:].view(B, HISTORY, MAX_FLEETS,  FLEET_DIM)
 
+        f_features = f_raw[..., :FLEET_FEAT_DIM]
+        fp_idx_raw = f_raw[:, -1, :, -1]
+
         p_emb = self.planet_embed(p_raw)
-        f_emb = self.fleet_embed(f_raw)
+        f_emb = self.fleet_embed(f_features)
 
         t_idx = torch.arange(HISTORY, device=obs_flat.device)
 
@@ -119,6 +127,18 @@ class OrbitWarsActor(nn.Module):
             f_t   = f_t[:, -1, :].view(B, MAX_FLEETS, EMBED_DIM)
         else:
             f_t = f_emb[:, -1, :, :]
+
+        # Source planet fusion (model.py 와 동일)
+        fp_idx      = fp_idx_raw.long()
+        valid       = (fp_idx >= 0) & (fp_idx < MAX_PLANETS)
+        fp_idx_safe = fp_idx.clamp(0, MAX_PLANETS - 1)
+        gather_idx  = fp_idx_safe.unsqueeze(-1).expand(-1, -1, EMBED_DIM)
+        src_t       = p_t.gather(1, gather_idx)
+
+        fused_in = torch.cat([f_t, src_t], dim=-1)
+        gate     = torch.sigmoid(self.fleet_source_gate(fused_in))
+        cand     = torch.tanh(self.fleet_source_value(fused_in))
+        f_t      = f_t + gate * cand * valid.unsqueeze(-1).to(f_t.dtype)
 
         # Local (fleet ↔ planet) + Global
         local_tokens = torch.cat([p_t, f_t], dim=1)
