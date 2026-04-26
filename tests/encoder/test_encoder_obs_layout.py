@@ -44,15 +44,19 @@ def test_max_planets_fleets_synced():
 
 
 def test_obs_dim_formula():
-    """OBS_DIM = HISTORY * (P*PD + F*FD)."""
+    """OBS_DIM = HISTORY * (P*PD + F*FD).
+
+    Step 3 후 forward 는 (src_token, value) 반환 — sequential head 적용 전 encoder
+    출력이라 EMBED_DIM 차원.
+    """
     expected = mdl.HISTORY * (mdl.MAX_PLANETS * mdl.PLANET_DIM
                                + mdl.MAX_FLEETS * mdl.FLEET_DIM)
     obs = torch.zeros(1, expected)
     m = mdl.OrbitWarsPolicy().eval()
     with torch.no_grad():
-        logits, value = m(obs)
-    assert logits.shape == (1, mdl.MAX_PLANETS, mdl.ACTION_DIM)
-    assert value.shape  == (1, 1)
+        src_token, value = m(obs)
+    assert src_token.shape == (1, mdl.MAX_PLANETS, mdl.EMBED_DIM)
+    assert value.shape     == (1, 1)
 
 
 def test_flatten_restore_round_trip():
@@ -176,10 +180,10 @@ def test_attention_pool_query_independent_of_input_last_turn():
     OBS = H * (P * PD + F * FD)
     obs = torch.zeros(1, OBS)
     with torch.no_grad():
-        logits, value = m(obs)
-    assert logits.shape == (1, P, mdl.ACTION_DIM)
+        src_token, value = m(obs)
+    assert src_token.shape == (1, P, mdl.EMBED_DIM)
     assert value.shape == (1, 1)
-    assert not torch.isnan(logits).any()
+    assert not torch.isnan(src_token).any()
 
 
 def test_fleet_padding_mask_separates_empty_from_lookup_miss():

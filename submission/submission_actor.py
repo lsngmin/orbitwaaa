@@ -50,8 +50,9 @@ FLEET_FEAT_DIM         = 7
 
 SHIPS_SURPLUS_BINS = tuple(M.get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
 NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
-# 5-way action: idx 0 = skip, 1..K = bin (k-1). model.py 와 동기.
+# 5-way amount action: idx 0 = skip, 1..K = bin (k-1). model.py 와 동기.
 NUM_ACTIONS        = 1 + NUM_SHIPS_BINS
+# Action layout (env_wrapper / decode 호환): [a_onehot(NUM_ACTIONS), t_onehot(P)]
 ACTION_DIM         = NUM_ACTIONS + MAX_PLANETS
 
 
@@ -64,6 +65,18 @@ def _make_transformer(layers):
         batch_first=True,
     )
     return nn.TransformerEncoder(enc, num_layers=layers)
+
+
+def _make_decoder(layers):
+    """model.make_decoder 미러 — planet query → [P+F] memory cross-attn."""
+    dec = nn.TransformerDecoderLayer(
+        d_model=EMBED_DIM,
+        nhead=NUM_HEADS,
+        dim_feedforward=EMBED_DIM * 2,
+        dropout=0.0,
+        batch_first=True,
+    )
+    return nn.TransformerDecoder(dec, num_layers=layers)
 
 
 def _safe_pad_mask(pad_mask):
@@ -112,18 +125,44 @@ class OrbitWarsActor(nn.Module):
         )
 
         self.local_attn  = _make_transformer(LOCAL_LAYERS)
-        self.global_attn = _make_transformer(GLOBAL_LAYERS)
+        # Global: cross-attn decoder (Q=P, KV=P+F) — model.py 와 동기
+        self.global_attn = _make_decoder(GLOBAL_LAYERS)
 
-        self.actor = nn.Sequential(
+        # Step 3 sequential heads — model.py 와 키 동일.
+        #   target_i  ~ Categorical(target_head(src_i))
+        #   amount_i  ~ Categorical(amount_pair_head(src_i, dst_target_i))
+        self.target_head = nn.Sequential(
             nn.Linear(EMBED_DIM, EMBED_DIM),
             nn.ReLU(),
-            nn.Linear(EMBED_DIM, ACTION_DIM),
+            nn.Linear(EMBED_DIM, MAX_PLANETS),
         )
+        self.amount_pair_head = nn.Sequential(
+            nn.Linear(EMBED_DIM * 2, EMBED_DIM),
+            nn.ReLU(),
+            nn.Linear(EMBED_DIM, NUM_ACTIONS),
+        )
+
+    def amount_logits(self, src_token, target_idx):
+        """Pair-wise amount head — model.py._amount_logits 와 동일.
+
+        src_token : (B, P, E) — forward 출력
+        target_idx: (B, P) long
+        returns   : (B, P, NUM_ACTIONS) — 5-way (idx 0 = skip)
+        """
+        B, P, E = src_token.shape
+        idx_safe   = target_idx.clamp(0, P - 1)
+        gather_idx = idx_safe.unsqueeze(-1).expand(-1, -1, E)
+        dst_token  = src_token.gather(1, gather_idx)
+        pair_input = torch.cat([src_token, dst_token], dim=-1)
+        return self.amount_pair_head(pair_input)
 
     def forward(self, obs_flat):
         """
         obs_flat: (B, HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM))
-        returns action_logits: (B, MAX_PLANETS, ACTION_DIM)
+        returns src_token: (B, MAX_PLANETS, EMBED_DIM)
+
+        Heads (target_head / amount_pair_head) 는 caller (main.py) 가 직접 호출.
+        sequential 샘플링이 필요해서 forward 단에서 amount logits 를 미리 못 만듦.
         """
         B = obs_flat.shape[0]
         p_size = MAX_PLANETS * PLANET_DIM
@@ -203,11 +242,16 @@ class OrbitWarsActor(nn.Module):
         f_t = _fuse(f_t, fp_idx_raw, self.fleet_source_value, self.fleet_source_gate)
         f_t = _fuse(f_t, dp_idx_raw, self.fleet_dest_value,   self.fleet_dest_gate)
 
-        # Local (fleet ↔ planet) + Global
+        # Local (fleet ↔ planet) + Global cross-attn
         local_tokens = torch.cat([p_t, f_t], dim=1)
         local_pad    = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
         local_out    = self.local_attn(local_tokens, src_key_padding_mask=_safe_pad_mask(local_pad))
-        p_local      = local_out[:, :MAX_PLANETS, :]
-        global_out   = self.global_attn(p_local, src_key_padding_mask=_safe_pad_mask(planet_pad_now))
+        p_query      = local_out[:, :MAX_PLANETS, :]                      # decoder query (B, P, E)
+        global_out   = self.global_attn(
+            tgt=p_query,
+            memory=local_out,                                              # KV = P+F (함대 정보 유지)
+            tgt_key_padding_mask=_safe_pad_mask(planet_pad_now),
+            memory_key_padding_mask=_safe_pad_mask(local_pad),
+        )
 
-        return self.actor(global_out)
+        return global_out

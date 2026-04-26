@@ -61,6 +61,21 @@ def make_transformer(layers):
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
 
+def make_decoder(layers):
+    """Cross-attn decoder: planet query 가 [P+F] memory 를 읽음.
+
+    한 층 안에 (planet self-attn) + (planet→[P+F] cross-attn) + FFN.
+    """
+    decoder_layer = nn.TransformerDecoderLayer(
+        d_model=EMBED_DIM,
+        nhead=NUM_HEADS,
+        dim_feedforward=EMBED_DIM * 2,
+        dropout=0.0,
+        batch_first=True,
+    )
+    return nn.TransformerDecoder(decoder_layer, num_layers=layers)
+
+
 def _safe_pad_mask(pad_mask):
     """src_key_padding_mask 안전화: 시퀀스 전체가 padding 인 경우 NaN 회피.
 
@@ -115,14 +130,26 @@ class OrbitWarsPolicy(nn.Module):
         # 2. Local Attention — fleet ↔ 행성 관계
         self.local_attn = make_transformer(LOCAL_LAYERS)
 
-        # 3. Global Attention — 전체 전략
-        self.global_attn = make_transformer(GLOBAL_LAYERS)
+        # 3. Global Attention — planet query 가 [P+F] memory 를 cross-attn 으로 읽음.
+        # 기존 P-only self-attn 의 정보 병목 (함대가 local 후 사라짐) 해소:
+        # local 4층으로 P+F 관계 깊게 섞고, global decoder 가 마지막에 P 가 함대까지
+        # 한 번 더 참조해 의사결정 표현 만듦.
+        self.global_attn = make_decoder(GLOBAL_LAYERS)
 
-        # Actor head — 행성별 행동 출력
-        self.actor = nn.Sequential(
+        # Actor heads — sequential factorization (Step 3):
+        #   target_i  ~ Categorical(target_head(src_i))                     # (P,)
+        #   amount_i  ~ Categorical(amount_pair_head(src_i, dst_target_i))  # 5-way (skip+bins)
+        # amount 이 src,target 둘 다 보고 결정 → "어디로 보낼지" 가 정해진 후
+        # "그곳으로 몇 척" 을 평가. skip 은 amount 의 0 번 bin 으로 흡수.
+        self.target_head = nn.Sequential(
             nn.Linear(EMBED_DIM, EMBED_DIM),
             nn.ReLU(),
-            nn.Linear(EMBED_DIM, ACTION_DIM),
+            nn.Linear(EMBED_DIM, MAX_PLANETS),
+        )
+        self.amount_pair_head = nn.Sequential(
+            nn.Linear(EMBED_DIM * 2, EMBED_DIM),
+            nn.ReLU(),
+            nn.Linear(EMBED_DIM, NUM_ACTIONS),
         )
 
         # Critic head — 상태 가치 출력
@@ -189,8 +216,11 @@ class OrbitWarsPolicy(nn.Module):
         """
         obs_flat: (B, HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM))
         returns:
-          action_logits: (B, MAX_PLANETS, ACTION_DIM)
-          value:         (B, 1)
+          src_token: (B, MAX_PLANETS, EMBED_DIM) — encoder output (= global_out)
+          value:     (B, 1)
+        head 적용은 get_action_and_value / evaluate_actions 가 담당 (target → amount
+        sequential conditional sampling 때문에 forward 단에서 amount logits 를 미리
+        못 계산함 — target 샘플이 필요).
         """
         B = obs_flat.shape[0]
         p_size = MAX_PLANETS * PLANET_DIM
@@ -257,13 +287,17 @@ class OrbitWarsPolicy(nn.Module):
         local_tokens = torch.cat([p_t, f_t], dim=1)               # (B, P+F, E)
         local_pad    = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
         local_out    = self.local_attn(local_tokens, src_key_padding_mask=_safe_pad_mask(local_pad))
-        p_local = local_out[:, :MAX_PLANETS, :]       # (B, P, E)
+        p_query = local_out[:, :MAX_PLANETS, :]                   # (B, P, E) — decoder query
 
-        # --- 3. Global Attention ---
-        global_out = self.global_attn(p_local, src_key_padding_mask=_safe_pad_mask(planet_pad_now))
-
-        # --- Actor ---
-        action_logits = self.actor(global_out)         # (B, P, ACTION_DIM)
+        # --- 3. Global Attention (cross-attn: P → [P+F]) ---
+        # tgt    = planet local output (B, P, E)
+        # memory = full local output  (B, P+F, E)  — 함대 정보 유지
+        global_out = self.global_attn(
+            tgt=p_query,
+            memory=local_out,
+            tgt_key_padding_mask=_safe_pad_mask(planet_pad_now),
+            memory_key_padding_mask=_safe_pad_mask(local_pad),
+        )
 
         # --- Critic (masked mean 풀링) ---
         # 빈 행성 토큰을 평균에서 배제 — 후반 P_alive ≪ MAX_PLANETS 일 때
@@ -273,47 +307,64 @@ class OrbitWarsPolicy(nn.Module):
         valid_count = valid_p.sum(dim=1).clamp(min=1.0)                       # (B, 1)
         value       = self.critic(valid_sum / valid_count)                    # (B, 1)
 
-        return action_logits, value
+        return global_out, value
 
-    def _split_logits(self, action_logits):
-        """action_logits: (B, P, ACTION_DIM) → (action_5way, target) 분리.
+    def _amount_logits(self, src_token, target_idx):
+        """Pair-wise amount head. amount = f(src_i, dst_{target_i}).
 
-        Layout: [action_5way(NUM_ACTIONS), target(P)]
-          action_5way idx 0 = skip, idx 1..K = bin (k-1).
+        Args:
+          src_token : (B, P, E) — forward 의 encoder 출력
+          target_idx: (B, P) long — 각 source 가 가리키는 target index
+        Returns:
+          (B, P, NUM_ACTIONS) — 5-way logits (idx 0 = skip)
         """
-        a_logits = action_logits[..., :NUM_ACTIONS]
-        t_logits = action_logits[..., NUM_ACTIONS:]
-        return a_logits, t_logits
+        B, P, E = src_token.shape
+        idx_safe   = target_idx.clamp(0, P - 1)
+        gather_idx = idx_safe.unsqueeze(-1).expand(-1, -1, E)
+        dst_token  = src_token.gather(1, gather_idx)                    # (B, P, E)
+        pair_input = torch.cat([src_token, dst_token], dim=-1)          # (B, P, 2E)
+        return self.amount_pair_head(pair_input)
 
     def get_action_and_value(self, obs_flat, action_mask=None, target_mask=None):
-        """PPO 학습용: 행동 샘플링 + log_prob + value.
+        """PPO 학습용: target → amount sequential conditional sampling.
 
-        action_mask: (B, P, NUM_ACTIONS) bool — False 위치의 action 확률을 0으로 강제.
-                     skip(idx 0) 은 항상 허용, bin(idx 1..) 은 source 가용성 따라 마스킹.
-        target_mask: (B, P, P) bool — False 위치의 target 선택 확률을 0으로 강제.
-        target log_prob 는 action_idx > 0 (= 발사) 일 때만 계산.
+        Sampling order:
+          1. target_i ~ Categorical(target_head(src_i))                       # masked
+          2. amount_i ~ Categorical(amount_pair_head(src_i, dst_target_i))    # masked
+
+        action_mask: (B, P, NUM_ACTIONS) bool — amount logits 마스킹.
+                     skip(idx 0) 은 항상 허용, bin(idx 1..) 은 source 가용성 따라.
+        target_mask: (B, P, P) bool — target logits 마스킹.
+
+        log_prob factorization (skip 흡수 방식):
+          log p(action) = log p(amount | src, target) + is_launch · log p(target | src)
+          target sample 은 항상 뽑지만 launch=0(skip) 일 때 lp_target 게이팅으로
+          target_head 학습 신호 차단.
+
+        Returns: action, log_prob, value, lp_heads (action layout = [a_onehot(K), t_onehot(P)])
         """
-        action_logits, value = self.forward(obs_flat)
-        a_logits, t_logits = self._split_logits(action_logits)
+        src_token, value = self.forward(obs_flat)
 
-        # 5-way action — mask 적용
-        if action_mask is not None:
-            a_logits = a_logits.masked_fill(~action_mask, -1e9)
-        a_dist = torch.distributions.Categorical(logits=a_logits)
-        a_idx  = a_dist.sample()                         # (B, P) long, 0=skip
-
-        # 타겟 선택 (Categorical) — mask 적용
+        # Step 1: target sample
+        t_logits = self.target_head(src_token)                          # (B, P, P)
         if target_mask is not None:
             t_logits = t_logits.masked_fill(~target_mask, -1e9)
         t_dist = torch.distributions.Categorical(logits=t_logits)
-        target = t_dist.sample()                         # (B, P) long
+        target = t_dist.sample()                                         # (B, P) long
+
+        # Step 2: amount sample (conditional on target)
+        a_logits = self._amount_logits(src_token, target)                # (B, P, NUM_ACTIONS)
+        if action_mask is not None:
+            a_logits = a_logits.masked_fill(~action_mask, -1e9)
+        a_dist = torch.distributions.Categorical(logits=a_logits)
+        a_idx  = a_dist.sample()                                         # (B, P) long, 0=skip
 
         is_launch = (a_idx > 0).float()
         lp_action = a_dist.log_prob(a_idx).sum(-1)
         lp_target = (t_dist.log_prob(target) * is_launch).sum(-1)
         log_prob  = lp_action + lp_target
 
-        # action 합치기: (B, P, NUM_ACTIONS + P)
+        # action 합치기: (B, P, NUM_ACTIONS + P) — env_wrapper / decode 와 호환.
         a_onehot = torch.zeros(*a_logits.shape, device=obs_flat.device)
         a_onehot.scatter_(-1, a_idx.unsqueeze(-1), 1.0)
         t_onehot = torch.zeros(*t_logits.shape, device=obs_flat.device)
@@ -324,23 +375,24 @@ class OrbitWarsPolicy(nn.Module):
         return action, log_prob, value, lp_heads
 
     def evaluate_actions(self, obs_flat, actions, action_mask=None, target_mask=None):
-        """PPO 업데이트용: 주어진 행동의 log_prob + entropy + value.
+        """PPO 업데이트용: 저장된 (target, amount) 의 log_prob + entropy + value.
 
-        rollout 시 사용한 것과 동일한 mask를 전달해야 importance ratio가 유효함.
+        rollout 시와 동일 마스크 사용해야 importance ratio 유효.
         """
-        action_logits, value = self.forward(obs_flat)
-        a_logits, t_logits = self._split_logits(action_logits)
+        src_token, value = self.forward(obs_flat)
 
-        a_idx  = actions[..., :NUM_ACTIONS].argmax(dim=-1)
-        target = actions[..., NUM_ACTIONS:].argmax(dim=-1)
+        a_idx  = actions[..., :NUM_ACTIONS].argmax(dim=-1)               # (B, P)
+        target = actions[..., NUM_ACTIONS:].argmax(dim=-1)               # (B, P)
 
-        if action_mask is not None:
-            a_logits = a_logits.masked_fill(~action_mask, -1e9)
-        a_dist = torch.distributions.Categorical(logits=a_logits)
-
+        t_logits = self.target_head(src_token)
         if target_mask is not None:
             t_logits = t_logits.masked_fill(~target_mask, -1e9)
         t_dist = torch.distributions.Categorical(logits=t_logits)
+
+        a_logits = self._amount_logits(src_token, target)                # 저장된 target 으로 pair
+        if action_mask is not None:
+            a_logits = a_logits.masked_fill(~action_mask, -1e9)
+        a_dist = torch.distributions.Categorical(logits=a_logits)
 
         is_launch = (a_idx > 0).float()
         lp_action = a_dist.log_prob(a_idx).sum(-1)

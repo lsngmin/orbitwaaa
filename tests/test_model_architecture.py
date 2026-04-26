@@ -15,7 +15,7 @@ import torch
 import pytest
 from model import (
     OrbitWarsPolicy,
-    HISTORY, MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, ACTION_DIM,
+    HISTORY, MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, ACTION_DIM, EMBED_DIM,
 )
 
 OBS_DIM = HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM)
@@ -51,12 +51,15 @@ def test_temporal_attn_weights_not_shared(model):
 
 
 def test_forward_output_shapes(model):
-    """forward pass가 올바른 shape를 반환하는지 확인."""
+    """forward pass가 올바른 shape를 반환하는지 확인.
+
+    Step 3: forward 는 (src_token, value) 반환 — head 적용 전 encoder 출력.
+    """
     B = 3
     obs = torch.randn(B, OBS_DIM)
-    logits, value = model(obs)
-    assert logits.shape == (B, MAX_PLANETS, ACTION_DIM)
-    assert value.shape  == (B, 1)
+    src_token, value = model(obs)
+    assert src_token.shape == (B, MAX_PLANETS, EMBED_DIM)
+    assert value.shape     == (B, 1)
 
 
 def test_get_action_and_value_shapes(model):

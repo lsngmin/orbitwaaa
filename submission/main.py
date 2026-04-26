@@ -124,22 +124,24 @@ def _history(player, current_step):
 
 # ── Action sampling (학습 get_action_and_value 와 parity) ────────────────────
 
-def _sample_action(action_logits, analysis):
-    """학습 OrbitWarsPolicy.get_action_and_value 와 동일한 mask+sampling.
+def _sample_action(model, src_token, analysis):
+    """학습 OrbitWarsPolicy.get_action_and_value 와 동일한 sequential sampling.
 
-    action_logits: (1, MAX_PLANETS, ACTION_DIM) CPU tensor
-    return: (MAX_PLANETS, ACTION_DIM) numpy
+      1. target_i ~ Categorical(target_head(src_i))            # masked
+      2. amount_i ~ Categorical(amount_pair_head(src_i, dst))  # masked, 5-way
 
-    Layout: [action_5way(NUM_ACTIONS), target(MAX_PLANETS)] — 5-way idx 0=skip.
+    src_token: (1, MAX_PLANETS, EMBED_DIM) CPU tensor
+    return:    (MAX_PLANETS, ACTION_DIM) numpy — [a_onehot(K), t_onehot(P)]
     """
-    a_logits = action_logits[0, :, :NUM_ACTIONS].clone()
-    t_logits = action_logits[0, :, NUM_ACTIONS:].clone()
-
-    a_logits = a_logits.masked_fill(~analysis.action_mask, -1e9)
+    # Step 1: target sample
+    t_logits = model.target_head(src_token)[0]                              # (P, P)
     t_logits = t_logits.masked_fill(~analysis.target_mask, -1e9)
+    target   = torch.distributions.Categorical(logits=t_logits).sample()    # (P,)
 
-    a_idx  = torch.distributions.Categorical(logits=a_logits).sample()
-    target = torch.distributions.Categorical(logits=t_logits).sample()
+    # Step 2: amount sample (conditional on target)
+    a_logits = model.amount_logits(src_token, target.unsqueeze(0))[0]       # (P, NUM_ACTIONS)
+    a_logits = a_logits.masked_fill(~analysis.action_mask, -1e9)
+    a_idx    = torch.distributions.Categorical(logits=a_logits).sample()    # (P,)
 
     a_onehot = torch.zeros_like(a_logits)
     a_onehot.scatter_(-1, a_idx.unsqueeze(-1), 1.0)
@@ -196,10 +198,11 @@ def agent(obs):
     obs_t    = torch.from_numpy(flat).unsqueeze(0).to(_DEVICE)  # (1, ...)
 
     with torch.no_grad():
-        action_logits = model(obs_t).cpu()               # (1, P, ACTION_DIM)
+        src_token = model(obs_t).cpu()                    # (1, P, EMBED_DIM)
 
     analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=player)
-    action_np = _sample_action(action_logits, analysis)
+    with torch.no_grad():
+        action_np = _sample_action(model, src_token, analysis)
     moves = decode_action_to_moves(
         action_np, raw_planets, av, acting_player=player, analysis=analysis
     )
