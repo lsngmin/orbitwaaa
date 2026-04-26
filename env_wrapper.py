@@ -36,6 +36,9 @@ FLEET_FEAT_DIM = 7   # fleet_embed 입력 dim (idx 제외)
 # bin=0 → just-capture (floor=required), bin=1 → 올인 (src.ships 전부)
 SHIPS_SURPLUS_BINS = tuple(CONFIG["model"].get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
 NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
+# 단일 5-way action: idx 0 = skip (발사 안 함), idx 1..K = bin (k-1) (발사 + 함선량).
+# launch + ships_bin 통합 head — 정책이 source 별 "발사 보류" 를 직접 학습.
+NUM_ACTIONS        = 1 + NUM_SHIPS_BINS
 
 
 ETA_NEAR = 5   # 1~5턴: 즉각 위협
@@ -351,13 +354,14 @@ class OrbitWarsEnv(gym.Env):
       fleets_history:  (HISTORY, MAX_FLEETS,  FLEET_DIM)
 
     행동 공간:
-      (MAX_PLANETS, 1 + NUM_SHIPS_BINS + MAX_PLANETS)
-      action[i, 0]                        = 발사 여부 (0~1, 0.5 이상이면 발사)
-      action[i, 1:1+NUM_SHIPS_BINS]       = ships_bin one-hot (surplus fraction)
-      action[i, 1+NUM_SHIPS_BINS:]        = 타겟 one-hot (argmax로 선택)
+      (MAX_PLANETS, NUM_ACTIONS + MAX_PLANETS)
+      action[i, :NUM_ACTIONS]    = 5-way one-hot (skip + K bins)
+                                   idx 0 = skip (발사 안 함)
+                                   idx 1..K = bin (k-1) — 발사 + 함선량 동시 결정
+      action[i, NUM_ACTIONS:]    = 타겟 one-hot (argmax로 선택)
 
-    ships 계산 (decode 시, surplus-based):
-      bin_value    = SHIPS_SURPLUS_BINS[ships_bin]
+    ships 계산 (decode 시, surplus-based; action_idx ≥ 1 일 때만):
+      bin_value    = SHIPS_SURPLUS_BINS[action_idx - 1]
       required     = ETA forward sim 기반 도착 시 필요 함선
       surplus      = max(0, src.ships - required)
       ships_needed = clip(required + bin_value × surplus, 1, src.ships)
@@ -377,7 +381,7 @@ class OrbitWarsEnv(gym.Env):
 
         self.action_space = spaces.Box(
             low=-1.0, high=1.0,
-            shape=(MAX_PLANETS, 1 + NUM_SHIPS_BINS + MAX_PLANETS),
+            shape=(MAX_PLANETS, NUM_ACTIONS + MAX_PLANETS),
             dtype=np.float32
         )
 
@@ -488,11 +492,11 @@ class OrbitWarsEnv(gym.Env):
             if p.owner != self._player:
                 continue
 
-            launch_prob      = float(action[i, 0])
-            ships_bin_logits = action[i, 1:1 + NUM_SHIPS_BINS]
-            target_logits    = action[i, 1 + NUM_SHIPS_BINS:]
+            action_logits = action[i, :NUM_ACTIONS]
+            target_logits = action[i, NUM_ACTIONS:]
 
-            if launch_prob < 0.5:
+            action_idx = int(np.argmax(action_logits))
+            if action_idx == 0:        # skip — 발사 안 함
                 continue
 
             # 타겟 선택 (argmax, 유효한 타겟만)
@@ -506,9 +510,8 @@ class OrbitWarsEnv(gym.Env):
             target_idx = int(np.argmax(target_probs))
             target     = planets[target_idx]
 
-            # ships_bin → surplus fraction → ships_needed
-            ships_bin = int(np.argmax(ships_bin_logits))
-            bin_value = float(SHIPS_SURPLUS_BINS[ships_bin])
+            # action_idx (1..K) → bin (idx 0..K-1) → surplus fraction
+            bin_value = float(SHIPS_SURPLUS_BINS[action_idx - 1])
 
             # 고정점 반복으로 (ships_needed, required) 동시 해결.
             # 동적: in-flight fleet 효과를 ETA forward sim 으로 반영.

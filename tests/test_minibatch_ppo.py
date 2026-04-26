@@ -2,8 +2,8 @@
 Minibatch PPO 검증 테스트.
 
 - n_epochs * ceil(N/minibatch_size) 횟수만큼 업데이트 발생
-- 반환값 10개 (p_loss, v_loss, e_loss, approx_kl, clip_frac,
-  epochs_done, ent_launch, ent_ships, ent_target, head_metrics) shape/type 확인
+- 반환값 9개 (p_loss, v_loss, e_loss, approx_kl, clip_frac,
+  epochs_done, ent_action, ent_target, head_metrics) shape/type 확인
 - approx_kl >= 0, clip_frac in [0, 1]
 - 동일 데이터 single-pass 대비 weights가 실제로 달라지는지 확인
 - NaN/Inf 없는지 smoke test
@@ -40,21 +40,21 @@ def model_and_opt():
     return m, opt
 
 
-def test_ppo_update_returns_ten_values(model_and_opt):
-    """ppo_update가 10개 값을 반환하는지 확인 (마지막은 per-head head_metrics dict)."""
+def test_ppo_update_returns_nine_values(model_and_opt):
+    """ppo_update가 9개 값을 반환하는지 확인 (마지막은 per-head head_metrics dict)."""
     m, opt = model_and_opt
     obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     result = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
                         n_epochs=1, minibatch_size=N)
-    assert len(result) == 10
-    assert isinstance(result[9], dict)
+    assert len(result) == 9
+    assert isinstance(result[8], dict)
 
 
 def test_approx_kl_nonnegative(model_and_opt):
     """approx_kl >= 0 (KL divergence 하한)."""
     m, opt = model_and_opt
     obs, actions, old_lp, rets, advs = make_dummy_batch(m)
-    _, _, _, approx_kl, _, _, _, _, _, _ = ppo_update(
+    _, _, _, approx_kl, _, _, _, _, _ = ppo_update(
         m, opt, obs, actions, old_lp, rets, advs,
         n_epochs=1, minibatch_size=N)
     assert approx_kl >= 0, f"approx_kl={approx_kl} < 0"
@@ -64,7 +64,7 @@ def test_clip_frac_in_range(model_and_opt):
     """clip_frac in [0, 1]."""
     m, opt = model_and_opt
     obs, actions, old_lp, rets, advs = make_dummy_batch(m)
-    _, _, _, _, clip_frac, _, _, _, _, _ = ppo_update(
+    _, _, _, _, clip_frac, _, _, _, _ = ppo_update(
         m, opt, obs, actions, old_lp, rets, advs,
         n_epochs=1, minibatch_size=N)
     assert 0.0 <= clip_frac <= 1.0, f"clip_frac={clip_frac} out of range"
@@ -76,10 +76,10 @@ def test_no_nan_in_outputs(model_and_opt):
     obs, actions, old_lp, rets, advs = make_dummy_batch(m)
     results = ppo_update(m, opt, obs, actions, old_lp, rets, advs,
                          n_epochs=2, minibatch_size=16)
-    for val in results[:9]:
+    for val in results[:8]:
         assert not (val != val), f"NaN 발생: {results}"
         assert abs(val) < 1e6,   f"Inf 발생: {results}"
-    for k, v in results[9].items():
+    for k, v in results[8].items():
         assert not (v != v), f"head_metrics[{k}] NaN"
         assert abs(v) < 1e6,  f"head_metrics[{k}] Inf"
 

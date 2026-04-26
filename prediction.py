@@ -313,8 +313,8 @@ def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
       ships_needed = clip(required + bin_value × surplus, 1, src_ships)
 
     bin_value=0 → just-capture (floor=required), bin_value=1 → 올인 (src_ships).
-    src_ships < required (capacity short) 인 경우 ships_needed = src_ships
-    (호출자가 capacity 부족을 under_invested 로 집계).
+    src_ships < required (capacity short) 인 경우 ships_needed = 0
+    (점령 수학적 불가 — dominated action. 호출자가 under_invested 로 집계 후 launch 폐기).
 
     고정점 반복: required 가 ships(=속도) 에 의존 → 한번에 안 풀림.
       ships↑ → 속도↑ → turns↓ → required↓ → ships(=req+frac×surplus) 변동 → 반복.
@@ -344,8 +344,9 @@ def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
         if req <= 0:
             return 0
         if src_ships < req:
-            # capacity short: 보낼 수 있는 만큼만 (호출자가 under_invested 로 집계)
-            return src_ships
+            # capacity short: 점령 수학적 불가 — dominated action 으로 차단.
+            # 0 반환 → 호출자가 under_invested 로 집계 후 launch 자체 폐기.
+            return 0
         surplus = src_ships - req
         raw = req + bin_value * surplus
         return min(src_ships, max(1, int(round(raw))))
