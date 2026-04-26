@@ -40,7 +40,8 @@ from prediction import (
     resolve_ships_for_capture, project_target_at_eta,
 )
 
-with open("config.yaml") as f:
+_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+with open(_cfg_path) as f:
     CFG = yaml.safe_load(f)
 
 T  = CFG["training"]
@@ -271,10 +272,15 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
                 continue
             # Guard A: 도착 시점에 이미 내 행성이 될 예정이면 mask off
             eff_turns = turns if turns else 1
-            proj_owner, _proj_ships = project_target_at_eta(
+            proj_owner, proj_ships = project_target_at_eta(
                 tgt, eff_turns, planets, fleets,
             )
             if proj_owner == acting_player:
+                continue
+            # Guard B: src.ships < required (도착 시점 적 ships+1) 이면 점령 불가 → mask off.
+            # prediction._required_at 와 동일 식: max(1, int(proj_ships) + 1).
+            required = max(1, int(proj_ships) + 1)
+            if src.ships < required:
                 continue
             target_mask[i, j] = True
 
@@ -392,6 +398,13 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             fleets=(analysis.fleets if analysis is not None else None),
             planets=(planets if analysis is not None else None),
         )
+        # under_invested: src.ships < required → 1-A 가 ships_needed=0 으로 막은 케이스.
+        # filtered_zero_ships 와 분리해서 *발사 시도* 시점에 집계 (학습 페널티/지표용).
+        # required=0 (target 이 ETA 시점 self-owned) 은 점령 자체 의미 없음 → 제외.
+        if required > 0 and p.ships < required:
+            counts["under_invested_count"] += 1
+            suffix = "neutral" if target.owner == -1 else "enemy"
+            counts[f"under_invested_count_{suffix}"] += 1
         if ships_needed <= 0:
             counts["filtered_zero_ships"] += 1
             continue
@@ -414,33 +427,25 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             counts["launched_high_prod"] += 1
 
         # ── ships 실측 (launched 기준 집계) ──────────────────────────────────
-        # send_required_ratio = ships_needed / required  (실제 공급 비율)
-        # under_invested     = src.ships < required (capacity short — bin 무관 점령 불가).
-        #   surplus formula 는 src.ships >= required 면 ships_needed >= required 보장 →
-        #   이 분기는 src capacity 가 부족한 경우만.
+        # send_required_ratio = ships_needed / required  (실제 공급 비율).
+        # under_invested 는 위에서 *발사 시도* 시점에 이미 집계됨 (1-A 가 ships_needed=0
+        # 으로 차단했기 때문에 여기 도달하면 항상 src.ships >= required).
         srr = ships_needed / max(required, 1)
-        under_invested = p.ships < required
         send_frac_src = ships_needed / max(p.ships, 1)
-        # chosen_surplus_frac 은 bin 이 실제 영향을 준 launch (non-capacity-short) 만 누적.
-        if not under_invested:
-            counts["chosen_surplus_frac_sum"]    += bin_value
-            counts["chosen_surplus_frac_sq_sum"] += bin_value ** 2
-            counts["bin_effective_count"]        += 1
+        counts["chosen_surplus_frac_sum"]    += bin_value
+        counts["chosen_surplus_frac_sq_sum"] += bin_value ** 2
+        counts["bin_effective_count"]        += 1
         counts["send_fraction_of_src_sum"]    += send_frac_src
         counts["send_fraction_of_src_sq_sum"] += send_frac_src ** 2
         counts["ships_to_send_sum"]        += ships_needed
         counts["required_ships_sum"]       += required
         counts["send_required_ratio_sum"]  += srr
         counts[f"ships_bin_hist_{ships_bin}"] += 1
-        if under_invested:
-            counts["under_invested_count"] += 1
         # target-type 분리 (neutral vs enemy)
         suffix = "neutral" if target.owner == -1 else "enemy"
         counts[f"ships_to_send_sum_{suffix}"]       += ships_needed
         counts[f"required_ships_sum_{suffix}"]      += required
         counts[f"send_required_ratio_sum_{suffix}"] += srr
-        if under_invested:
-            counts[f"under_invested_count_{suffix}"] += 1
         # per-target 누적 (over-send 산출용 — 같은 target 두 번째 launch 부터는 required 고정)
         target_sends[target.id]   = target_sends.get(target.id, 0) + ships_needed
         target_required.setdefault(target.id, required)
@@ -529,6 +534,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     sum_dense = sum_cap = sum_terminal = 0.0
     sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
     sum_over_send_penalty = 0.0   # 다중 source 협조 실패 페널티 (음수 누적)
+    sum_under_invested_penalty = 0.0   # capacity-short launch 시도 페널티 (음수 누적)
     # win_rate 계측: episode 종료 시 main(player=0) reward로 win/draw/loss 집계.
     # draw는 0.5 가중치 (eval과 동일 규약).
     sum_wins = 0.0
@@ -548,6 +554,10 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     all_in_penalty_coef = float(T.get("all_in_penalty", 0.0))
     # 다중 source over-send 페널티 (per-excess-ship). 0 이면 비활성.
     over_send_penalty_coef = float(T.get("over_send_penalty", 0.0))
+    # under-invested: src.ships < required (capacity short — 점령 수학적 불가).
+    # 발사 *시도* 당 페널티. 1-A 가 decode 단에서 ships=0 으로 차단하지만
+    # mask 가 못 잡는 edge (target_mask 이후 fixed-point oscillation 등) 를 reward 로 억제.
+    under_invested_penalty_coef = float(T.get("under_invested_penalty", 0.0))
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
@@ -602,8 +612,10 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             # over-send: per-target Σships - required 의 양수 초과분에 비례한 페널티.
             #   다중 source 에서 같은 target 에 redundant 발사 시 함선 단위로 줄임.
             over_send_penalty = -over_send_penalty_coef * decode_counts.get("over_send_excess_sum", 0)
+            # under-invested: src.ships < required 상태에서의 launch 시도 수에 비례한 페널티.
+            under_invested_penalty = -under_invested_penalty_coef * decode_counts.get("under_invested_count", 0)
             terminal_r     = 0.0
-            reward         = dense_r + cap_bonus + all_in_penalty + over_send_penalty
+            reward         = dense_r + cap_bonus + all_in_penalty + over_send_penalty + under_invested_penalty
             prev_score     = curr_score
 
             if ep_done:
@@ -618,6 +630,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             sum_cap      += cap_bonus
             sum_all_in_penalty += all_in_penalty
             sum_over_send_penalty += over_send_penalty
+            sum_under_invested_penalty += under_invested_penalty
             sum_terminal += terminal_r
 
             obs_list.append(obs_t)
@@ -672,6 +685,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "sum_cap":      sum_cap,
         "sum_all_in_penalty": sum_all_in_penalty,
         "sum_over_send_penalty": sum_over_send_penalty,
+        "sum_under_invested_penalty": sum_under_invested_penalty,
         "sum_terminal": sum_terminal,
         "sum_wins":     sum_wins,
     }
@@ -738,6 +752,7 @@ def _finalize_reward_stats(raw_list):
     total_dense = total_cap = total_terminal = 0.0
     total_all_in_penalty = 0.0
     total_over_send_penalty = 0.0
+    total_under_invested_penalty = 0.0
     total_wins = 0.0
     for r in raw_list:
         for k, v in r["counters"].items():
@@ -748,6 +763,7 @@ def _finalize_reward_stats(raw_list):
         total_cap      += r["sum_cap"]
         total_all_in_penalty += r.get("sum_all_in_penalty", 0.0)
         total_over_send_penalty += r.get("sum_over_send_penalty", 0.0)
+        total_under_invested_penalty += r.get("sum_under_invested_penalty", 0.0)
         total_terminal += r["sum_terminal"]
         total_wins     += r.get("sum_wins", 0.0)
 
@@ -762,6 +778,8 @@ def _finalize_reward_stats(raw_list):
     stats["mean_all_in_penalty"] = total_all_in_penalty / steps_safe
     # 다중 source over-send 페널티 (음수). over_send_penalty=0 이면 0.
     stats["mean_over_send_penalty"] = total_over_send_penalty / steps_safe
+    # capacity-short launch 시도 페널티 (음수). under_invested_penalty=0 이면 0.
+    stats["mean_under_invested_penalty"] = total_under_invested_penalty / steps_safe
     # rollout 내 main(player=0) 승률. on-policy sampling이라 eval보다 noisy지만,
     # match_type별 log로 분포별 성능을 바로 볼 수 있는 이점.
     stats["win_rate"]      = total_wins / max(total_episodes, 1)

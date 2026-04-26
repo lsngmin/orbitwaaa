@@ -64,16 +64,21 @@ def test_decode_no_launch(mock_sun, mock_aim):
 
 
 @patch("train.Planet", FakePlanet)
+@patch("prediction.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 @patch("train.first_collision_on_path", return_value=("planet", 1))
-def test_decode_launch_to_enemy(mock_path, mock_sun, mock_aim):
-    """launch >= 0.5, enemy target → move 1개 생성."""
+def test_decode_launch_to_enemy(mock_path, mock_sun, mock_aim, mock_pred_aim):
+    """launch >= 0.5, enemy target → move 1개 생성.
+
+    aim mock turns=10, target.ships=5, prod=2 → required=5+2*10+1=26.
+    src.ships=30 >= 26 → 1-A 통과 (capacity 충족).
+    """
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
     _set_action(action_np, src_idx=0, ships_bin=0, target_idx=1)
 
     raw_planets = [
-        make_raw(0, 10.0, 10.0, owner=0, ships=20),
+        make_raw(0, 10.0, 10.0, owner=0, ships=30),
         make_raw(1, 90.0, 90.0, owner=1, ships=5),
     ]
     moves = decode_action_to_moves(action_np, raw_planets, av=0.0, acting_player=0)
@@ -156,13 +161,17 @@ def test_single_sample_per_step():
 # ── Trace integrity: action_t가 moves의 유일한 원천인지 확인 ─────────────────
 
 @patch("train.Planet", FakePlanet)
+@patch("prediction.aim", return_value=(0.5, 50.0, 50.0, 10))
 @patch("train.aim", return_value=(0.5, 50.0, 50.0, 10))
 @patch("train.crosses_sun", return_value=False)
 @patch("train.first_collision_on_path", return_value=("planet", 1))
-def test_decode_is_pure_function(mock_path, mock_sun, mock_aim):
+def test_decode_is_pure_function(mock_path, mock_sun, mock_aim, mock_pred_aim):
     """
     동일한 action_np 입력 → 동일한 moves 출력.
     decode_action_to_moves가 외부 상태에 의존하지 않음을 확인.
+
+    aim mock turns=10, target.ships=5, prod=2 → required=26.
+    src.ships=30 >= 26 → 1-A 통과 (capacity 충족).
     """
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
     _set_action(action_np, src_idx=0, ships_bin=1, target_idx=1)

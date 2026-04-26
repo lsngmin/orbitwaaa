@@ -7,12 +7,12 @@ on:
   push:
     branches: [submission]
     paths:
-      - "submission.yaml"        # 어떤 .pt 를 ship 할지 가리키는 포인터
-      - "checkpoints/**"         # 선택된 .pt 자체가 갱신된 경우
-      - "build_submission.py"
-      - "main.py"
-      - "submission_features.py"
-      - "submission_actor.py"
+      - "submission/submission.yaml"        # 어떤 .pt 를 ship 할지 가리키는 포인터
+      - "checkpoints/**"                    # 선택된 .pt 자체가 갱신된 경우
+      - "submission/build_submission.py"
+      - "submission/main.py"
+      - "submission/submission_features.py"
+      - "submission/submission_actor.py"
       - "config.yaml"
       - ".github/workflows/deploy_submission.yml"
   workflow_dispatch:
@@ -54,13 +54,13 @@ jobs:
       - name: Resolve checkpoint from submission.yaml
         id: resolve
         run: |
-          if [ ! -f submission.yaml ]; then
-            echo "::error::submission.yaml 미존재"
+          if [ ! -f submission/submission.yaml ]; then
+            echo "::error::submission/submission.yaml 미존재"
             exit 1
           fi
           # python yaml 로 안전하게 파싱 (jq/yq 불필요)
-          CKPT=$(python -c "import yaml; print(yaml.safe_load(open('submission.yaml'))['checkpoint'])")
-          MSG=$(python -c "import yaml; print(yaml.safe_load(open('submission.yaml')).get('message') or '')")
+          CKPT=$(python -c "import yaml; print(yaml.safe_load(open('submission/submission.yaml'))['checkpoint'])")
+          MSG=$(python -c "import yaml; print(yaml.safe_load(open('submission/submission.yaml')).get('message') or '')")
           echo "checkpoint=$CKPT" >> "$GITHUB_OUTPUT"
           echo "yaml_message=$MSG" >> "$GITHUB_OUTPUT"
           if [ ! -f "$CKPT" ]; then
@@ -75,7 +75,7 @@ jobs:
         # --skip-encode: kaggle_environments orbit_wars env 는 CI 에 없음
         # verify(차원) + forward smoke 는 정상 수행
         run: |
-          python build_submission.py \
+          python submission/build_submission.py \
             -o submission.tar.gz \
             --skip-encode
 

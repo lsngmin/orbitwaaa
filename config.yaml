@@ -42,6 +42,12 @@ training:
   # reward 차원에서 억제 (encoder attention 만으로는 sample correlation 이 안 잡힘).
   # 0 이면 비활성. 시작값은 작게 (0.0005~0.002 권장 — all_in_penalty 와 같은 스케일).
   over_send_penalty: 0.002
+  # capacity-short launch 시도당 페널티 (음수). src.ships < required (도착 시점
+  # 적 ships+1) 인 launch 는 점령 수학적 불가 = dominated action.
+  # 1-A (prediction.py) 가 decode 단에서 ships=0 으로 차단하지만, target_mask 통과
+  # 후 fixed-point oscillation 등으로 mask 가 못 잡는 케이스를 reward 로 추가 억제.
+  # 0 이면 비활성. all_in_penalty 와 같은 스케일.
+  under_invested_penalty: 0.01
   state_score_ship_weight: 0.1    # timeout 승자 판정(total ships)에 더 가깝게 정렬
   state_score_prod_weight: 0.5    # 생산력은 ships로 이어지는 간접 힌트만 유지
   state_score_planet_weight: 0.5  # planet_count 편향 완화 (기존 2.0에서 축소)

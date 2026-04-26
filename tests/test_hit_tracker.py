@@ -41,12 +41,13 @@ def make_raw(id_, x, y, owner, ships=20, production=2, radius=3.0):
 
 
 @patch("train.Planet", FakePlanet)
+@patch("prediction.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
 @patch("train.aim", return_value=(math.pi / 4, 50.0, 50.0, 10))
-def test_decode_action_counts_cover_filters_and_launch(mock_aim):
+def test_decode_action_counts_cover_filters_and_launch(mock_aim, mock_pred_aim):
     """surplus-fraction head.
     ships_bin=0 (bin_value=0.0 → just-capture floor) 기준 시나리오:
       - target(enemy) ships=5, prod=2, turns=10 → required = 5 + 2×10 + 1 = 26
-      - src.ships=20 < required=26 (capacity short) → ships_needed = src.ships = 20
+      - src.ships=30 >= required=26 → ships_needed = required = 26 (just-capture)
     """
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
 
@@ -63,11 +64,11 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     _set_action(action_np, src_idx=4, ships_bin=0, target_idx=5)
 
     raw_planets = [
-        make_raw(0, 10.0, 10.0, owner=0, ships=20),
+        make_raw(0, 10.0, 10.0, owner=0, ships=30),
         make_raw(1, 20.0, 20.0, owner=0, ships=10),   # self target
         make_raw(2, 30.0, 30.0, owner=0, ships=0),    # zero-ships source
-        make_raw(3, 40.0, 40.0, owner=0, ships=20),
-        make_raw(4, 50.0, 50.0, owner=0, ships=20),
+        make_raw(3, 40.0, 40.0, owner=0, ships=30),
+        make_raw(4, 50.0, 50.0, owner=0, ships=30),
         make_raw(5, 80.0, 80.0, owner=1, ships=5, production=2),
     ]
 
@@ -85,8 +86,8 @@ def test_decode_action_counts_cover_filters_and_launch(mock_aim):
     assert len(launches) == 1
     assert launches[0]["source_id"] == 4
     assert launches[0]["target_id"] == 5
-    # required = 5 + 2×10 + 1 = 26, src.ships=20 < required → capacity short → 20
-    assert launches[0]["ships"] == 20
+    # required = 5 + 2×10 + 1 = 26, src.ships=30 >= required → just-capture floor
+    assert launches[0]["ships"] == 26
     assert math.isclose(launches[0]["angle"], math.pi / 4)
     expected_core = {
         "attempts": 4,
@@ -124,11 +125,11 @@ def test_under_invested_counts_capacity_short(mock_path, mock_sun, mock_aim):
     surplus-fraction head 의 under_invested_count 시맨틱:
       src.ships < required (capacity short — bin 무관 점령 불가).
 
-    회귀 방지: src 가 required 보다 적게 가지고 있으면 어떤 bin 으로도
-    floor(required) 를 채울 수 없음. 이 케이스만 under_invested 로 집계.
+    회귀 방지 (1-A 이후): src 가 required 보다 적게 가지고 있으면 어떤 bin 으로도
+    floor(required) 를 채울 수 없음 → ships_needed=0 으로 launch 폐기.
       - src.ships=20, target.ships=5, prod=2, turns=10 → required=26
-      - bin=2 (0.66) 무관: src 가 부족하므로 ships_needed = src.ships = 20
-      - under_invested_count=1 (capacity short)
+      - bin=2 (0.66) 무관: capacity-short → ships_needed=0 → launch 안 함.
+      - under_invested_count=1 (발사 시도 시점에 집계, launch 는 0).
 
     prediction.aim을 patch해야 resolve_ships_for_capture 내부 aim 호출까지 덮음.
     """
@@ -144,13 +145,16 @@ def test_under_invested_counts_capacity_short(mock_path, mock_sun, mock_aim):
         action_np, raw_planets, av=0.0, acting_player=0, return_counts=True,
     )
 
-    assert counts["launched"] == 1
-    assert launches[0]["ships"] == 20          # capacity short → src.ships
-    # required=26, send=20 → src.ships < required → under-invested
+    # 1-A: capacity-short 는 launch 폐기 (dominated action).
+    assert counts["launched"] == 0
+    assert len(launches) == 0
+    # 발사 *시도* 자체는 집계됨 (under_invested_count) — 학습 페널티 신호.
     assert counts["under_invested_count"] == 1, (
         "capacity-short under_invested 누락: "
         f"src.ships=20 < required=26 인데 카운트 안 됨"
     )
+    # filtered_zero_ships 로도 잡힘 (ships_needed=0 short-circuit).
+    assert counts["filtered_zero_ships"] == 1
 
 
 @patch("train.Planet", FakePlanet)
@@ -224,8 +228,8 @@ def _planet(pid, owner, x, y, radius=3.0, ships=10, production=1):
     return (pid, owner, x, y, radius, ships, production)
 
 
-def _obs(planets, fleets, next_fleet_id=0):
-    return {"planets": planets, "fleets": fleets, "next_fleet_id": next_fleet_id}
+def _obs(planets, fleets=None, next_fleet_id=0):
+    return {"planets": planets, "fleets": fleets or [], "next_fleet_id": next_fleet_id}
 
 
 def test_register_launches_assigns_sequential_ids():

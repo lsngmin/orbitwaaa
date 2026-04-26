@@ -132,8 +132,12 @@ def test_intermediate_bin_formula_approximately():
 
 # ── capacity-short: src_ships < required ─────────────────────────────────────
 
-def test_capacity_short_returns_src_ships():
-    """src_ships < required 면 bin 무관 ships_needed = src_ships."""
+def test_capacity_short_returns_zero():
+    """src_ships < required 면 bin 무관 ships_needed = 0 (1-A: dominated action 차단).
+
+    이전 동작은 src.ships 전부 보내는 것이었으나, 점령 수학적 불가 = dominated action
+    이므로 0 으로 차단하고 호출자가 under_invested 로 집계 후 launch 폐기.
+    """
     src = StaticPlanet(0,  0.0,  0.0, owner=0, ships=10, production=0)
     # 멀고 큰 target → required 큼
     dst = StaticPlanet(1, 80.0,  0.0, owner=1, ships=50, production=3)
@@ -142,8 +146,8 @@ def test_capacity_short_returns_src_ships():
         ships, _, _, _, _, required, _ = resolve_ships_for_capture(
             src, dst, 0.0, bin_value=bv, src_ships=src.ships,
         )
-        assert ships == src.ships, (
-            f"bin={bv}: capacity-short 인데 ships={ships} != src.ships={src.ships}"
+        assert ships == 0, (
+            f"bin={bv}: capacity-short 이면 ships=0 이어야 함 (실제={ships})"
         )
         assert src.ships < required, (
             f"테스트 전제 위반: src.ships={src.ships} < required={required} 이어야 함"

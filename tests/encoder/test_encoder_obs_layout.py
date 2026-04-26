@@ -5,13 +5,6 @@ drift 가 잦은 곳:
   - FLEET_FEAT_DIM (= FLEET_DIM - 1)
 
 여기서 잡히면 build_submission 단계 전에 알 수 있음.
-
-스코프 외 (의도적 제외):
-  numpy_model 은 본 sync 회귀에 포함하지 않는다.
-  - PLANET_DIM 이 학습 모델과 의도적으로 어긋난 상태 ("무시" 결정 — 별도 트랙)
-  - numpy_model 은 build_submission 흐름의 inference fallback 으로,
-    여기서 같이 검증하면 무관한 항목이 빨갛게 떠 fusion 회귀 신호를 가린다.
-  numpy_model 의 layout 동기화는 별도 build_submission 검증에서 다룬다.
 """
 
 import sys
