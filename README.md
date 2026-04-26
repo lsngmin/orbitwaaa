@@ -115,7 +115,7 @@ ships_to_send  = clip(required_ships + bin × surplus, 1, src.ships)
 | `B` | batch size | rollout 시 dynamic |
 | `T` | history length | `HISTORY = 20` |
 | `P` | planet 슬롯 | `MAX_PLANETS = 44` |
-| `F` | fleet 슬롯 | `MAX_FLEETS = 200` |
+| `F` | fleet 슬롯 | `MAX_FLEETS = 140` |
 | `D_p` | planet raw feature dim | `PLANET_DIM = 15` |
 | `D_f` | fleet raw feature dim (embed 입력) | `FLEET_FEAT_DIM = 7` |
 | `E` | embedding dim | `embed_dim = 128` |

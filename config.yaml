@@ -54,7 +54,7 @@ training:
 
 env:
   max_planets: 44   # 게임 최대 = 40 base (5-10 groups × 4) + 4 comets
-  max_fleets: 200   # 4P 후반 worst-case (30+ planets/player × ~5턴 transit)
+  max_fleets: 140   # 2P 측정 p99≈78 기준 헤드룸 ×1.7 — 4P 측정 후 재조정
   history_turns: 20     # temporal window
 
 selfplay:
