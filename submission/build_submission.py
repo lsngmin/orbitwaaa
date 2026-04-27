@@ -109,13 +109,18 @@ def fail(s):
 # ── 차원 추출 ────────────────────────────────────────────────────────────────
 
 def extract_pt_dims(ckpt: dict) -> dict:
-    """state_dict 에서 차원 추출. 키 없으면 즉시 실패."""
+    """state_dict 에서 차원 추출. 키 없으면 즉시 실패.
+
+    Phase A 이후 actor 가 분리됨 (target_q/k attention + amount_pair_head MLP).
+    legacy `actor.0/2.weight` 단일 head 키 대신 amount_pair_head.2 의 출력 dim
+    (NUM_ACTIONS = 1 + NUM_SHIPS_BINS) 으로부터 ACTION_DIM 을 도출.
+    """
     required = [
         "planet_embed.weight",
         "fleet_embed.weight",
         "planet_temporal_pos.weight",
-        "actor.0.weight",
-        "actor.2.weight",
+        "amount_pair_head.2.weight",   # Phase A: pair-wise amount head 의 output = NUM_ACTIONS
+        "target_q.weight",              # Phase A: target attention query (EMBED × EMBED)
     ]
     missing = [k for k in required if k not in ckpt]
     if missing:
@@ -127,7 +132,9 @@ def extract_pt_dims(ckpt: dict) -> dict:
     embed_dim, planet_feat = ckpt["planet_embed.weight"].shape  # 입력 features (sentinel 제외)
     _,         fleet_feat  = ckpt["fleet_embed.weight"].shape   # 입력 features (idx 제외)
     history,   _           = ckpt["planet_temporal_pos.weight"].shape
-    action_dim, _          = ckpt["actor.2.weight"].shape
+    # NUM_ACTIONS = amount_pair_head 의 출력 차원 (1=skip + K=bins).
+    # ACTION_DIM = NUM_ACTIONS + MAX_PLANETS — MAX_PLANETS 는 config 에서 가져옴 (verify 단계).
+    num_actions, _         = ckpt["amount_pair_head.2.weight"].shape
 
     return {
         "PLANET_FEAT_DIM": int(planet_feat),      # planet_embed 입력 dim
@@ -136,7 +143,7 @@ def extract_pt_dims(ckpt: dict) -> dict:
         "FLEET_DIM":       int(fleet_feat) + 2,   # obs 저장 dim (= FEAT + src_idx + dst_idx)
         "EMBED_DIM":       int(embed_dim),
         "HISTORY":         int(history),
-        "ACTION_DIM":      int(action_dim),
+        "NUM_ACTIONS":     int(num_actions),      # amount head output (= 1 + NUM_SHIPS_BINS)
     }
 
 
@@ -166,6 +173,7 @@ def extract_code_dims() -> dict:
         "sa_EMBED_DIM":  int(sa.EMBED_DIM),
         "sa_HISTORY":    int(sa.HISTORY),
         "sa_NUM_SHIPS_BINS": int(sa.NUM_SHIPS_BINS),
+        "sa_NUM_ACTIONS": int(sa.NUM_ACTIONS),
         "sa_MAX_PLANETS": int(sa.MAX_PLANETS),
         "sa_ACTION_DIM": int(sa.ACTION_DIM),
         "ew_PLANET_DIM": int(ew.PLANET_DIM),
@@ -208,14 +216,16 @@ def verify(pt: dict, code: dict) -> None:
     need("config.yaml env.history_turns",     pt["HISTORY"],   code["cfg_history"])
     need("config.yaml env.max_planets",       code["sa_MAX_PLANETS"], code["cfg_max_planets"])
 
-    # 5) ACTION_DIM 분해
-    expected_action_dim = 1 + code["sa_NUM_SHIPS_BINS"] + code["sa_MAX_PLANETS"]
-    if pt["ACTION_DIM"] != expected_action_dim:
+    # 5) NUM_ACTIONS / ACTION_DIM 분해
+    # Phase A 모델: amount_pair_head 의 output = NUM_ACTIONS = 1 + NUM_SHIPS_BINS.
+    # ACTION_DIM 은 logical concept (env 인터페이스): NUM_ACTIONS + MAX_PLANETS.
+    expected_num_actions = 1 + code["sa_NUM_SHIPS_BINS"]
+    if pt["NUM_ACTIONS"] != expected_num_actions:
         errs.append(
-            f"  ACTION_DIM: .pt={pt['ACTION_DIM']} ≠ "
-            f"1 + NUM_SHIPS_BINS({code['sa_NUM_SHIPS_BINS']}) "
-            f"+ MAX_PLANETS({code['sa_MAX_PLANETS']}) = {expected_action_dim}"
+            f"  NUM_ACTIONS: .pt amount_pair_head out={pt['NUM_ACTIONS']} ≠ "
+            f"1 + NUM_SHIPS_BINS({code['sa_NUM_SHIPS_BINS']}) = {expected_num_actions}"
         )
+    expected_action_dim = expected_num_actions + code["sa_MAX_PLANETS"]
     if code["sa_ACTION_DIM"] != expected_action_dim:
         errs.append(
             f"  submission_actor.ACTION_DIM={code['sa_ACTION_DIM']} ≠ "
@@ -234,7 +244,7 @@ def verify(pt: dict, code: dict) -> None:
     ok("차원 검증 통과 ("
        f"PLANET_DIM={pt['PLANET_DIM']} FLEET_DIM={pt['FLEET_DIM']} "
        f"EMBED_DIM={pt['EMBED_DIM']} HISTORY={pt['HISTORY']} "
-       f"ACTION_DIM={pt['ACTION_DIM']})")
+       f"NUM_ACTIONS={pt['NUM_ACTIONS']} ACTION_DIM={code['sa_ACTION_DIM']})")
 
 
 # ── Smoke ────────────────────────────────────────────────────────────────────
@@ -275,18 +285,41 @@ def smoke_load_forward(ckpt: dict, code: dict) -> None:
     with torch.no_grad():
         out = model(obs)
 
-    expected_shape = (1, P, code["sa_ACTION_DIM"])
+    # Phase A 모델: forward 는 src_token (B, P, EMBED_DIM) 만 반환.
+    # target_logits / amount_pair_head 는 main.py 가 sequential 샘플링 시 직접 호출.
+    expected_shape = (1, P, code["sa_EMBED_DIM"])
     if tuple(out.shape) != expected_shape:
         fail(
             f"forward 출력 shape 불일치: got {tuple(out.shape)} "
-            f"expected {expected_shape}"
+            f"expected {expected_shape} (src_token = encoder output)"
         )
 
     if torch.isnan(out).any() or torch.isinf(out).any():
         fail("forward 출력에 NaN/Inf — 학습 발산 또는 .pt 손상 의심.")
 
+    # 추가 smoke: target_logits + amount_pair_head 도 forward 가능한지 확인.
+    # main.py 의 inference path 와 동일 (src_token → q/k attention → target → amount).
+    with torch.no_grad():
+        # target attention: (B, P, P)
+        q = model.target_q(out)
+        k = model.target_k(out)
+        t_logits = (q @ k.transpose(-1, -2)) / (code["sa_EMBED_DIM"] ** 0.5)
+        if t_logits.shape != (1, P, P):
+            fail(f"target_logits shape 어긋남: {tuple(t_logits.shape)} ≠ (1, {P}, {P})")
+        # amount_pair_head: ([src, dst]) → (B, P, P, NUM_ACTIONS)
+        # 단순 sanity 만 — 실제 main.py 는 sample 한 (src, target) pair 1개에 대해서만 호출.
+        h_src = out.unsqueeze(2).expand(-1, -1, P, -1)  # (B, P, P, E)
+        h_dst = out.unsqueeze(1).expand(-1, P, -1, -1)  # (B, P, P, E)
+        pair  = torch.cat([h_src, h_dst], dim=-1)
+        a_logits = model.amount_pair_head(pair)
+        expected_a = (1, P, P, code["sa_NUM_ACTIONS"])
+        if a_logits.shape != expected_a:
+            fail(f"amount_logits shape 어긋남: {tuple(a_logits.shape)} ≠ {expected_a}")
+
     ok(f"smoke load+forward 통과 (input_size={flat_size}, "
-       f"missing/critic={len(res.unexpected_keys)})")
+       f"src_token=(1,{P},{code['sa_EMBED_DIM']}), "
+       f"target=(1,{P},{P}), amount=(1,{P},{P},{code['sa_NUM_ACTIONS']}), "
+       f"unexpected/critic={len(res.unexpected_keys)})")
 
 
 # ── encode_planets 출력 dim ──────────────────────────────────────────────────
@@ -443,7 +476,7 @@ def main():
     info(
         f".pt dims: PLANET_DIM={pt_dims['PLANET_DIM']} "
         f"FLEET_DIM={pt_dims['FLEET_DIM']} EMBED_DIM={pt_dims['EMBED_DIM']} "
-        f"HISTORY={pt_dims['HISTORY']} ACTION_DIM={pt_dims['ACTION_DIM']}"
+        f"HISTORY={pt_dims['HISTORY']} NUM_ACTIONS={pt_dims['NUM_ACTIONS']}"
     )
 
     code_dims = extract_code_dims()

@@ -8,7 +8,7 @@
 #   - `python build_submission.py path/to/other.pt` → CLI 가 yaml 을 override.
 
 # 제출할 checkpoint 경로
-checkpoint: checkpoints/baseline_kk/main_latest.pt
+checkpoint: checkpoints/pairwisev2-c/main_latest.pt
 
 # Kaggle 제출 메시지 (선택). 비워두면 git commit 메시지 사용.
-message: "1-A/1-B/1-C: capacity-short 차단 + under_invested penalty (baseline_kk)"
+message: "Phase A v2-c: multiplier amount-mode + cost-feature bias channels (pairwisev2-c)"
