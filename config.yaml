@@ -37,7 +37,7 @@ training:
   gamma: 1.0            # length invariance: 짧은/긴 에피소드 terminal 보상 동등
   gae_lambda: 0.95
   clip_range: 0.2
-  target_kl: null       # 이 값 초과 시 PPO epoch 조기 종료 (None이면 비활성)
+  target_kl: 0.02       # 이 값 초과 시 PPO epoch 조기 종료. opponent mix 도입 후 KL 폭주 안전장치.
   ent_coef: 0.005       # 탐험 장려 엔트로피 계수
   vf_coef: 0.5          # Critic loss 가중치
   max_grad_norm: 0.5    # gradient clipping

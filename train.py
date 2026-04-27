@@ -24,7 +24,7 @@ import torch.optim as optim
 from utils import TrainingLogger, save_checkpoint, load_checkpoint
 from utils.hit_tracker import HitRateTracker
 import yaml
-from collections import deque
+from collections import deque, Counter
 from kaggle_environments import make
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 import multiprocessing as mp
@@ -1271,8 +1271,15 @@ def _finalize_reward_stats(raw_list):
     return stats
 
 
-def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None):
+def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None,
+                    opp_states=None):
     """n_envs=1이면 단일 env, 그 이상이면 multiprocessing 병렬 rollout.
+
+    opp_states: optional list[state_dict_cpu | None] of length n_envs. If provided,
+                each worker receives its own opponent — enables per-env opponent
+                mixing (self / league / exploiter all in one rollout batch).
+                When None, opponent_model is shared across all workers (legacy /
+                exploiter rollout / single opponent eval).
 
     _collect_single은 raw_stats(counters/n_steps/episodes/sum_*)를 반환.
     여기서 worker들을 합산한 뒤 step-weighted로 정확히 정규화해서
@@ -1280,18 +1287,34 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
     episode 길이가 달라도 편향 없음).
     """
     if n_envs <= 1 or pool is None:
-        result = _collect_single(main_model, opponent_model, n_steps, DEVICE)
+        if opp_states is not None:
+            opp_state = opp_states[0]
+            opp = None
+            if opp_state is not None:
+                opp = OrbitWarsPolicy().to(DEVICE)
+                opp.load_state_dict(opp_state)
+                opp.eval()
+        else:
+            opp = opponent_model
+        result = _collect_single(main_model, opp, n_steps, DEVICE)
         # tuple layout: 0=obs, 1=act, 2=adv, 3=ret, 4=logp, 5=logp_heads,
         #               6=action_mask, 7=target_mask, 8=pair_feats, 9=amount_feats, 10=raw_stats
         merged_stats = _finalize_reward_stats([result[10]])
         return (*result[:10], merged_stats)
 
     main_state = {k: v.cpu() for k, v in main_model.state_dict().items()}
-    opp_state  = ({k: v.cpu() for k, v in opponent_model.state_dict().items()}
-                  if opponent_model is not None else None)
+
+    if opp_states is None:
+        opp_state = ({k: v.cpu() for k, v in opponent_model.state_dict().items()}
+                     if opponent_model is not None else None)
+        opp_states = [opp_state] * n_envs
+    elif len(opp_states) != n_envs:
+        raise ValueError(
+            f"opp_states length {len(opp_states)} != n_envs {n_envs}"
+        )
 
     steps_per_env = max(1, n_steps // n_envs)
-    worker_args   = [(main_state, opp_state, steps_per_env)] * n_envs
+    worker_args   = [(main_state, opp_states[i], steps_per_env) for i in range(n_envs)]
 
     results = pool.map(_rollout_worker, worker_args)
 
@@ -1335,6 +1358,38 @@ def _sample_opponent(main_model, exploiter, league):
         return opp, "league"
     opp = copy.deepcopy(exploiter); opp.eval()
     return opp, "exploiter"
+
+
+def _sample_opp_states_for_workers(main_state, exploiter_state, league, n_envs):
+    """Per-env opponent sampling for parallel rollout workers.
+
+    Returns list[(opp_state_dict_or_None, match_type)] of length n_envs.
+    A single PPO update batch then mixes self / league / exploiter trajectories
+    instead of being locked to one match_type per generation.
+
+    main_state, exploiter_state: pre-extracted CPU state_dict snapshots — shared
+    across "self" / "exploiter" envs to avoid n_envs deepcopies. League opponents
+    are loaded fresh from disk (already independent snapshots).
+
+    match_type labels match _sample_opponent: {self, self_fallback, league, exploiter}.
+    """
+    mix = SP["opponent_mix"]
+    out = []
+    for _ in range(n_envs):
+        r = random.random()
+        if r < mix["self"]:
+            out.append((main_state, "self"))
+            continue
+        if r < mix["self"] + mix["league"]:
+            opp = league.sample_opponent()
+            if opp is None:
+                out.append((main_state, "self_fallback"))
+            else:
+                opp_state = {k: v.detach().cpu() for k, v in opp.state_dict().items()}
+                out.append((opp_state, "league"))
+            continue
+        out.append((exploiter_state, "exploiter"))
+    return out
 
 
 # ── PPO 업데이트 ──────────────────────────────────────────────────────────────
@@ -1820,12 +1875,34 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
             generation += 1
             gen_t0 = time.time()
 
-            opponent, match_type = _sample_opponent(main_model, exploiter, league)
-
-            (obs, actions, advantages, returns, log_probs, logp_heads, amasks, tmasks,
-             pair_feats, amount_feats, rew_stats) = collect_rollout(
-                main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
-            )
+            # Per-env opponent mixing: each rollout worker gets its own opponent
+            # so a single PPO batch sees self / league / exploiter trajectories
+            # together (avoids one-update-per-opponent-type overfitting).
+            if n_envs > 1 and pool is not None:
+                main_state_cpu = {k: v.detach().cpu() for k, v in main_model.state_dict().items()}
+                exp_state_cpu  = {k: v.detach().cpu() for k, v in exploiter.state_dict().items()}
+                opp_pairs   = _sample_opp_states_for_workers(main_state_cpu, exp_state_cpu, league, n_envs)
+                opp_states  = [s for s, _ in opp_pairs]
+                mt_counts   = Counter(t for _, t in opp_pairs)
+                _abbr = {"self": "s", "self_fallback": "sf", "league": "l", "exploiter": "e"}
+                if len(mt_counts) == 1:
+                    match_type = next(iter(mt_counts))
+                else:
+                    match_type = "/".join(
+                        f"{_abbr.get(k, k)}{v}" for k, v in sorted(mt_counts.items())
+                    )
+                (obs, actions, advantages, returns, log_probs, logp_heads, amasks, tmasks,
+                 pair_feats, amount_feats, rew_stats) = collect_rollout(
+                    main_model, opponent_model=None,
+                    n_steps=rollout_steps, n_envs=n_envs, pool=pool,
+                    opp_states=opp_states,
+                )
+            else:
+                opponent, match_type = _sample_opponent(main_model, exploiter, league)
+                (obs, actions, advantages, returns, log_probs, logp_heads, amasks, tmasks,
+                 pair_feats, amount_feats, rew_stats) = collect_rollout(
+                    main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
+                )
             p_loss, v_loss, e_loss, approx_kl, clip_frac, epochs_done, ent_a, ent_t, head_metrics = ppo_update(
                 main_model, optimizer, obs, actions, log_probs, returns, advantages,
                 old_logp_heads=logp_heads, action_masks=amasks, target_masks=tmasks,
