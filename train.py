@@ -1794,7 +1794,15 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
     # PARTIAL_TRANSFER=1: 모델 구조 변경 (e.g. Step 3 → Step 4 target head 교체) 시
     # 한 번만 strict=False 로 로드. 매칭 안 되는 key (target_q/k 등) 는 새로 init.
     strict_load = os.environ.get("PARTIAL_TRANSFER", "0") != "1"
-    result = load_checkpoint(ckpt_path, main_model, optimizer, DEVICE, strict=strict_load)
+    # RESET_ALPHA=1: target_bias_alpha 만 fresh init (0.1) 으로 강제 시동.
+    # 5gen 진단 결과 기존 ckpt 의 target_bias_alpha=-0.014 가 0.1 init 을 덮어쓰면
+    # 효과 없음 → 한 번만 reset 후 학습. amount_bin_alpha 는 이미 일하는 중이라 보존.
+    # 한 번 사용 후 끄는 것 권장 (다음 재개 시 ckpt 의 새 학습값 살리려면).
+    reset_keys = None
+    if os.environ.get("RESET_ALPHA", "0") == "1":
+        reset_keys = ["target_bias_alpha"]
+    result = load_checkpoint(ckpt_path, main_model, optimizer, DEVICE,
+                             strict=strict_load, reset_keys=reset_keys)
     if result:
         generation, total_steps, league.agents = result
     else:

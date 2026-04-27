@@ -198,8 +198,14 @@ class OrbitWarsPolicy(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1),
         )
-        self.target_bias_alpha = nn.Parameter(torch.zeros(1))
+        # target_bias_alpha: 0.1 init (1차 5gen 진단 결과 0 init 은 P=44 way softmax
+        # gradient dilution 으로 ±0.014 진동에서 못 자람 → q·k/√E logit 에 묻힘.
+        # 0.1 으로 강제 시동하면 bias_mlp 가 받는 reward gradient 가 즉시 chain rule
+        # 통해 커짐. 자연스레 자라는 amount_bin_alpha 와 비대칭 해소.
+        self.target_bias_alpha = nn.Parameter(torch.full((1,), 0.1))
         # amount: per-bin scalar bias (skip(idx 0) 은 candidate 가 없으므로 0 유지).
+        # amount_bin_alpha 는 5gen 동안 양수 단조 자람 (-0.0018 → +0.0031) — 일하는
+        # 중이라 0 init 유지. target 쪽만 시동 거는 게 ablation 깨끗.
         self.amount_bin_bias_mlp = nn.Sequential(
             nn.Linear(AMOUNT_BIN_FEAT_DIM, 32),
             nn.ReLU(),

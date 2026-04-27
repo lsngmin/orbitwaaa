@@ -13,8 +13,16 @@ def save_checkpoint(path, model, optimizer, generation, total_steps, league_agen
     }, path)
 
 
-def load_checkpoint(path, model, optimizer, device, strict=True):
+def load_checkpoint(path, model, optimizer, device, strict=True, reset_keys=None):
     """체크포인트 로드. 없으면 None 반환.
+
+    reset_keys: 이 리스트의 키는 ckpt 에서 빼고 model 의 fresh init 유지.
+      예: target_bias_alpha 를 학습된 -0.014 대신 새 init 0.1 로 시작.
+      strict=True 여도 reset_keys 가 있으면 자동으로 strict=False 로 강등 (해당
+      key 가 missing 으로 잡혀서 RuntimeError 나는 걸 방지).
+    또한 optimizer state 의 해당 파라미터 momentum/variance 도 리셋해야 함 —
+      안 그러면 0.1 init 에 학습된 -0.014 의 momentum 이 즉시 적용돼 다시 음수로
+      끌려감. reset_keys 면 optimizer state 전체를 fresh start.
 
     strict=False (partial transfer):
       - shape-mismatch key 는 명시적으로 skip (PyTorch strict=False 만으론
@@ -31,6 +39,20 @@ def load_checkpoint(path, model, optimizer, device, strict=True):
 
     ckpt = torch.load(path, map_location=device)
     state_to_load = ckpt["model"]
+
+    # reset_keys: 학습된 값 무시하고 fresh init 유지할 파라미터.
+    reset_applied = []
+    if reset_keys:
+        for k in reset_keys:
+            if k in state_to_load:
+                state_to_load.pop(k)
+                reset_applied.append(k)
+        if reset_applied:
+            print(f"[reset_keys] ckpt 에서 제거 → fresh init 유지: {reset_applied}")
+            if strict:
+                print("[reset_keys] strict=True → False 로 자동 강등 (missing key 허용)")
+                strict = False
+
     if not strict:
         # shape-mismatch key 사전 필터링.
         # PyTorch load_state_dict(strict=False) 는 missing/unexpected 만 허용 —
@@ -53,12 +75,17 @@ def load_checkpoint(path, model, optimizer, device, strict=True):
     if not strict and (res.missing_keys or res.unexpected_keys):
         print(f"[partial transfer] missing keys ({len(res.missing_keys)}): {res.missing_keys}")
         print(f"[partial transfer] unexpected keys ({len(res.unexpected_keys)}): {res.unexpected_keys}")
-    try:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    except (ValueError, KeyError) as e:
-        if strict:
-            raise
-        print(f"[partial transfer] optimizer state mismatch — fresh start: {e}")
+    if reset_applied:
+        # reset_keys 적용했으면 optimizer state 도 fresh — 안 그러면 학습된 값의
+        # momentum 이 새 init 을 즉시 끌어내림.
+        print(f"[reset_keys] optimizer state 도 fresh start (momentum 잔재 제거)")
+    else:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except (ValueError, KeyError) as e:
+            if strict:
+                raise
+            print(f"[partial transfer] optimizer state mismatch — fresh start: {e}")
 
     print(f"체크포인트 로드: gen={ckpt['generation']}, steps={ckpt['total_steps']:,}")
     return ckpt["generation"], ckpt["total_steps"], ckpt["league_agents"]
