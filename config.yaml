@@ -45,6 +45,13 @@ training:
   dense_reward_coef: 0.004  # 중간 shaping은 약한 힌트만 주도록 축소
   cap_bonus_gain: 0.008     # 중립 → 내 점령 시 prod * 이 값 보너스
   cap_bonus_loss: 0.025     # 내 → 상실 시 prod * 이 값 페널티 (1차: 0.012→0.025, 방어 비용 강화)
+  # 초반 중립 점령 multiplicative boost.
+  # early_boost = 1.0 + (이 값 - 1.0) × max(0, 1 - turn_norm)
+  #   = 1.0 (기본, off)  → base bonus 그대로 (gradient 변화 0)
+  #   = 1.5             → 초반 1.5×, 말기 1.0× (말기 base 보존)
+  # neutral GAIN 한정 (own loss / enemy capture 는 boost 무관 — 초반 중립 race 만 가속).
+  # 1.0=off baseline 검증 후 1.5 → 2.0 ablation 권장.
+  cap_bonus_early_multiplier: 1.0
   # Sprint 2: 발사 시 source 의 80%+ 비우는(all-in) 발사 페널티.
   # 1차 측정에서 all_in_launch_rate=0.94, remaining_ships_after_launch≈8 — policy가
   # 자원 무시 발사 default. cap_bonus_loss(잃을 때)와 별개 채널로 "발사 시점 보존"

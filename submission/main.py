@@ -207,7 +207,14 @@ def agent(obs):
     with torch.no_grad():
         src_token = model(obs_t).cpu()                    # (1, P, EMBED_DIM)
 
-    analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=player)
+    # turn_norm: train 과 inference 정합성 (pair_feats ch7 / ch6 race signal).
+    # episodeSteps 는 orbit_wars 환경 default 500 — Kaggle env 에서 obs.step 직접 사용.
+    # cur_step None (첫 turn 전) 은 0 초반 가정 (안전 fallback).
+    _ep_max = 500
+    _step   = int(cur_step) if cur_step is not None else 0
+    turn_norm_inf = max(0.0, min(1.0, _step / max(_ep_max, 1)))
+    analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=player,
+                                    turn_norm=turn_norm_inf)
     with torch.no_grad():
         action_np = _sample_action(model, src_token, analysis)
     moves = decode_action_to_moves(

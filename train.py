@@ -177,16 +177,26 @@ def _snapshot_obs_for_resolve(raw_obs):
     }
 
 
-def neutral_capture_bonus(prev_map, curr_raw_obs, player):
+def neutral_capture_bonus(prev_map, curr_raw_obs, player, turn_norm=0.0):
     """중립 행성 점령 보너스: production에 비례한 즉각 보상.
 
     prev_map: _snapshot_planet_owners()로 미리 추출한 {pid: (owner, prod)}.
               env.step() 이후 참조 오염을 피하기 위해 raw_obs 직접 참조 대신 사용.
 
     계수는 config.yaml의 training.cap_bonus_gain / cap_bonus_loss로 관리.
+
+    early_boost (multiplicative, neutral GAIN 한정):
+      cap_bonus_early_multiplier (default 1.0 = off) ≥ 1.0 일 때만 의미 있음.
+      early_boost = 1.0 + (multiplier - 1.0) × max(0, 1 - turn_norm)
+      → turn_norm=0 (게임 초반) 일 때 multiplier 그대로, turn_norm=1 (말기) 일 때 1.0.
+      base bonus 를 대체하지 않고 곱해서 amplify 만 함 (말기에도 base 는 보존).
+      enemy capture / own loss 는 boost 안 적용 — 초반 중립 race 만 가속하려는 의도.
     """
     gain_coef = T.get("cap_bonus_gain", 0.05)
     loss_coef = T.get("cap_bonus_loss", 0.025)
+    early_mult = float(T.get("cap_bonus_early_multiplier", 1.0))
+    tn         = float(max(0.0, min(1.0, turn_norm)))
+    early_boost = 1.0 + (early_mult - 1.0) * max(0.0, 1.0 - tn)
 
     if isinstance(curr_raw_obs, dict):
         curr_planets = curr_raw_obs.get("planets", [])
@@ -199,8 +209,10 @@ def neutral_capture_bonus(prev_map, curr_raw_obs, player):
         owner = p[1] if isinstance(p, (list, tuple)) else p.owner
         prev_owner, prod = prev_map.get(pid, (-1, 0))
         if prev_owner == -1 and owner == player:        # 중립 → 내 것
-            bonus += prod * gain_coef
+            # neutral GAIN 만 early_boost 적용 (multiplicative — base 보존).
+            bonus += prod * gain_coef * early_boost
         elif prev_owner == player and owner != player:  # 내 것 → 잃음
+            # own loss 는 boost 없음 — phase 무관 일정 페널티.
             bonus -= prod * loss_coef
     return bonus
 
@@ -224,11 +236,13 @@ class ActionSpace:
     __slots__ = ("planets", "fleets", "pos_cache", "action_mask", "target_mask",
                  "av", "acting_player", "self_fallback_active",
                  "self_fallback_by_thresh", "active_by_thresh",
+                 "mask_block_by_thresh",
                  "pair_features_target", "amount_features_full")
 
     def __init__(self, planets, fleets, pos_cache, action_mask, target_mask, av, acting_player,
                  self_fallback_active=0,
                  self_fallback_by_thresh=None, active_by_thresh=None,
+                 mask_block_by_thresh=None,
                  pair_features_target=None, amount_features_full=None):
         self.planets       = planets
         self.fleets        = fleets
@@ -247,19 +261,26 @@ class ActionSpace:
         # dict {1: int, 5: int, 10: int, 20: int}.
         self.self_fallback_by_thresh = self_fallback_by_thresh or {}
         self.active_by_thresh        = active_by_thresh or {}
+        # 진단: mask first-failure 분해 (per src.ships threshold).
+        # {gate_name: {1: int, 5: int, 10: int, 20: int}, ...}
+        # gate 우선순위: owner_rule → enemy_neutral_filter → sun_path → capacity_short
+        # 각 (src, dst) pair 는 첫 실패 게이트에만 카운트됨.
+        self.mask_block_by_thresh    = mask_block_by_thresh or {}
         # ── Phase A explicit cost features ───────────────────────────────────
-        # pair_features_target: (P, P, TARGET_PAIR_FEAT_DIM) float32
-        #   [required/src_ships, required/dst_ships, eta_norm, proj_target/src_ships]
+        # pair_features_target: (P, P, TARGET_PAIR_FEAT_DIM=8) float32
+        #   ch0~3: capacity-axis (req/src, req/dst, eta_norm, proj/src)
+        #   ch4~5: production-axis (log1p(req/prod), log1p(req/(prod×eta)))
+        #   ch6:   eta_advantage_norm (race signal)
+        #   ch7:   turn_norm (phase)
         #   target_mask 가 False 인 (i,j) 도 텐서엔 들어가지만 logits 자체가
         #   -1e9 로 마스크되므로 무시됨. 학습-제출 parity 위해 항상 채움.
-        # amount_features_full: (P, P, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM) float32
-        #   [candidate/src, remaining/src, candidate/required, eta_norm]
+        # amount_features_full: (P, P, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM=8) float32
         #   per-(src, dst, bin_k) candidate 지표. 모델은 chosen target 으로 gather.
         self.pair_features_target  = pair_features_target
         self.amount_features_full  = amount_features_full
 
 
-def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
+def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0.0):
     """공통 분석 1회 + masks 생성.
 
     재사용 의도:
@@ -273,6 +294,21 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
       - in-flight fleet 효과를 ETA 까지 시뮬해 도착 시점 owner 가 acting_player 면
         target 에서 제외 (이미 내 거 될 예정 → 추가 launch 무의미).
         repeat 발사 / 같은 target 중복 commit 을 mask 차원에서 차단.
+
+    Mask first-failure tracking:
+      - 게이트 우선순위: owner_rule (i==j or tgt.owner==acting_player)
+        → enemy_neutral_filter (Guard A: proj_owner == acting_player)
+        → sun_path (crosses_sun OR path collision)
+        → capacity_short (src.ships < required)
+      - 각 (src, dst) pair 가 첫 실패한 게이트에 1회만 카운트 (중복 X).
+      - src.ships threshold 4종 (1/5/10/20) × gate 4종 = 16 카운터.
+      - 진짜 mask 위기 (cap_ge20 ↑) vs 게임 룰 (own ↑) 분리 진단용.
+
+    turn_norm:
+      - 현재 step / episodeSteps. 0.0 = 초반, 1.0 = 종료.
+      - pair_feats[i,j,7] / amount_feats[i,j,k,7] 채널로 전달 → bias_mlp 가
+        phase-conditional weighting 자동 학습.
+      - default 0.0 (제출 inference 에서 안 넘기면 초반 가정 — 안전한 fallback).
     """
     planets      = [Planet(*p) for p in raw_planets[:MAX_PLANETS]]
     fleets       = [Fleet(*f)  for f in raw_fleets]
@@ -287,17 +323,70 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
     amount_feats = torch.zeros(MAX_PLANETS, MAX_PLANETS, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM,
                                 dtype=torch.float32)
     # 정규화 상수
-    ETA_NORM   = 30.0      # 일반 eta 5~30 turn 분포
-    RATIO_CLIP = 5.0       # required/src 등의 발산 방지
+    ETA_NORM       = 30.0      # 일반 eta 5~30 turn 분포
+    RATIO_CLIP     = 5.0       # required/src 등의 발산 방지
+    ENEMY_ETA_CAP  = 60.0      # enemy 가 도달 못 하는 dst (sun-path 등) 의 cap.
+                                # eta_advantage = (enemy_eta - my_eta) / 30 의 분자에서
+                                # +∞ 대신 60 turn 사용 → race 신호가 saturate 되도록.
+    tn             = float(max(0.0, min(1.0, turn_norm)))   # phase channel value
+
+    # ── Enemy-side ETA pre-compute (race signal 용) ─────────────────────────
+    # 각 dst 에 대해 "현재 살아있는 enemy 어떤 source 든 가장 빨리 보낼 수 있는 ETA".
+    # crosses_sun / path collision 이 막힌 경로는 무한대 → ENEMY_ETA_CAP 으로 cap.
+    # eta_advantage = (enemy_min_eta - my_eta) / ETA_NORM ∈ [-1, 1] (clamp).
+    #   양수 = "내가 적보다 빠름" → 일찍 잡으면 race 우위.
+    #   음수 = "적이 더 빠름" → 보내봤자 경합 손실.
+    # 비용: P_enemy × P_dst × aim() ≈ 추가 100~400 aim 호출 / step (cached). 무시 가능.
+    dst_to_enemy_eta = [ENEMY_ETA_CAP] * len(planets)
+    for j, tgt in enumerate(planets):
+        if tgt.owner == acting_player:
+            # 내 행성은 enemy race 의미 없음 (race signal off → 0 nominal advantage).
+            # tgt 가 owner_rule 게이트로 어차피 mask off 라 의미 없지만 shape 유지.
+            dst_to_enemy_eta[j] = ENEMY_ETA_CAP
+            continue
+        best = ENEMY_ETA_CAP
+        for src in planets:
+            if src.owner == acting_player or src.owner == -1 or src.ships <= 0:
+                continue
+            if src.id == tgt.id:
+                continue
+            if crosses_sun(src.x, src.y, tgt.x, tgt.y):
+                continue
+            ships_rep = int(src.ships)
+            _, _, _, e_turns = aim(src, tgt, av, ships_rep, pos_cache=pos_cache)
+            if e_turns is None or e_turns <= 0:
+                continue
+            if e_turns < best:
+                best = float(e_turns)
+        dst_to_enemy_eta[j] = min(best, ENEMY_ETA_CAP)
+
+    # ── Mask first-failure decomposition counters ───────────────────────────
+    # 4 게이트 × 4 src.ships threshold (1/5/10/20).
+    # 각 (src, dst) pair 는 첫 실패 게이트 한 곳에만 카운트.
+    GATE_NAMES = ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+    THRESHOLDS = (1, 5, 10, 20)
+    mask_block_by_thresh = {g: {t: 0 for t in THRESHOLDS} for g in GATE_NAMES}
+
+    def _bump_mask_block(gate, src_ships):
+        """첫 실패 게이트에 (src.ships threshold 별) 1 증가."""
+        sh = int(src_ships)
+        bucket = mask_block_by_thresh[gate]
+        for t in THRESHOLDS:
+            if sh >= t:
+                bucket[t] += 1
 
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
             continue
         src_ships_safe = max(int(src.ships), 1)
         for j, tgt in enumerate(planets):
+            # Gate 1: owner_rule (self target or own-owned target).
             if i == j or tgt.owner == acting_player:
+                _bump_mask_block("owner_rule", src.ships)
                 continue
+            # Gate 3a (path): direct sun crossing — 게이트 우선순위 상 sun_path.
             if crosses_sun(src.x, src.y, tgt.x, tgt.y):
+                _bump_mask_block("sun_path", src.ships)
                 continue
             ships_rep = int(src.ships)
             angle, tx, ty, turns = aim(src, tgt, av, ships_rep, pos_cache=pos_cache)
@@ -306,36 +395,62 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
                 src, angle, ships_rep, planets, av, max_turns=max_turns,
                 pos_cache=pos_cache,
             )
+            # Gate 3b (path collision): 의도된 tgt 에 도달 못함 → sun_path 버킷 통합.
             if cause != "planet" or hit_pid != tgt.id:
+                _bump_mask_block("sun_path", src.ships)
                 continue
-            # Guard A: 도착 시점에 이미 내 행성이 될 예정이면 mask off
+            # Gate 2: Guard A → enemy_neutral_filter (target ownership at ETA).
+            #   도착 시점에 내 행성이 될 예정 = "이미 잡혀 있을 enemy/neutral" 분류 실패.
             eff_turns = turns if turns else 1
             proj_owner, proj_ships = project_target_at_eta(
                 tgt, eff_turns, planets, fleets,
             )
             if proj_owner == acting_player:
+                _bump_mask_block("enemy_neutral_filter", src.ships)
                 continue
-            # Guard B: src.ships < required (도착 시점 적 ships+1) 이면 점령 불가 → mask off.
-            # prediction._required_at 와 동일 식: max(1, int(proj_ships) + 1).
+            # Gate 4: capacity_short — src.ships < required (도착 시점 적 ships+1).
+            #   prediction._required_at 와 동일 식: max(1, int(proj_ships) + 1).
             required = max(1, int(proj_ships) + 1)
             if src.ships < required:
+                _bump_mask_block("capacity_short", src.ships)
                 continue
             target_mask[i, j] = True
 
             # ── Pair-level cost features (target head) ──────────────────────
+            # 채널 0~3: 기존 capacity-axis (linear clip)
+            # 채널 4~5: production-axis (log1p) — req_over_src 포화(=1.0) 상태에서
+            #   "회복 가능한 베팅 vs 자살 베팅" 을 가르는 신규 신호.
+            # 채널 6:   eta_advantage_norm — (enemy_min_eta - my_eta) / 30 ∈ [-1,1].
+            #   양수 = 적보다 빨리 도달 → 초반 중립 race 시그널.
+            # 채널 7:   turn_norm — phase awareness (bias_mlp 가 phase × 다른 채널
+            #   조합으로 phase-conditional weighting 학습).
+            # ETA 는 required 산출에 쓰인 eff_turns 와 동일 (정합성).
             tgt_ships_safe = max(int(tgt.ships), 1)
+            src_prod_safe  = max(float(src.production), 1.0)
+            eta_safe       = max(int(eff_turns), 1)
             req_over_src   = min(required / src_ships_safe, RATIO_CLIP)
             req_over_dst   = min(required / tgt_ships_safe, RATIO_CLIP)
             eta_norm       = min(eff_turns / ETA_NORM, 1.5)
             proj_over_src  = min(max(proj_ships, 0.0) / src_ships_safe, RATIO_CLIP)
+            req_over_prod      = math.log1p(required / src_prod_safe)
+            req_over_prod_eta  = math.log1p(required / (src_prod_safe * eta_safe))
+            eta_adv_raw        = (dst_to_enemy_eta[j] - float(eff_turns)) / ETA_NORM
+            eta_adv_norm       = max(-1.0, min(1.0, eta_adv_raw))
             pair_feats[i, j, 0] = req_over_src
             pair_feats[i, j, 1] = req_over_dst
             pair_feats[i, j, 2] = eta_norm
             pair_feats[i, j, 3] = proj_over_src
+            pair_feats[i, j, 4] = req_over_prod
+            pair_feats[i, j, 5] = req_over_prod_eta
+            pair_feats[i, j, 6] = eta_adv_norm
+            pair_feats[i, j, 7] = tn
 
             # ── Per-bin candidate features (amount head) ────────────────────
             # SHIPS_BINS = SHIPS_MULTIPLIERS (multiplier mode) or SHIPS_SURPLUS_BINS.
             # candidate_ships 는 mode 에 따라 다른 식 (decode 와 동일).
+            # production-axis 는 candidate 기준으로 계산 (cand 도 src.production 으로
+            # 회복하는 데 몇 턴/도착-전 회복가능성 — required 와 동일 의미).
+            # 채널 6/7 은 pair-level 과 동일 (bin 무관 — race 와 phase).
             for k, bv in enumerate(SHIPS_BINS):
                 if AMOUNT_MODE == "multiplier":
                     raw = required * bv
@@ -349,10 +464,16 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
                 cand_over_src = min(cand / src_ships_safe, 1.0)
                 rem_over_src  = min(rem  / src_ships_safe, 1.0)
                 cand_over_req = min(cand / max(required, 1), RATIO_CLIP)
+                cand_over_prod      = math.log1p(cand / src_prod_safe)
+                cand_over_prod_eta  = math.log1p(cand / (src_prod_safe * eta_safe))
                 amount_feats[i, j, k, 0] = cand_over_src
                 amount_feats[i, j, k, 1] = rem_over_src
                 amount_feats[i, j, k, 2] = cand_over_req
                 amount_feats[i, j, k, 3] = eta_norm
+                amount_feats[i, j, k, 4] = cand_over_prod
+                amount_feats[i, j, k, 5] = cand_over_prod_eta
+                amount_feats[i, j, k, 6] = eta_adv_norm
+                amount_feats[i, j, k, 7] = tn
 
     self_fallback_active = 0
     # 진단: src.ships threshold 별 self_fallback / active 분해.
@@ -394,6 +515,7 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
                        self_fallback_active=self_fallback_active,
                        self_fallback_by_thresh=self_fallback_by_thresh,
                        active_by_thresh=active_by_thresh,
+                       mask_block_by_thresh=mask_block_by_thresh,
                        pair_features_target=pair_feats,
                        amount_features_full=amount_feats)
 
@@ -559,6 +681,8 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         launches.append({
             "source_id": p.id,
             "target_id": target.id,
+            "source_idx": i,                # planets[] index (eta_advantage lookup 용)
+            "target_idx": target_idx,       # planets[] index
             "target_owner": target.owner,   # -1: neutral, 그 외: 적 (우리는 self 마스킹됨)
             "ships": ships_needed,
             "angle": angle,
@@ -568,9 +692,13 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             #   src_ships_at_launch — launch 시점 source 잔존 ships (req_over_src 분모)
             #   required             — launch 시점 required (req_over_src 분자)
             #   ships_bin            — 0..K-1 (send_frac × bin 매트릭스 분류)
+            #   src_prod_at_launch   — production-axis 분모 (req/prod, req/(prod×eta))
+            #   eta_turns            — required 산출에 쓰인 turns 와 동일 (정합성)
             "src_ships_at_launch": int(p.ships),
             "required": int(required),
             "ships_bin": int(ships_bin),
+            "src_prod_at_launch": float(p.production),
+            "eta_turns": int(turns) if turns else 1,
         })
 
     # over-send 정산: target 별 합산 ships 가 required 초과한 만큼 누적.
@@ -587,11 +715,15 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     return moves
 
 
-def _opp_moves(opponent_model, obs_tensor, raw_planets, raw_fleets, av, device):
-    """상대(player 1) 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용)."""
+def _opp_moves(opponent_model, obs_tensor, raw_planets, raw_fleets, av, device, turn_norm=0.0):
+    """상대(player 1) 행동 생성 (PPO 저장 불필요 — 별도 샘플링 허용).
+
+    turn_norm: 호출자 (rollout) 의 ep_step 기반 phase 신호. 동일 step 의 메인과 동기화.
+    """
     if opponent_model is None:
         return []
-    analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=1)
+    analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=1,
+                                    turn_norm=turn_norm)
     with torch.no_grad():
         action, *_ = opponent_model.get_action_and_value(
             obs_tensor.unsqueeze(0).to(device),
@@ -652,9 +784,26 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     # 진단: src.ships threshold 별 분해 (작은 src 가 false alarm 만드는지 확인용)
     sum_self_fallback_by_thresh = {1: 0, 5: 0, 10: 0, 20: 0}
     sum_active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
+    # 진단: mask first-failure 분해 — 4 게이트 × 4 src.ships threshold (1/5/10/20).
+    # gate: owner_rule | enemy_neutral_filter | sun_path | capacity_short
+    # 분모는 sum_active_by_thresh (위와 동일) — 동일 step active source 수 기준 rate 산출.
+    sum_mask_block_by_thresh = {
+        g: {1: 0, 5: 0, 10: 0, 20: 0}
+        for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+    }
+    # 진단: per-launch eta_advantage_norm 분포 (race signal). 양수 = 적보다 빨리 도달.
+    # 가설: 초반 launch 의 p50/p75 가 양수 → 정책이 race-favorable target 우선 선택.
+    eta_adv_launched_list = []
     # 진단: per-launch req/src.ships 분포 (target 비용 측면). p50/p75/p90/p95 산출용.
     # source 깊은 깊이로 비싼 target 을 잡으면 reserve 가 줄어 다음 턴 방어 곤란 → all-in_rate 와 양의 상관.
     req_over_src_list = []
+    # 진단: production-axis 분포. req_over_src 가 p90=1.0 으로 포화된 상태에서
+    # "회복 가능한 베팅 vs 자살 베팅" 을 가르는 보조 신호.
+    #   req_over_prod      = required / max(src.production, 1)         — 경제 비용 (몇 턴어치 생산)
+    #   req_over_prod_eta  = required / max(src.production × eta, 1)   — 도착 전 회복 가능성
+    # ETA 는 launch 시점 turns 와 동일 (analyze 의 eff_turns 와 의미 동일).
+    req_over_prod_list      = []
+    req_over_prod_eta_list  = []
     # 진단: send_frac × ships_bin 매트릭스. 각 bin 의 send_frac 분포 (multiplier 모드 동작 확인).
     # bin0 (1.00×) → send_frac ≈ required/src ; bin3 (1.20×) → send_frac ≈ ceil(req·1.20)/src
     send_frac_by_bin = {k: [] for k in range(NUM_SHIPS_BINS)}
@@ -665,6 +814,10 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     env = make("orbit_wars", debug=False)
     env.reset()
     hit_tracker.reset_episode(env.state[0].observation)
+    # episode-level step counter (buffer 의 `step` 과 다름 — 에피소드 내 0..episodeSteps-1).
+    # turn_norm = ep_step / episode_steps_max ∈ [0, 1] phase 신호로 모델/reward 에 전달.
+    episode_steps_max = int(getattr(env.configuration, "episodeSteps", 500) or 500)
+    ep_step = 0
 
     history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
     history_f     = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
@@ -696,7 +849,10 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             raw_obs_main = env.state[0].observation
             obs_t, raw_planets, raw_fleets, av = get_obs_tensor(raw_obs_main, 0, history_p, history_f)
 
-            analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=0)
+            # turn_norm: 0.0 = 에피소드 시작, 1.0 = 종료. analyze 의 ch7 + bonus early_boost 에 쓰임.
+            turn_norm = ep_step / max(episode_steps_max, 1)
+            analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=0,
+                                            turn_norm=turn_norm)
             action_mask, target_mask = analysis.action_mask, analysis.target_mask
             pair_feats   = analysis.pair_features_target            # (P, P, F_t)
             amount_full  = analysis.amount_features_full            # (P, P, K, F_a)
@@ -717,7 +873,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
             raw_obs_opp = env.state[1].observation
             obs_opp, raw_planets_opp, raw_fleets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
-            moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, raw_fleets_opp, av_opp, device)
+            moves_opp = _opp_moves(opponent_model, obs_opp, raw_planets_opp, raw_fleets_opp, av_opp, device,
+                                   turn_norm=turn_norm)
 
             # env.step() 전에 snapshot — in-place mutation 방지 (P2 fix)
             prev_map      = _snapshot_planet_owners(env.state[0].observation)
@@ -732,7 +889,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             curr_score     = (state_score(curr_obs_main, player=0)
                             - state_score(env.state[1].observation, player=1))
             dense_r        = dense_coef * (curr_score - prev_score)
-            cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0)
+            cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0,
+                                                   turn_norm=turn_norm)
             # Sprint 2: 이번 step 의 all-in 발사 수에 비례한 페널티 (decode 시 이미 카운트됨).
             #   penalty = -coef × n_all_in   (coef=0 이면 비활성, Sprint 1 baseline 동일)
             all_in_penalty = -all_in_penalty_coef * decode_counts.get("all_in_launches", 0)
@@ -768,13 +926,32 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             for thresh in (1, 5, 10, 20):
                 sum_self_fallback_by_thresh[thresh] += analysis.self_fallback_by_thresh.get(thresh, 0)
                 sum_active_by_thresh[thresh]        += analysis.active_by_thresh.get(thresh, 0)
+            # 진단: mask first-failure 분해 (4 게이트 × 4 threshold). 각 (src,dst) pair 가
+            # 첫 실패 게이트에만 카운트되어 들어옴 (analyze_action_space 가 보장).
+            mb_bt = analysis.mask_block_by_thresh
+            for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short"):
+                gate_dict = mb_bt.get(g, {})
+                for thresh in (1, 5, 10, 20):
+                    sum_mask_block_by_thresh[g][thresh] += gate_dict.get(thresh, 0)
             # 진단: per-launch req/src.ships 와 send_frac × bin. launches_main 에서 추출.
+            # prod-axis 도 같은 launch metadata 에서 산출 (분모는 src.production / src.production×ETA).
+            pair_feats_step = analysis.pair_features_target  # (P,P,F_t) — ch6 = eta_adv_norm
             for lc in launches_main:
-                src_sh = max(int(lc["src_ships_at_launch"]), 1)
-                req_over_src_list.append(int(lc["required"]) / src_sh)
+                src_sh   = max(int(lc["src_ships_at_launch"]), 1)
+                src_prod = max(float(lc["src_prod_at_launch"]), 1.0)
+                eta_t    = max(int(lc["eta_turns"]), 1)
+                req      = int(lc["required"])
+                req_over_src_list.append(req / src_sh)
+                req_over_prod_list.append(req / src_prod)
+                req_over_prod_eta_list.append(req / (src_prod * eta_t))
                 bk = int(lc["ships_bin"])
                 if 0 <= bk < NUM_SHIPS_BINS:
                     send_frac_by_bin[bk].append(int(lc["ships"]) / src_sh)
+                # eta_advantage_norm (race signal). pair_feats[i,j,6] 직접 참조 — analyze 와 정합.
+                si = int(lc.get("source_idx", -1))
+                ti = int(lc.get("target_idx", -1))
+                if 0 <= si < MAX_PLANETS and 0 <= ti < MAX_PLANETS:
+                    eta_adv_launched_list.append(float(pair_feats_step[si, ti, 6].item()))
 
             obs_list.append(obs_t)
             act_list.append(action_t.squeeze(0).cpu())
@@ -799,6 +976,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             amount_feat_list.append(amount_gathered)
 
             step += 1
+            ep_step += 1
 
         # 에피소드 완주 후 target 도달 여부 확인
         if step >= n_steps:
@@ -808,6 +986,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         env = make("orbit_wars", debug=False)
         env.reset()
         hit_tracker.reset_episode(env.state[0].observation)
+        episode_steps_max = int(getattr(env.configuration, "episodeSteps", 500) or 500)
+        ep_step       = 0
         prev_score    = (state_score(env.state[0].observation, player=0)
                        - state_score(env.state[1].observation, player=1))
         history_p     = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
@@ -848,8 +1028,15 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         # 진단: threshold-bucketed (1/5/10/20) self_fallback / active 합산.
         "sum_self_fallback_by_thresh": dict(sum_self_fallback_by_thresh),
         "sum_active_by_thresh":        dict(sum_active_by_thresh),
+        # 진단: mask first-failure 분해 (4 게이트 × 4 threshold).
+        "sum_mask_block_by_thresh": {
+            g: dict(t) for g, t in sum_mask_block_by_thresh.items()
+        },
         # 진단: per-launch raw values (worker 합산 후 분포 산출용).
-        "req_over_src_list": req_over_src_list,
+        "req_over_src_list":      req_over_src_list,
+        "req_over_prod_list":     req_over_prod_list,
+        "req_over_prod_eta_list": req_over_prod_eta_list,
+        "eta_adv_launched_list":  eta_adv_launched_list,
         "send_frac_by_bin":  {k: list(v) for k, v in send_frac_by_bin.items()},
     }
     return (
@@ -923,8 +1110,15 @@ def _finalize_reward_stats(raw_list):
     total_active_sources       = 0
     total_self_fallback_by_thresh = {1: 0, 5: 0, 10: 0, 20: 0}
     total_active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
-    total_req_over_src_list = []
-    total_send_frac_by_bin  = {k: [] for k in range(NUM_SHIPS_BINS)}
+    total_mask_block_by_thresh    = {
+        g: {1: 0, 5: 0, 10: 0, 20: 0}
+        for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+    }
+    total_req_over_src_list      = []
+    total_req_over_prod_list     = []
+    total_req_over_prod_eta_list = []
+    total_eta_adv_launched_list  = []
+    total_send_frac_by_bin       = {k: [] for k in range(NUM_SHIPS_BINS)}
     for r in raw_list:
         for k, v in r["counters"].items():
             total_counters[k] += v
@@ -945,8 +1139,17 @@ def _finalize_reward_stats(raw_list):
         for thresh in (1, 5, 10, 20):
             total_self_fallback_by_thresh[thresh] += sf_bt.get(thresh, 0)
             total_active_by_thresh[thresh]        += ac_bt.get(thresh, 0)
+        # 진단: mask first-failure (gate × threshold) — worker 단순 합산.
+        mb_bt = r.get("sum_mask_block_by_thresh", {})
+        for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short"):
+            gd = mb_bt.get(g, {})
+            for thresh in (1, 5, 10, 20):
+                total_mask_block_by_thresh[g][thresh] += gd.get(thresh, 0)
         # 진단: per-launch lists 합산
         total_req_over_src_list.extend(r.get("req_over_src_list", []))
+        total_req_over_prod_list.extend(r.get("req_over_prod_list", []))
+        total_req_over_prod_eta_list.extend(r.get("req_over_prod_eta_list", []))
+        total_eta_adv_launched_list.extend(r.get("eta_adv_launched_list", []))
         sfb = r.get("send_frac_by_bin", {})
         for k in range(NUM_SHIPS_BINS):
             total_send_frac_by_bin[k].extend(sfb.get(k, []))
@@ -980,6 +1183,21 @@ def _finalize_reward_stats(raw_list):
         stats[f"self_fallback_active_rate_ge{thresh}"] = (
             total_self_fallback_by_thresh[thresh] / max(total_active_by_thresh[thresh], 1)
         )
+    # 진단 A': mask first-failure 분해 — gate × threshold 별 차단 rate.
+    # 분모: 같은 threshold 의 active_by_thresh 합 (acting_player 소유 + ships≥thresh src 수).
+    # 한 src 가 P 개 dst 와 비교되니 분모×P 가 (src,dst) pair 총수지만,
+    # 분모를 active_src 로 두면 "src 당 평균 막힌 dst 수" 의미가 됨 — 모니터링 친숙.
+    # 가설:
+    #   - cap_short_ge20 ↑↑ : 진짜 mask 위기 (큰 src 가 비싼 target 에 막혀 idle).
+    #   - own_ge20 ↑       : 게임 룰 (대부분의 행성이 acting_player 소유 — 후반).
+    #   - enemy_neutral_filter ↑ : Guard A 가 in-flight 중복 방지로 자주 컷.
+    #   - sun_path ↑       : 사선/태양 차폐 — geometric (mask issue 아님).
+    for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short"):
+        for thresh in (1, 5, 10, 20):
+            stats[f"mask_block_{g}_ge{thresh}"] = (
+                total_mask_block_by_thresh[g][thresh]
+                / max(total_active_by_thresh[thresh], 1)
+            )
     # 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
     # 가설: send_required_ratio≈1.17 / send_fraction≈0.80 → req/src ≈ 0.68. 너무 비싼 target →
     # 발사 후 reserve 부족 → 다음 턴 방어 곤란. p90/p95 가 높으면 target 선택이 한계 비용에 몰림.
@@ -992,6 +1210,40 @@ def _finalize_reward_stats(raw_list):
         stats["req_over_src_launched_mean"] = 0.0
         for name in ("p50", "p75", "p90", "p95"):
             stats[f"req_over_src_launched_{name}"] = 0.0
+    # 진단 B': production-axis (req/prod, req/(prod×ETA)) 분포.
+    # req_over_src 가 p90=1.0 으로 saturated 일 때, prod-axis 가 "회복 가능 vs 자살" 가른다.
+    #   req_over_prod      높음 → 경제적으로 비싼 commit (생산량 많이 태움).
+    #   req_over_prod_eta  높음 → 도착 전까지 회복 불가능 (장기 손실 확정).
+    if total_req_over_prod_list:
+        arr_p = np.asarray(total_req_over_prod_list, dtype=np.float64)
+        stats["req_over_prod_launched_mean"] = float(arr_p.mean())
+        for q, name in [(50, "p50"), (75, "p75"), (90, "p90"), (95, "p95")]:
+            stats[f"req_over_prod_launched_{name}"] = float(np.percentile(arr_p, q))
+    else:
+        stats["req_over_prod_launched_mean"] = 0.0
+        for name in ("p50", "p75", "p90", "p95"):
+            stats[f"req_over_prod_launched_{name}"] = 0.0
+    if total_req_over_prod_eta_list:
+        arr_pe = np.asarray(total_req_over_prod_eta_list, dtype=np.float64)
+        stats["req_over_prod_eta_launched_mean"] = float(arr_pe.mean())
+        for q, name in [(50, "p50"), (75, "p75"), (90, "p90"), (95, "p95")]:
+            stats[f"req_over_prod_eta_launched_{name}"] = float(np.percentile(arr_pe, q))
+    else:
+        stats["req_over_prod_eta_launched_mean"] = 0.0
+        for name in ("p50", "p75", "p90", "p95"):
+            stats[f"req_over_prod_eta_launched_{name}"] = 0.0
+    # 진단 C: per-launch eta_advantage_norm 분포 (race signal).
+    # 양수 = 적보다 빨리 도달 (early neutral race 우위), 음수 = 늦음 (보내봤자 경합 손실).
+    # 가설: 정책이 race-favorable target 선호 시 launched p50/p75 → 양수 쪽으로 shift.
+    if total_eta_adv_launched_list:
+        arr_e = np.asarray(total_eta_adv_launched_list, dtype=np.float64)
+        stats["eta_advantage_launched_mean"] = float(arr_e.mean())
+        for q, name in [(50, "p50"), (75, "p75"), (90, "p90"), (95, "p95")]:
+            stats[f"eta_advantage_launched_{name}"] = float(np.percentile(arr_e, q))
+    else:
+        stats["eta_advantage_launched_mean"] = 0.0
+        for name in ("p50", "p75", "p90", "p95"):
+            stats[f"eta_advantage_launched_{name}"] = 0.0
     # 진단 D: send_frac × ships_bin 분포 (multiplier 모드 동작 확인).
     # bin0 (1.00×) → send_frac ≈ required/src ; bin3 (1.20×) → send_frac ≈ ceil(req·1.20)/src.
     # bin0 p90 가 0.5+ 면 작은 src 가 just-capture 도 비싼 상태. bin3 p90 가 1.0 근접 →
@@ -1254,11 +1506,15 @@ def evaluate(main_model, opponent_model, n_games=20):
         game_sr_sum   = 0.0
         game_under_e  = 0
         game_enemy_l  = 0
+        ep_step_e        = 0
+        ep_steps_max_e   = int(getattr(env.configuration, "episodeSteps", 500) or 500)
 
         while not env.done:
             raw_main = env.state[0].observation
             obs_t, raw_p, raw_f, av = get_obs_tensor(raw_main, 0, history_p, history_f)
-            analysis_e = analyze_action_space(raw_p, raw_f, av, acting_player=0)
+            turn_norm_e = ep_step_e / max(ep_steps_max_e, 1)
+            analysis_e = analyze_action_space(raw_p, raw_f, av, acting_player=0,
+                                              turn_norm=turn_norm_e)
             with torch.no_grad():
                 action_t, _, _, _ = main_model.get_action_and_value(
                     obs_t.unsqueeze(0).to(DEVICE),
@@ -1289,9 +1545,11 @@ def evaluate(main_model, opponent_model, n_games=20):
 
             raw_opp = env.state[1].observation
             obs_o, raw_po, raw_fo, avo = get_obs_tensor(raw_opp, 1, history_p_opp, history_f_opp)
-            moves_opp = _opp_moves(opponent_model, obs_o, raw_po, raw_fo, avo, DEVICE)
+            moves_opp = _opp_moves(opponent_model, obs_o, raw_po, raw_fo, avo, DEVICE,
+                                   turn_norm=turn_norm_e)
 
             env.step([moves_main, moves_opp])
+            ep_step_e += 1
 
         r = env.state[0].reward
         if r == 1:
@@ -1349,11 +1607,15 @@ def _run_eval_game(p0_model, p1_model, tracker):
     game_sr_sum   = 0.0
     game_under_e  = 0
     game_enemy_l  = 0
+    ep_step_v      = 0
+    ep_steps_max_v = int(getattr(env.configuration, "episodeSteps", 500) or 500)
 
     while not env.done:
         raw_obs_p0 = env.state[0].observation
         obs_t, raw_p, raw_f, av = get_obs_tensor(raw_obs_p0, 0, history_p, history_f)
-        analysis = analyze_action_space(raw_p, raw_f, av, acting_player=0)
+        turn_norm_v = ep_step_v / max(ep_steps_max_v, 1)
+        analysis = analyze_action_space(raw_p, raw_f, av, acting_player=0,
+                                        turn_norm=turn_norm_v)
         with torch.no_grad():
             action_t, _, _, _ = p0_model.get_action_and_value(
                 obs_t.unsqueeze(0).to(DEVICE),
@@ -1378,11 +1640,13 @@ def _run_eval_game(p0_model, p1_model, tracker):
 
         raw_obs_p1 = env.state[1].observation
         obs_o, raw_po, raw_fo, avo = get_obs_tensor(raw_obs_p1, 1, history_p_opp, history_f_opp)
-        moves_p1 = _opp_moves(p1_model, obs_o, raw_po, raw_fo, avo, DEVICE)
+        moves_p1 = _opp_moves(p1_model, obs_o, raw_po, raw_fo, avo, DEVICE,
+                              turn_norm=turn_norm_v)
 
         prev_obs_snap = _snapshot_obs_for_resolve(raw_obs_p0)
         tracker.register_launches(launches, prev_obs_snap["next_fleet_id"])
         env.step([moves_p0, moves_p1])
+        ep_step_v += 1
 
         curr_obs  = env.state[0].observation
         max_speed = env.configuration.shipSpeed

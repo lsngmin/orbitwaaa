@@ -48,6 +48,16 @@ class TrainingLogger:
             "self_fallback_active_rate_ge5",
             "self_fallback_active_rate_ge10",
             "self_fallback_active_rate_ge20",
+            # Phase A 진단 A': mask first-failure 분해 — 4 게이트 × 4 threshold (16 cols).
+            # 분모: active_by_thresh (acting_player 소유 + ships≥thresh src 수).
+            # 가설별 신호:
+            #   capacity_short_ge20 ↑↑ : 진짜 mask 위기 (큰 src 가 비싼 target 에 막혀 idle).
+            #   owner_rule          ↑  : 게임 룰 (acting_player 소유 행성 비율 — 후반 정상 ↑).
+            #   enemy_neutral_filter↑  : Guard A 가 in-flight 중복 발사 차단 (정상).
+            #   sun_path            ↑  : 사선/태양 차폐 — geometric (mask issue 아님).
+            *(f"mask_block_{g}_ge{t}"
+              for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+              for t in (1, 5, 10, 20)),
             # Phase A 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
             # send_required_ratio≈1.17 / send_fraction≈0.80 → req/src ≈ 0.68 가설.
             "req_over_src_launched_mean",
@@ -55,6 +65,28 @@ class TrainingLogger:
             "req_over_src_launched_p75",
             "req_over_src_launched_p90",
             "req_over_src_launched_p95",
+            # Phase A 진단 B': production-axis (req/prod, req/(prod×ETA)).
+            # req_over_src 가 p90=1.0 saturated 일 때 "회복 가능 vs 자살" 가르는 보조 신호.
+            #   req/prod    : 경제 비용 (몇 턴어치 생산을 태우나)
+            #   req/prodETA : 도착 전까지 회복 가능성
+            "req_over_prod_launched_mean",
+            "req_over_prod_launched_p50",
+            "req_over_prod_launched_p75",
+            "req_over_prod_launched_p90",
+            "req_over_prod_launched_p95",
+            "req_over_prod_eta_launched_mean",
+            "req_over_prod_eta_launched_p50",
+            "req_over_prod_eta_launched_p75",
+            "req_over_prod_eta_launched_p90",
+            "req_over_prod_eta_launched_p95",
+            # Phase A 진단 C: per-launch eta_advantage_norm 분포 (race signal).
+            # (enemy_min_eta - my_eta) / 30 ∈ [-1, 1]. 양수 = 적보다 빠름 (race 우위).
+            # 가설: 정책이 race-favorable target 선호 시 launched p50/p75 → 양수 shift.
+            "eta_advantage_launched_mean",
+            "eta_advantage_launched_p50",
+            "eta_advantage_launched_p75",
+            "eta_advantage_launched_p90",
+            "eta_advantage_launched_p95",
             # Phase A 진단 C: additive bias channel scalar α (model parameter, learned).
             # 0 → off, 커지면 cost feature bias 가 정책에 영향 시작.
             "target_bias_alpha", "amount_bin_alpha",
@@ -347,3 +379,52 @@ class TrainingLogger:
                 f" | b0_p90={bin0_p90:.2f}/b{_NUM_SHIPS_BINS - 1}_p90={bin_top_p90:.2f}]"
             )
             print(line9)
+
+        # Phase A' 진단 (production-axis): req_over_src 포화 상태에서
+        # "경제적으로 비싼가 / 도착 전 회복 가능한가" 분리 추적.
+        #   r/p     : req/prod (몇 턴어치 생산)
+        #   r/pE    : req/(prod×ETA) (도착 전 회복 가능성)
+        #   둘 다 p90 으로 보면 정책이 한계 경제 비용에 몰리는지 명확.
+        rop_mean   = kwargs.get("req_over_prod_launched_mean", "")
+        rop_p50    = kwargs.get("req_over_prod_launched_p50",  "")
+        rop_p90    = kwargs.get("req_over_prod_launched_p90",  "")
+        rop_p95    = kwargs.get("req_over_prod_launched_p95",  "")
+        rope_mean  = kwargs.get("req_over_prod_eta_launched_mean", "")
+        rope_p50   = kwargs.get("req_over_prod_eta_launched_p50",  "")
+        rope_p90   = kwargs.get("req_over_prod_eta_launched_p90",  "")
+        rope_p95   = kwargs.get("req_over_prod_eta_launched_p95",  "")
+        if _is_num(rop_mean):
+            line10 = (
+                f"phaseA'=[r/p μ={rop_mean:.2f}/p50={rop_p50:.2f}/p90={rop_p90:.2f}/p95={rop_p95:.2f}"
+                f" | r/pE μ={rope_mean:.2f}/p50={rope_p50:.2f}/p90={rope_p90:.2f}/p95={rope_p95:.2f}]"
+            )
+            print(line10)
+
+        # Phase A 진단 A' (mask first-failure ge20): 큰 src(≥20 ships) 기준 게이트별 차단 rate.
+        # 작은 src threshold 는 노이즈 많아 ge20 만 콘솔 — 다른 threshold 는 CSV 에 있음.
+        # cap ↑↑ → 진짜 mask 위기, own ↑ → 게임 룰, enf ↑ → Guard A 적정,
+        # sun ↑ → geometric (mask issue 아님).
+        mb_own_ge20 = kwargs.get("mask_block_owner_rule_ge20", "")
+        mb_enf_ge20 = kwargs.get("mask_block_enemy_neutral_filter_ge20", "")
+        mb_sun_ge20 = kwargs.get("mask_block_sun_path_ge20", "")
+        mb_cap_ge20 = kwargs.get("mask_block_capacity_short_ge20", "")
+        if _is_num(mb_own_ge20):
+            line11 = (
+                f"mask_ge20=[own={mb_own_ge20:.1f}/enf={mb_enf_ge20:.1f}"
+                f"/sun={mb_sun_ge20:.1f}/cap={mb_cap_ge20:.1f}]"
+            )
+            print(line11)
+
+        # Phase A 진단 C (eta_advantage launched): race signal 의 per-launch 분포.
+        # 양수 dominant → 정책이 race-favorable target 선호 (초반 중립 race 우위).
+        # 음수 dominant → 늦은 race 만 보냄 (보내봤자 경합 손실 — 위험 신호).
+        eta_mean = kwargs.get("eta_advantage_launched_mean", "")
+        eta_p50  = kwargs.get("eta_advantage_launched_p50",  "")
+        eta_p75  = kwargs.get("eta_advantage_launched_p75",  "")
+        eta_p90  = kwargs.get("eta_advantage_launched_p90",  "")
+        if _is_num(eta_mean):
+            line12 = (
+                f"eta_adv=[μ={eta_mean:+.2f}/p50={eta_p50:+.2f}"
+                f"/p75={eta_p75:+.2f}/p90={eta_p90:+.2f}]"
+            )
+            print(line12)

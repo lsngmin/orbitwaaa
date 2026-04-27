@@ -50,12 +50,32 @@ NUM_SHIPS_BINS     = len(SHIPS_BINS)
 NUM_ACTIONS        = 1 + NUM_SHIPS_BINS
 
 # ── Cost feature dims ────────────────────────────────────────────────────────
-# Pair-level (target head): [required/src_ships, required/dst_ships, eta_norm,
-#   proj_target_ships/src_ships]
-TARGET_PAIR_FEAT_DIM = 4
-# Per-bin (amount head): [candidate_ships/src_ships, remaining_after_send/src_ships,
-#   candidate_ships/required, eta_norm]
-AMOUNT_BIN_FEAT_DIM  = 4
+# Pair-level (target head): [
+#   0: required/src_ships          (linear clip)  — capacity 한계 지표
+#   1: required/dst_ships          (linear clip)
+#   2: eta_norm                    (linear clip)
+#   3: proj_target_ships/src_ships (linear clip)
+#   4: log1p(required/src.production)              — 몇 턴어치 생산량을 태우나 (경제 비용)
+#   5: log1p(required/(src.production × eta_turns))— 도착 전까지 회복 가능성
+#   6: eta_advantage_norm                          — race signal:
+#        clip((enemy_nearest_eta_to_dst - my_eta) / 30, -1, 1)
+#        > 0: 내가 더 빠름, < 0: 적이 더 빠름
+#   7: turn_norm                                   — phase-awareness:
+#        current_ep_step / max_episode_steps (0..1)
+#        bias_mlp 가 implicit 하게 phase 별 feature 가중 학습
+# ]
+TARGET_PAIR_FEAT_DIM = 8
+# Per-bin (amount head): [
+#   0: candidate_ships/src_ships                    (linear clip)
+#   1: remaining_after_send/src_ships               (linear clip)
+#   2: candidate_ships/required                     (linear clip)
+#   3: eta_norm                                     (linear clip)
+#   4: log1p(candidate_ships/src.production)        — 후보가 몇 턴어치 생산량
+#   5: log1p(candidate_ships/(src.production × eta_turns)) — 후보 도착 전 회복 가능성
+#   6: eta_advantage_norm  (pair-level mirror; per-amount ETA 변동은 무시)
+#   7: turn_norm           (phase)
+# ]
+AMOUNT_BIN_FEAT_DIM  = 8
 
 # Action layout: [action_5way_onehot(NUM_ACTIONS), target_onehot(P)]
 #   action_5way: 0=skip, 1..K=bin (k-1)
