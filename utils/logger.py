@@ -39,6 +39,9 @@ class TrainingLogger:
             # 다중 source over-send 페널티 (음수 mean). over_send_penalty=0 이면 0.
             "mean_over_send_penalty",
             "mean_attempts", "mean_launched", "launch_rate",
+            # Step 4 측정: active source(자기 행성+ships>0) 중 valid target 없어
+            # skip 으로 빠진 비율. mask 가 너무 조이면 행동공간 막힘 신호.
+            "self_fallback_active_rate",
             "mean_filtered_invalid_target", "mean_filtered_zero_ships", "mean_filtered_sun",
             "mean_filtered_path",
             "mean_out", "mean_sun_crash",
@@ -144,10 +147,12 @@ class TrainingLogger:
         head_str = (f" | klh=[{kl_a:.3f}/{kl_t:.3f}]"
                     f" | cfh=[{cf_a:.2f}/{cf_t:.2f}]"
                     ) if _is_num(kl_a) else ""
+        sfb_rate = kwargs.get("self_fallback_active_rate", "")
+        sfb_str  = f"/sfb={sfb_rate:.0%}" if _is_num(sfb_rate) else ""
         decode_str = (
             f" | dec=[a={mean_attempts:.2f}/l={mean_launched:.2f}/r={launch_rate:.0%}"
             f"/inv={mean_filtered_invalid:.2f}/z={mean_filtered_zero:.2f}/sun={mean_filtered_sun:.2f}"
-            f"/path={mean_filtered_path:.2f}]"
+            f"/path={mean_filtered_path:.2f}{sfb_str}]"
         ) if _is_num(mean_attempts) else ""
         mean_out        = kwargs.get("mean_out", "")
         mean_sun_crash  = kwargs.get("mean_sun_crash", "")

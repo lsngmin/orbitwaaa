@@ -32,10 +32,14 @@ FLEET_DIM      = 9   # 0-6: numeric features, 7: src_idx, 8: dst_idx
                      # idx 7,8 sentinel: -2=empty slot (둘 다), -1=lookup miss(real fleet), ≥0=valid
 FLEET_FEAT_DIM = 7   # fleet_embed 입력 dim (idx 제외)
 
-# ships head: surplus fraction Categorical
-# bin=0 → just-capture (floor=required), bin=1 → 올인 (src.ships 전부)
+# ships head: amount mode 선택. "multiplier" (Phase A) / "surplus" (legacy).
+#   multiplier: ships = ceil(required × multiplier_k), required 는 BASE.
+#   surplus   : ships = required + bin_k × (src - required), required 위에 surplus 합산.
+AMOUNT_MODE        = CONFIG["model"].get("amount_mode", "multiplier")
 SHIPS_SURPLUS_BINS = tuple(CONFIG["model"].get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
-NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
+SHIPS_MULTIPLIERS  = tuple(CONFIG["model"].get("ships_multipliers",  [1.00, 1.05, 1.12, 1.20]))
+SHIPS_BINS         = SHIPS_MULTIPLIERS if AMOUNT_MODE == "multiplier" else SHIPS_SURPLUS_BINS
+NUM_SHIPS_BINS     = len(SHIPS_BINS)
 # 단일 5-way action: idx 0 = skip (발사 안 함), idx 1..K = bin (k-1) (발사 + 함선량).
 # launch + ships_bin 통합 head — 정책이 source 별 "발사 보류" 를 직접 학습.
 NUM_ACTIONS        = 1 + NUM_SHIPS_BINS

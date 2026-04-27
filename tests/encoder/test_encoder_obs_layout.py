@@ -151,6 +151,25 @@ def test_planet_fusion_params_present():
         assert k in keys_a, f"actor 에 {k} 누락"
 
 
+def test_target_qk_params_present_and_no_target_head():
+    """Step 4: target_head Sequential → target_q / target_k dot-product attention.
+
+    회귀: 옛 target_head.* 키가 남아있으면 partial transfer 가 새 head 를 fresh init
+    하는 게 아니라 unexpected 로 무시 → 학습-제출 mismatch. 새 키가 없으면 forward 가
+    NoneType.
+    """
+    for cls in (mdl.OrbitWarsPolicy, sa.OrbitWarsActor):
+        sd = cls().state_dict()
+        keys = set(sd.keys())
+        assert "target_q.weight" in keys, f"{cls.__name__}: target_q.weight 누락"
+        assert "target_k.weight" in keys, f"{cls.__name__}: target_k.weight 누락"
+        assert "target_q.bias"   in keys, f"{cls.__name__}: target_q.bias 누락"
+        assert "target_k.bias"   in keys, f"{cls.__name__}: target_k.bias 누락"
+        # 옛 P-way classifier 잔재 없어야 함
+        leftover = [k for k in keys if k.startswith("target_head.")]
+        assert not leftover, f"{cls.__name__}: 옛 target_head.* 키 잔재: {leftover}"
+
+
 def test_attention_pool_params_present():
     """Attention pool query + cross-attn 파라미터가 state_dict 에 존재.
 

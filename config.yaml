@@ -6,11 +6,24 @@ model:
   global_layers: 2
   num_heads: 8
   temporal_window: 20
-  # ── ships head: surplus fraction Categorical ─────────────────────────────────
-  # surplus = src.ships - required   (required = ETA forward-sim 도착 시 필요 함선)
-  # ships_to_send = required + bin × max(0, surplus)   clipped to [1, src.ships]
-  # bin=0   → just-capture (floor),  bin=1 → 올인 (src.ships 전부)
-  # 모든 bin 이 의미적으로 다른 행동을 만들어내 gradient density 가 빡빡 (multiplier 방식 대비)
+  # ── ships head: amount mode 선택 ─────────────────────────────────────────────
+  # amount_mode = "multiplier" (Phase A 전환):
+  #   ships_to_send = ceil(required × multiplier_k)   clipped to [1, src.ships]
+  #   multiplier=1.00 → just-capture, 1.20 → 20% buffer.
+  #   required 가 BASE — surplus 를 더하지 않음. 모든 bin 이 required 근방에서
+  #   작게 벌어져 의미 있는 차이가 있는 행동만 만든다.
+  #   src.ships < required 이면 0 (capacity short — 호출자가 launch 폐기).
+  #
+  # amount_mode = "surplus" (legacy, 보존):
+  #   surplus       = src.ships - required
+  #   ships_to_send = required + bin × surplus    clipped to [1, src.ships]
+  #   bin=0 → floor, bin=1 → 올인. 후반 src≫required 분포에서 bin 1..K 가 모두
+  #   사실상 all-in 으로 붕괴 (40-gen 학습 plateau 의 구조적 원인).
+  amount_mode: multiplier
+  # multiplier mode 의 각 bin 값. K = len(ships_multipliers) = NUM_SHIPS_BINS.
+  # 1.00 = just-capture, 1.20 = +20% buffer. 너무 큰 값은 자원 낭비 → 수렴 후 추가.
+  ships_multipliers: [1.00, 1.05, 1.12, 1.20]
+  # surplus mode 잔여 (amount_mode=surplus 일 때만 사용).
   ships_surplus_bins: [0.0, 0.33, 0.66, 1.0]
 
 training:

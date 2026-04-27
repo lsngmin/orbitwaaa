@@ -48,12 +48,18 @@ FLEET_DIM              = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
                               # idx 7,8 sentinel: -2=empty slot, -1=lookup miss (real fleet), ≥0=valid
 FLEET_FEAT_DIM         = 7
 
+AMOUNT_MODE        = M.get("amount_mode", "multiplier")
 SHIPS_SURPLUS_BINS = tuple(M.get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
-NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
+SHIPS_MULTIPLIERS  = tuple(M.get("ships_multipliers",  [1.00, 1.05, 1.12, 1.20]))
+SHIPS_BINS         = SHIPS_MULTIPLIERS if AMOUNT_MODE == "multiplier" else SHIPS_SURPLUS_BINS
+NUM_SHIPS_BINS     = len(SHIPS_BINS)
 # 5-way amount action: idx 0 = skip, 1..K = bin (k-1). model.py 와 동기.
 NUM_ACTIONS        = 1 + NUM_SHIPS_BINS
 # Action layout (env_wrapper / decode 호환): [a_onehot(NUM_ACTIONS), t_onehot(P)]
 ACTION_DIM         = NUM_ACTIONS + MAX_PLANETS
+# Phase A cost-feature dims (model.py 와 동기)
+TARGET_PAIR_FEAT_DIM = 4
+AMOUNT_BIN_FEAT_DIM  = 4
 
 
 def _make_transformer(layers):
@@ -128,41 +134,76 @@ class OrbitWarsActor(nn.Module):
         # Global: cross-attn decoder (Q=P, KV=P+F) — model.py 와 동기
         self.global_attn = _make_decoder(GLOBAL_LAYERS)
 
-        # Step 3 sequential heads — model.py 와 키 동일.
-        #   target_i  ~ Categorical(target_head(src_i))
-        #   amount_i  ~ Categorical(amount_pair_head(src_i, dst_target_i))
-        self.target_head = nn.Sequential(
-            nn.Linear(EMBED_DIM, EMBED_DIM),
-            nn.ReLU(),
-            nn.Linear(EMBED_DIM, MAX_PLANETS),
-        )
+        # Step 4 sequential heads + Phase A cost bias — model.py 와 키 동일.
+        #   target_i  ~ Categorical(q·k/√E + α_t · target_bias_mlp(pair_feats))
+        #   amount_i  ~ Categorical(amount_pair_head + α_a · amount_bin_bias_mlp)
+        self.target_q = nn.Linear(EMBED_DIM, EMBED_DIM)
+        self.target_k = nn.Linear(EMBED_DIM, EMBED_DIM)
         self.amount_pair_head = nn.Sequential(
             nn.Linear(EMBED_DIM * 2, EMBED_DIM),
             nn.ReLU(),
             nn.Linear(EMBED_DIM, NUM_ACTIONS),
         )
 
-    def amount_logits(self, src_token, target_idx):
-        """Pair-wise amount head — model.py._amount_logits 와 동일.
+        # Phase A: explicit cost-feature bias channels (model.py 와 동일 키/dim).
+        # α=0 init → 학습 시작 시점에 q·k/√E 와 amount_pair_head 출력 그대로.
+        self.target_bias_mlp = nn.Sequential(
+            nn.Linear(TARGET_PAIR_FEAT_DIM, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+        self.target_bias_alpha = nn.Parameter(torch.zeros(1))
+        self.amount_bin_bias_mlp = nn.Sequential(
+            nn.Linear(AMOUNT_BIN_FEAT_DIM, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+        self.amount_bin_alpha = nn.Parameter(torch.zeros(1))
 
-        src_token : (B, P, E) — forward 출력
-        target_idx: (B, P) long
-        returns   : (B, P, NUM_ACTIONS) — 5-way (idx 0 = skip)
+    def target_logits(self, src_token, pair_features=None):
+        """Pair-aware target head + Phase A cost bias (model._target_logits 미러).
+
+        Args:
+          src_token    : (B, P, E)
+          pair_features: (B, P, P, TARGET_PAIR_FEAT_DIM) or None
+        Returns:
+          (B, P, P)
+        """
+        q = self.target_q(src_token)
+        k = self.target_k(src_token)
+        logits = torch.matmul(q, k.transpose(-2, -1)) / (EMBED_DIM ** 0.5)
+        if pair_features is not None:
+            bias = self.target_bias_mlp(pair_features).squeeze(-1)
+            logits = logits + self.target_bias_alpha * bias
+        return logits
+
+    def amount_logits(self, src_token, target_idx, amount_features=None):
+        """Pair-wise amount head + per-bin cost bias (model._amount_logits 미러).
+
+        amount_features 는 (B, P, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM) — 이미 chosen
+        target 으로 gather 된 형태. None 이면 base output.
         """
         B, P, E = src_token.shape
         idx_safe   = target_idx.clamp(0, P - 1)
         gather_idx = idx_safe.unsqueeze(-1).expand(-1, -1, E)
         dst_token  = src_token.gather(1, gather_idx)
         pair_input = torch.cat([src_token, dst_token], dim=-1)
-        return self.amount_pair_head(pair_input)
+        logits     = self.amount_pair_head(pair_input)
+        if amount_features is not None:
+            bias_per_bin = self.amount_bin_bias_mlp(amount_features).squeeze(-1)
+            zero_skip    = torch.zeros_like(bias_per_bin[..., :1])
+            bias_full    = torch.cat([zero_skip, bias_per_bin], dim=-1)
+            logits = logits + self.amount_bin_alpha * bias_full
+        return logits
 
     def forward(self, obs_flat):
         """
         obs_flat: (B, HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM))
         returns src_token: (B, MAX_PLANETS, EMBED_DIM)
 
-        Heads (target_head / amount_pair_head) 는 caller (main.py) 가 직접 호출.
-        sequential 샘플링이 필요해서 forward 단에서 amount logits 를 미리 못 만듦.
+        Heads (target_q/target_k via target_logits / amount_pair_head) 는 caller
+        (main.py) 가 직접 호출. sequential 샘플링이 필요해서 forward 단에서
+        amount logits 를 미리 못 만듦.
         """
         B = obs_flat.shape[0]
         p_size = MAX_PLANETS * PLANET_DIM

@@ -47,10 +47,11 @@ def make_raw(id_, x, y, owner, ships=20, production=2, radius=3.0):
 @patch("train.first_collision_on_path", return_value=("planet", 2))
 def test_over_send_excess_two_sources_same_target(*_):
     """두 source 가 같은 target 에 발사 → required 한 번만, ships 합산.
-    bin=1.0 (all-in) 으로 강제하면 over-send 가 확실히 발생.
+    multiplier mode 에서 bin=3 (top multiplier ≈ 1.20×) 두 발 → sent ≈ 2·ceil(req·1.20)
+    > required → over-send 발생.
     """
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
-    # bin=3 → bin_value=1.0 (all-in)
+    # bin=3 → top multiplier (e.g. 1.20×). 둘 다 top multiplier → 합산 sent > required.
     _set_action(action_np, src_idx=0, ships_bin=3, target_idx=2)
     _set_action(action_np, src_idx=1, ships_bin=3, target_idx=2)
 
@@ -65,11 +66,13 @@ def test_over_send_excess_two_sources_same_target(*_):
     )
 
     assert counts["launched"] == 2
-    # 두 source 모두 all-in (100 each) → 200 ships sent
     sent_total = sum(l["ships"] for l in launches)
-    assert sent_total == 200
-    # required 는 첫 launch 시점 snapshot (모든 launch 동일 target → 같은 required)
-    # excess = 200 - required > 0
+    # required 는 첫 launch 시점 snapshot (모든 launch 동일 target → 같은 required).
+    # multiplier 모드에서도 두 launch 합산 > required 이면 excess 발생.
+    required = counts["required_ships_sum"] / counts["launched"]
+    assert sent_total > required, (
+        f"sent_total={sent_total} should exceed required≈{required} for over-send to trigger"
+    )
     assert counts["over_send_excess_sum"] > 0
     assert counts["over_send_target_count"] == 1, (
         f"distinct over-send target 1개 기대, got {counts['over_send_target_count']}"
@@ -114,8 +117,8 @@ def test_over_send_distinct_targets_count_separately(mock_sun, mock_aim):
         return ("planet", 3)
 
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
-    _set_action(action_np, src_idx=0, ships_bin=3, target_idx=2)  # all-in
-    _set_action(action_np, src_idx=1, ships_bin=3, target_idx=3)  # all-in
+    _set_action(action_np, src_idx=0, ships_bin=3, target_idx=2)  # top multiplier
+    _set_action(action_np, src_idx=1, ships_bin=3, target_idx=3)  # top multiplier
 
     raw_planets = [
         make_raw(0, 10.0, 10.0, owner=0, ships=100),
@@ -130,7 +133,7 @@ def test_over_send_distinct_targets_count_separately(mock_sun, mock_aim):
         )
 
     assert counts["launched"] == 2
-    # 각 target 1번씩 all-in → target 별 excess = 100 - required (양수)
+    # 각 target 1번씩 top multiplier → target 별 excess = ceil(req·1.20) - req > 0
     assert counts["over_send_target_count"] == 2
     assert counts["over_send_excess_sum"] > 0
 
@@ -142,7 +145,7 @@ def test_over_send_distinct_targets_count_separately(mock_sun, mock_aim):
 def test_over_send_excess_value_matches_sum_minus_required(*_):
     """excess_sum 은 정확히 (sum_sent - required) 이어야 함."""
     action_np = np.zeros((MAX_PLANETS, ACTION_DIM), dtype=np.float32)
-    # 둘 다 all-in
+    # 둘 다 top multiplier (multiplier 모드에서 over-send 보장)
     _set_action(action_np, src_idx=0, ships_bin=3, target_idx=2)
     _set_action(action_np, src_idx=1, ships_bin=3, target_idx=2)
 

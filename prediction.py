@@ -303,24 +303,29 @@ def project_target_at_eta(target, eta, planets, fleets):
 
 def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
                                pos_cache=None, max_iter=5, fleets=None,
-                               planets=None):
+                               planets=None, amount_mode="multiplier"):
     """
-    surplus-fraction head decode.
+    Pair-wise ship-count decode (target=dst 점령 수학).
 
-    관계식:
+    관계식 (amount_mode="multiplier", Phase A default):
       required     = ETA forward sim 기반 도착 시 필요 함선 (in-flight 반영)
-      surplus      = max(0, src_ships - required)
-      ships_needed = clip(required + bin_value × surplus, 1, src_ships)
+      ships_needed = clip(ceil(required × multiplier), 1, src_ships)
+      bin_value = multiplier ∈ ships_multipliers (config.yaml).
 
-    bin_value=0 → just-capture (floor=required), bin_value=1 → 올인 (src_ships).
-    src_ships < required (capacity short) 인 경우 ships_needed = 0
-    (점령 수학적 불가 — dominated action. 호출자가 under_invested 로 집계 후 launch 폐기).
+    관계식 (amount_mode="surplus", legacy):
+      surplus      = max(0, src_ships - required)
+      ships_needed = clip(round(required + bin × surplus), 1, src_ships)
+      bin_value = bin ∈ ships_surplus_bins.
+
+    공통:
+      src_ships < required (capacity short) 인 경우 ships_needed = 0
+      (점령 수학적 불가 — dominated action. 호출자가 under_invested 로 집계 후
+       launch 폐기.)
 
     고정점 반복: required 가 ships(=속도) 에 의존 → 한번에 안 풀림.
-      ships↑ → 속도↑ → turns↓ → required↓ → ships(=req+frac×surplus) 변동 → 반복.
-      bin_value=0 일 때는 ships=required 라 monotone, bin_value>0 일 때도
-      surplus 가 monotone 비증가라 비교적 빠르게 수렴. oscillate 시 best_ships
-      (conservative=가장 큰) 채택.
+      ships↑ → 속도↑ → turns↓ → required↓ → ships 변동 → 반복.
+      multiplier 모드는 ships=ceil(req·m) 라 monotone 수렴 더 빠름.
+      oscillate 시 best_ships (conservative=가장 큰) 채택.
 
     returns: (ships_needed, angle, tx, ty, turns, required, converged)
     """
@@ -347,9 +352,16 @@ def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
             # capacity short: 점령 수학적 불가 — dominated action 으로 차단.
             # 0 반환 → 호출자가 under_invested 로 집계 후 launch 자체 폐기.
             return 0
-        surplus = src_ships - req
-        raw = req + bin_value * surplus
-        return min(src_ships, max(1, int(round(raw))))
+        if amount_mode == "multiplier":
+            # required 는 BASE — surplus 를 더하지 않는다.
+            # multiplier ∈ [1, ~1.2]: 1.0 = floor, 1.2 = +20% buffer.
+            raw = req * bin_value
+            ships = int(math.ceil(raw))
+        else:  # "surplus" — legacy
+            surplus = src_ships - req
+            raw    = req + bin_value * surplus
+            ships  = int(round(raw))
+        return min(src_ships, max(1, ships))
 
     ships_rep = src_ships
     angle = tx = ty = None

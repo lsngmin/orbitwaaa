@@ -33,8 +33,10 @@ from model import OrbitWarsPolicy
 from env_wrapper import (
     encode_planets, encode_fleets,
     MAX_PLANETS, MAX_FLEETS, PLANET_DIM, FLEET_DIM, HISTORY,
-    SHIPS_SURPLUS_BINS, NUM_SHIPS_BINS, NUM_ACTIONS,
+    SHIPS_SURPLUS_BINS, SHIPS_MULTIPLIERS, SHIPS_BINS, AMOUNT_MODE,
+    NUM_SHIPS_BINS, NUM_ACTIONS,
 )
+from model import TARGET_PAIR_FEAT_DIM, AMOUNT_BIN_FEAT_DIM
 from prediction import (
     aim, crosses_sun, first_collision_on_path, PositionCache,
     resolve_ships_for_capture, project_target_at_eta,
@@ -220,9 +222,12 @@ class ActionSpace:
     """
 
     __slots__ = ("planets", "fleets", "pos_cache", "action_mask", "target_mask",
-                 "av", "acting_player")
+                 "av", "acting_player", "self_fallback_active",
+                 "pair_features_target", "amount_features_full")
 
-    def __init__(self, planets, fleets, pos_cache, action_mask, target_mask, av, acting_player):
+    def __init__(self, planets, fleets, pos_cache, action_mask, target_mask, av, acting_player,
+                 self_fallback_active=0,
+                 pair_features_target=None, amount_features_full=None):
         self.planets       = planets
         self.fleets        = fleets
         self.pos_cache     = pos_cache
@@ -230,6 +235,21 @@ class ActionSpace:
         self.target_mask   = target_mask
         self.av            = av
         self.acting_player = acting_player
+        # self_fallback_active: 이 step 의 active source (acting_player 소유 + ships > 0)
+        # 중 valid target 이 0 개라 self-fallback 이 적용된 src 수.
+        # launchable=False → action_mask 로 skip 강제, 학습 contamination 없음.
+        # 빈도 측정만 — 너무 크면 mask viability 보수화 검토 필요.
+        self.self_fallback_active = self_fallback_active
+        # ── Phase A explicit cost features ───────────────────────────────────
+        # pair_features_target: (P, P, TARGET_PAIR_FEAT_DIM) float32
+        #   [required/src_ships, required/dst_ships, eta_norm, proj_target/src_ships]
+        #   target_mask 가 False 인 (i,j) 도 텐서엔 들어가지만 logits 자체가
+        #   -1e9 로 마스크되므로 무시됨. 학습-제출 parity 위해 항상 채움.
+        # amount_features_full: (P, P, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM) float32
+        #   [candidate/src, remaining/src, candidate/required, eta_norm]
+        #   per-(src, dst, bin_k) candidate 지표. 모델은 chosen target 으로 gather.
+        self.pair_features_target  = pair_features_target
+        self.amount_features_full  = amount_features_full
 
 
 def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
@@ -253,9 +273,20 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
     launchable   = torch.zeros(MAX_PLANETS, dtype=torch.bool)
     target_mask  = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
 
+    # Phase A: explicit cost-feature tensors. mask 가 False 인 (i,j) 위치는
+    # 0 으로 둠 (logit -1e9 마스크가 우선이라 영향 없음).
+    pair_feats   = torch.zeros(MAX_PLANETS, MAX_PLANETS, TARGET_PAIR_FEAT_DIM,
+                                dtype=torch.float32)
+    amount_feats = torch.zeros(MAX_PLANETS, MAX_PLANETS, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM,
+                                dtype=torch.float32)
+    # 정규화 상수
+    ETA_NORM   = 30.0      # 일반 eta 5~30 turn 분포
+    RATIO_CLIP = 5.0       # required/src 등의 발산 방지
+
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
             continue
+        src_ships_safe = max(int(src.ships), 1)
         for j, tgt in enumerate(planets):
             if i == j or tgt.owner == acting_player:
                 continue
@@ -284,11 +315,48 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
                 continue
             target_mask[i, j] = True
 
+            # ── Pair-level cost features (target head) ──────────────────────
+            tgt_ships_safe = max(int(tgt.ships), 1)
+            req_over_src   = min(required / src_ships_safe, RATIO_CLIP)
+            req_over_dst   = min(required / tgt_ships_safe, RATIO_CLIP)
+            eta_norm       = min(eff_turns / ETA_NORM, 1.5)
+            proj_over_src  = min(max(proj_ships, 0.0) / src_ships_safe, RATIO_CLIP)
+            pair_feats[i, j, 0] = req_over_src
+            pair_feats[i, j, 1] = req_over_dst
+            pair_feats[i, j, 2] = eta_norm
+            pair_feats[i, j, 3] = proj_over_src
+
+            # ── Per-bin candidate features (amount head) ────────────────────
+            # SHIPS_BINS = SHIPS_MULTIPLIERS (multiplier mode) or SHIPS_SURPLUS_BINS.
+            # candidate_ships 는 mode 에 따라 다른 식 (decode 와 동일).
+            for k, bv in enumerate(SHIPS_BINS):
+                if AMOUNT_MODE == "multiplier":
+                    raw = required * bv
+                    cand = max(1, math.ceil(raw))
+                else:
+                    surplus = max(src.ships - required, 0)
+                    raw = required + bv * surplus
+                    cand = max(1, int(round(raw)))
+                cand = min(cand, src.ships)
+                rem  = max(src.ships - cand, 0)
+                cand_over_src = min(cand / src_ships_safe, 1.0)
+                rem_over_src  = min(rem  / src_ships_safe, 1.0)
+                cand_over_req = min(cand / max(required, 1), RATIO_CLIP)
+                amount_feats[i, j, k, 0] = cand_over_src
+                amount_feats[i, j, k, 1] = rem_over_src
+                amount_feats[i, j, k, 2] = cand_over_req
+                amount_feats[i, j, k, 3] = eta_norm
+
+    self_fallback_active = 0
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
             continue
         if target_mask[i].any():
             launchable[i] = True
+        else:
+            # active source (소유 + ships>0) 인데 valid target 0 개 → self-fallback 대상.
+            # 빈도 계측용 (학습 영향은 launchable=False 라 skip 강제로 차단됨).
+            self_fallback_active += 1
 
     # All-false row fallback: Categorical NaN 방지용 self 허용
     # (launchable[i]=False → action_mask 가 skip 만 허용 → target lp 게이팅으로 학습 영향 없음)
@@ -302,7 +370,10 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
     action_mask[:, 0] = True
     action_mask[:, 1:] = launchable.unsqueeze(-1)
 
-    return ActionSpace(planets, fleets, pos_cache, action_mask, target_mask, av, acting_player)
+    return ActionSpace(planets, fleets, pos_cache, action_mask, target_mask, av, acting_player,
+                       self_fallback_active=self_fallback_active,
+                       pair_features_target=pair_feats,
+                       amount_features_full=amount_feats)
 
 
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
@@ -382,7 +453,8 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             counts["action_skip_count"] += 1
             continue
         ships_bin = action_idx - 1
-        bin_value = float(SHIPS_SURPLUS_BINS[ships_bin])
+        # SHIPS_BINS = SHIPS_MULTIPLIERS (multiplier mode) or SHIPS_SURPLUS_BINS (legacy)
+        bin_value = float(SHIPS_BINS[ships_bin])
         counts["attempts"] += 1
 
         if target_idx >= len(planets) or planets[target_idx].owner == acting_player:
@@ -397,6 +469,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             p, target, av, bin_value, p.ships, pos_cache=pos_cache,
             fleets=(analysis.fleets if analysis is not None else None),
             planets=(planets if analysis is not None else None),
+            amount_mode=AMOUNT_MODE,
         )
         # under_invested: src.ships < required → 1-A 가 ships_needed=0 으로 막은 케이스.
         # filtered_zero_ships 와 분리해서 *발사 시도* 시점에 집계 (학습 페널티/지표용).
@@ -494,6 +567,8 @@ def _opp_moves(opponent_model, obs_tensor, raw_planets, raw_fleets, av, device):
             obs_tensor.unsqueeze(0).to(device),
             action_mask=analysis.action_mask.unsqueeze(0).to(device),
             target_mask=analysis.target_mask.unsqueeze(0).to(device),
+            target_pair_features=analysis.pair_features_target.unsqueeze(0).to(device),
+            amount_features=analysis.amount_features_full.unsqueeze(0).to(device),
         )
     return decode_action_to_moves(
         action.squeeze(0).cpu().numpy(), raw_planets, av,
@@ -530,11 +605,20 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     obs_list, act_list, rew_list, done_list, logp_list, val_list = [], [], [], [], [], []
     logp_heads_list = []
     action_mask_list, target_mask_list = [], []
+    # Phase A: per-step cost feature buffers.
+    #   pair_feat_list: (P, P, F_t) full — evaluate_actions 가 그대로 사용
+    #   amount_feat_list: (P, K, F_a) — rollout 의 chosen target 으로 이미 gather 된 형태.
+    #     evaluate_actions 시 _gather_amount_features 의 4D pass-through 분기 탐.
+    pair_feat_list, amount_feat_list = [], []
     hit_tracker = HitRateTracker()
     sum_dense = sum_cap = sum_terminal = 0.0
     sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
     sum_over_send_penalty = 0.0   # 다중 source 협조 실패 페널티 (음수 누적)
     sum_under_invested_penalty = 0.0   # capacity-short launch 시도 페널티 (음수 누적)
+    # Step 4 계측: active source (acting_player 소유 + ships>0) 중 valid target=0 인 비율.
+    # 학습 영향 없음 (skip 강제) 이지만 mask viability 가 너무 보수/공격적인지 진단.
+    sum_self_fallback_active = 0
+    sum_active_sources       = 0
     # win_rate 계측: episode 종료 시 main(player=0) reward로 win/draw/loss 집계.
     # draw는 0.5 가중치 (eval과 동일 규약).
     sum_wins = 0.0
@@ -575,11 +659,15 @@ def _collect_single(main_model, opponent_model, n_steps, device):
 
             analysis = analyze_action_space(raw_planets, raw_fleets, av, acting_player=0)
             action_mask, target_mask = analysis.action_mask, analysis.target_mask
+            pair_feats   = analysis.pair_features_target            # (P, P, F_t)
+            amount_full  = analysis.amount_features_full            # (P, P, K, F_a)
             with torch.no_grad():
                 action_t, log_prob, value, lp_heads = main_model.get_action_and_value(
                     obs_t.unsqueeze(0).to(device),
                     action_mask=action_mask.unsqueeze(0).to(device),
                     target_mask=target_mask.unsqueeze(0).to(device),
+                    target_pair_features=pair_feats.unsqueeze(0).to(device),
+                    amount_features=amount_full.unsqueeze(0).to(device),
                 )
             action_np  = action_t.squeeze(0).cpu().numpy()
             moves_main, decode_counts, launches_main = decode_action_to_moves(
@@ -632,6 +720,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             sum_over_send_penalty += over_send_penalty
             sum_under_invested_penalty += under_invested_penalty
             sum_terminal += terminal_r
+            # Step 4 계측: 이 step 의 self_fallback 빈도. active_sources 는 분모 (acting
+            # player 소유 + ships>0 인 src 수) — 매 step launchable[i] 결정 후 알 수 있음.
+            sum_self_fallback_active += analysis.self_fallback_active
+            sum_active_sources       += int(analysis.action_mask[:, 1:].any(dim=-1).sum().item()) \
+                                        + analysis.self_fallback_active
 
             obs_list.append(obs_t)
             act_list.append(action_t.squeeze(0).cpu())
@@ -642,6 +735,18 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             val_list.append(value.squeeze(0).cpu())
             action_mask_list.append(action_mask)
             target_mask_list.append(target_mask)
+            # Phase A: cost features 저장.
+            # pair_feats 는 full (P,P,F_t) 그대로 — evaluate_actions 가 사용.
+            # amount_feats 는 rollout 에서 sample 된 chosen target 으로 미리 gather:
+            #   (P, P, K, F_a) → (P, K, F_a). evaluate 시 _gather_amount_features 4D
+            #   pass-through 으로 그대로 들어감.
+            chosen_target = action_t[0, :, NUM_ACTIONS:].argmax(dim=-1).cpu()  # (P,) long
+            gather_idx_5d = chosen_target.view(MAX_PLANETS, 1, 1, 1).expand(
+                MAX_PLANETS, 1, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM
+            )
+            amount_gathered = amount_full.gather(1, gather_idx_5d).squeeze(1)  # (P, K, F_a)
+            pair_feat_list.append(pair_feats)
+            amount_feat_list.append(amount_gathered)
 
             step += 1
 
@@ -688,6 +793,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "sum_under_invested_penalty": sum_under_invested_penalty,
         "sum_terminal": sum_terminal,
         "sum_wins":     sum_wins,
+        "sum_self_fallback_active": sum_self_fallback_active,
+        "sum_active_sources":       sum_active_sources,
     }
     return (
         torch.stack(obs_list),
@@ -698,6 +805,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         torch.stack(logp_heads_list),
         torch.stack(action_mask_list),
         torch.stack(target_mask_list),
+        torch.stack(pair_feat_list),     # (T, P, P, F_t)
+        torch.stack(amount_feat_list),   # (T, P, K, F_a) — chosen target 으로 gather 됨
         raw_stats,   # ← normalize는 collect_rollout에서 합산 후 수행
     )
 
@@ -754,6 +863,8 @@ def _finalize_reward_stats(raw_list):
     total_over_send_penalty = 0.0
     total_under_invested_penalty = 0.0
     total_wins = 0.0
+    total_self_fallback_active = 0
+    total_active_sources       = 0
     for r in raw_list:
         for k, v in r["counters"].items():
             total_counters[k] += v
@@ -766,6 +877,8 @@ def _finalize_reward_stats(raw_list):
         total_under_invested_penalty += r.get("sum_under_invested_penalty", 0.0)
         total_terminal += r["sum_terminal"]
         total_wins     += r.get("sum_wins", 0.0)
+        total_self_fallback_active += r.get("sum_self_fallback_active", 0)
+        total_active_sources       += r.get("sum_active_sources", 0)
 
     stats = HitRateTracker.summary_from_counters(
         total_counters, total_n_steps, total_episodes,
@@ -780,6 +893,14 @@ def _finalize_reward_stats(raw_list):
     stats["mean_over_send_penalty"] = total_over_send_penalty / steps_safe
     # capacity-short launch 시도 페널티 (음수). under_invested_penalty=0 이면 0.
     stats["mean_under_invested_penalty"] = total_under_invested_penalty / steps_safe
+    # Step 4 계측: active source (acting_player 소유 + ships>0) 중 valid target=0 인
+    # source 의 비율. 학습 contamination 없음 (skip 강제) 이지만 mask viability 진단:
+    #   - <1% : 거의 무시 가능
+    #   - 1-5% : 노이즈 가능, 모니터링
+    #   - >5% : mask 가 너무 보수적, ships_rep / Guard A,B 재검토
+    stats["self_fallback_active_rate"] = (
+        total_self_fallback_active / max(total_active_sources, 1)
+    )
     # rollout 내 main(player=0) 승률. on-policy sampling이라 eval보다 noisy지만,
     # match_type별 log로 분포별 성능을 바로 볼 수 있는 이점.
     stats["win_rate"]      = total_wins / max(total_episodes, 1)
@@ -799,8 +920,10 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
     """
     if n_envs <= 1 or pool is None:
         result = _collect_single(main_model, opponent_model, n_steps, DEVICE)
-        merged_stats = _finalize_reward_stats([result[8]])
-        return (*result[:8], merged_stats)
+        # tuple layout: 0=obs, 1=act, 2=adv, 3=ret, 4=logp, 5=logp_heads,
+        #               6=action_mask, 7=target_mask, 8=pair_feats, 9=amount_feats, 10=raw_stats
+        merged_stats = _finalize_reward_stats([result[10]])
+        return (*result[:10], merged_stats)
 
     main_state = {k: v.cpu() for k, v in main_model.state_dict().items()}
     opp_state  = ({k: v.cpu() for k, v in opponent_model.state_dict().items()}
@@ -811,7 +934,7 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
 
     results = pool.map(_rollout_worker, worker_args)
 
-    merged_stats = _finalize_reward_stats([r[8] for r in results])
+    merged_stats = _finalize_reward_stats([r[10] for r in results])
     return (
         torch.cat([r[0] for r in results]),
         torch.cat([r[1] for r in results]),
@@ -821,6 +944,8 @@ def collect_rollout(main_model, opponent_model, n_steps=512, n_envs=1, pool=None
         torch.cat([r[5] for r in results]),
         torch.cat([r[6] for r in results]),
         torch.cat([r[7] for r in results]),
+        torch.cat([r[8] for r in results]),
+        torch.cat([r[9] for r in results]),
         merged_stats,
     )
 
@@ -877,6 +1002,7 @@ def compute_gae(rewards, dones, values, last_value=0.0, gamma=T["gamma"], lam=T[
 
 def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantages,
                old_logp_heads=None, action_masks=None, target_masks=None,
+               pair_features=None, amount_features=None,
                clip_range=T["clip_range"], n_epochs=T["n_epochs"], minibatch_size=T["minibatch_size"],
                target_kl=T.get("target_kl")):
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -892,6 +1018,10 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
         action_masks = action_masks.to(DEVICE)
     if target_masks is not None:
         target_masks = target_masks.to(DEVICE)
+    if pair_features is not None:
+        pair_features = pair_features.to(DEVICE)
+    if amount_features is not None:
+        amount_features = amount_features.to(DEVICE)
 
     N = len(obs)
     p_losses, v_losses, e_losses = [], [], []
@@ -909,8 +1039,11 @@ def ppo_update(model, optimizer, obs, actions, old_log_probs, returns, advantage
 
             am_mb = action_masks[mb] if action_masks is not None else None
             tm_mb = target_masks[mb] if target_masks is not None else None
+            pf_mb = pair_features[mb]   if pair_features   is not None else None
+            af_mb = amount_features[mb] if amount_features is not None else None
             log_probs, entropy, values, ent_a, ent_t, lp_heads = model.evaluate_actions(
                 obs[mb], actions[mb], action_mask=am_mb, target_mask=tm_mb,
+                target_pair_features=pf_mb, amount_features=af_mb,
             )
 
             ratio        = (log_probs - old_log_probs[mb]).exp()
@@ -1022,6 +1155,8 @@ def evaluate(main_model, opponent_model, n_games=20):
                     obs_t.unsqueeze(0).to(DEVICE),
                     action_mask=analysis_e.action_mask.unsqueeze(0).to(DEVICE),
                     target_mask=analysis_e.target_mask.unsqueeze(0).to(DEVICE),
+                    target_pair_features=analysis_e.pair_features_target.unsqueeze(0).to(DEVICE),
+                    amount_features=analysis_e.amount_features_full.unsqueeze(0).to(DEVICE),
                 )
             moves_main, counts, _launches = decode_action_to_moves(
                 action_t.squeeze(0).cpu().numpy(), raw_p, av,
@@ -1115,6 +1250,8 @@ def _run_eval_game(p0_model, p1_model, tracker):
                 obs_t.unsqueeze(0).to(DEVICE),
                 action_mask=analysis.action_mask.unsqueeze(0).to(DEVICE),
                 target_mask=analysis.target_mask.unsqueeze(0).to(DEVICE),
+                target_pair_features=analysis.pair_features_target.unsqueeze(0).to(DEVICE),
+                amount_features=analysis.amount_features_full.unsqueeze(0).to(DEVICE),
             )
         moves_p0, counts, launches = decode_action_to_moves(
             action_t.squeeze(0).cpu().numpy(), raw_p, av,
@@ -1281,7 +1418,10 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
     exploiter_reset = 0
 
     ckpt_path = os.path.join(SAVE_DIR, "resume.pt")
-    result = load_checkpoint(ckpt_path, main_model, optimizer, DEVICE)
+    # PARTIAL_TRANSFER=1: 모델 구조 변경 (e.g. Step 3 → Step 4 target head 교체) 시
+    # 한 번만 strict=False 로 로드. 매칭 안 되는 key (target_q/k 등) 는 새로 init.
+    strict_load = os.environ.get("PARTIAL_TRANSFER", "0") != "1"
+    result = load_checkpoint(ckpt_path, main_model, optimizer, DEVICE, strict=strict_load)
     if result:
         generation, total_steps, league.agents = result
     else:
@@ -1301,22 +1441,26 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
 
             opponent, match_type = _sample_opponent(main_model, exploiter, league)
 
-            obs, actions, advantages, returns, log_probs, logp_heads, amasks, tmasks, rew_stats = collect_rollout(
+            (obs, actions, advantages, returns, log_probs, logp_heads, amasks, tmasks,
+             pair_feats, amount_feats, rew_stats) = collect_rollout(
                 main_model, opponent, n_steps=rollout_steps, n_envs=n_envs, pool=pool
             )
             p_loss, v_loss, e_loss, approx_kl, clip_frac, epochs_done, ent_a, ent_t, head_metrics = ppo_update(
                 main_model, optimizer, obs, actions, log_probs, returns, advantages,
                 old_logp_heads=logp_heads, action_masks=amasks, target_masks=tmasks,
+                pair_features=pair_feats, amount_features=amount_feats,
             )
             total_steps += len(obs)
 
             exp_opp = copy.deepcopy(main_model)
             exp_opp.eval()
-            obs_e, act_e, adv_e, ret_e, logp_e, logp_heads_e, amasks_e, tmasks_e, _ = collect_rollout(
+            (obs_e, act_e, adv_e, ret_e, logp_e, logp_heads_e, amasks_e, tmasks_e,
+             pair_feats_e, amount_feats_e, _) = collect_rollout(
                 exploiter, exp_opp, n_steps=max(1, rollout_steps // 2), n_envs=max(1, n_envs // 2), pool=pool
             )
             ppo_update(exploiter, exploiter_opt, obs_e, act_e, logp_e, ret_e, adv_e,
-                       old_logp_heads=logp_heads_e, action_masks=amasks_e, target_masks=tmasks_e)
+                       old_logp_heads=logp_heads_e, action_masks=amasks_e, target_masks=tmasks_e,
+                       pair_features=pair_feats_e, amount_features=amount_feats_e)
 
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
@@ -1334,6 +1478,10 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_attempts=rew_stats["mean_attempts"],
                 mean_launched=rew_stats["mean_launched"],
                 launch_rate=rew_stats["launch_rate"],
+                # Step 4 측정: active source(자기 행성+ships>0) 중 valid target 없어
+                # skip 으로 빠진 비율. 높으면 mask 가 너무 조이거나 dst 제약(파라볼라/부족)
+                # 으로 행동공간이 막힌 상태. target_q/k pair-aware 도입 효과 확인용.
+                self_fallback_active_rate=rew_stats.get("self_fallback_active_rate", 0.0),
                 mean_filtered_invalid_target=rew_stats["mean_filtered_invalid_target"],
                 mean_filtered_zero_ships=rew_stats["mean_filtered_zero_ships"],
                 mean_filtered_sun=rew_stats["mean_filtered_sun"],

@@ -37,13 +37,25 @@ FLEET_DIM       = 9   # 0-6: numeric, 7: src_idx, 8: dst_idx
                       # idx 7,8 sentinel: -2=empty slot, -1=lookup miss (real fleet), ≥0=valid
 FLEET_FEAT_DIM  = 7   # fleet_embed 입력 dim
 
-# ships head: surplus fraction Categorical
-# decode: ships_to_send = clip(required + bin × max(0, src.ships - required), 1, src.ships)
+# ships head: amount mode 선택. "multiplier" (Phase A) / "surplus" (legacy).
+#   multiplier: ships = ceil(required × multiplier_k)
+#   surplus   : ships = required + bin × max(0, src - required)
+AMOUNT_MODE        = M.get("amount_mode", "multiplier")
 SHIPS_SURPLUS_BINS = tuple(M.get("ships_surplus_bins", [0.0, 0.33, 0.66, 1.0]))
-NUM_SHIPS_BINS     = len(SHIPS_SURPLUS_BINS)
+SHIPS_MULTIPLIERS  = tuple(M.get("ships_multipliers",  [1.00, 1.05, 1.12, 1.20]))
+SHIPS_BINS         = SHIPS_MULTIPLIERS if AMOUNT_MODE == "multiplier" else SHIPS_SURPLUS_BINS
+NUM_SHIPS_BINS     = len(SHIPS_BINS)
 # 단일 5-way action: idx 0 = skip (발사 안 함), idx 1..K = bin k-1 (발사 + 함선량)
 # launch + ships_bin 를 합쳐 정책이 source 별 "발사 보류" 를 직접 sample.
 NUM_ACTIONS        = 1 + NUM_SHIPS_BINS
+
+# ── Cost feature dims ────────────────────────────────────────────────────────
+# Pair-level (target head): [required/src_ships, required/dst_ships, eta_norm,
+#   proj_target_ships/src_ships]
+TARGET_PAIR_FEAT_DIM = 4
+# Per-bin (amount head): [candidate_ships/src_ships, remaining_after_send/src_ships,
+#   candidate_ships/required, eta_norm]
+AMOUNT_BIN_FEAT_DIM  = 4
 
 # Action layout: [action_5way_onehot(NUM_ACTIONS), target_onehot(P)]
 #   action_5way: 0=skip, 1..K=bin (k-1)
@@ -136,21 +148,44 @@ class OrbitWarsPolicy(nn.Module):
         # 한 번 더 참조해 의사결정 표현 만듦.
         self.global_attn = make_decoder(GLOBAL_LAYERS)
 
-        # Actor heads — sequential factorization (Step 3):
-        #   target_i  ~ Categorical(target_head(src_i))                     # (P,)
-        #   amount_i  ~ Categorical(amount_pair_head(src_i, dst_target_i))  # 5-way (skip+bins)
-        # amount 이 src,target 둘 다 보고 결정 → "어디로 보낼지" 가 정해진 후
-        # "그곳으로 몇 척" 을 평가. skip 은 amount 의 0 번 bin 으로 흡수.
-        self.target_head = nn.Sequential(
-            nn.Linear(EMBED_DIM, EMBED_DIM),
-            nn.ReLU(),
-            nn.Linear(EMBED_DIM, MAX_PLANETS),
-        )
+        # Actor heads — sequential factorization (Step 4: target pair-aware):
+        #   target_i  ~ Categorical(q(H_i) · k(H_j) / sqrt(E))              # (B, P, P)
+        #   amount_i  ~ Categorical(amount_pair_head(H_i, H_target_i))      # 5-way
+        # target/amount 모두 (src, dst) 를 명시적으로 점수화 — Step 3 의 비대칭
+        #   target: f(H_i)_j   ← P-way classifier (index prior 만 학습 가능)
+        #   amount: g(H_i, H_j) ← pair-aware
+        # 을 해소. target_logit[i,j] = score(source i, destination j) 로 dst 의 표현
+        # 을 직접 본다. Q/K 분리 — source/destination 방향성 고려.
+        self.target_q = nn.Linear(EMBED_DIM, EMBED_DIM)
+        self.target_k = nn.Linear(EMBED_DIM, EMBED_DIM)
         self.amount_pair_head = nn.Sequential(
             nn.Linear(EMBED_DIM * 2, EMBED_DIM),
             nn.ReLU(),
             nn.Linear(EMBED_DIM, NUM_ACTIONS),
         )
+
+        # ── Phase A: explicit cost-feature bias channels ─────────────────────
+        # rationale: surplus-fraction plateau (gen 32, 40-gen) 는 모델이 required 를
+        # 명시적으로 모르는 상태에서 src/dst 의 토큰 표현만으로 "얼마 보낼지" 를
+        # 학습해야 했기 때문. required/src_ships, eta 같은 명시 지표를 head 에
+        # 직접 주면 학습 신호가 농축됨.
+        #
+        # Step 4 parity: alpha = nn.Parameter(zeros(1)) 으로 초기화 → 학습 시작
+        # 시점에 bias 출력이 정확히 0. 즉 t_logits = q·k/√E 그대로, a_logits
+        # = amount_pair_head(...) 그대로. Step 4 verification 가드 통과.
+        self.target_bias_mlp = nn.Sequential(
+            nn.Linear(TARGET_PAIR_FEAT_DIM, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+        self.target_bias_alpha = nn.Parameter(torch.zeros(1))
+        # amount: per-bin scalar bias (skip(idx 0) 은 candidate 가 없으므로 0 유지).
+        self.amount_bin_bias_mlp = nn.Sequential(
+            nn.Linear(AMOUNT_BIN_FEAT_DIM, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+        self.amount_bin_alpha = nn.Parameter(torch.zeros(1))
 
         # Critic head — 상태 가치 출력
         self.critic = nn.Sequential(
@@ -309,51 +344,114 @@ class OrbitWarsPolicy(nn.Module):
 
         return global_out, value
 
-    def _amount_logits(self, src_token, target_idx):
-        """Pair-wise amount head. amount = f(src_i, dst_{target_i}).
+    def _gather_amount_features(self, amount_features, target_idx):
+        """Shape-detect helper: full (B,P,P,K,F) → gathered (B,P,K,F) by target_idx.
+
+        4D 입력은 이미 gather 된 것으로 보고 pass-through.
+        None 은 None.
 
         Args:
-          src_token : (B, P, E) — forward 의 encoder 출력
-          target_idx: (B, P) long — 각 source 가 가리키는 target index
+          amount_features: (B, P, P, K, F) or (B, P, K, F) or None
+          target_idx     : (B, P) long
+        """
+        if amount_features is None:
+            return None
+        if amount_features.dim() == 4:
+            return amount_features
+        # 5D: gather by chosen target
+        B, P, _, K, F = amount_features.shape
+        idx_safe = target_idx.clamp(0, P - 1)
+        gather_idx = idx_safe.view(B, P, 1, 1, 1).expand(-1, -1, 1, K, F)
+        return amount_features.gather(2, gather_idx).squeeze(2)             # (B, P, K, F)
+
+    def _target_logits(self, src_token, pair_features=None):
+        """Pair-aware target head (Step 4 + Phase A cost bias).
+
+        Step 4:    t_logits[i,j] = q(H_i)·k(H_j)/sqrt(E)
+        Phase A:   t_logits[i,j] += α · target_bias_mlp(pair_features[i,j])
+
+        pair_features=None 또는 α=0 (init) 이면 정확히 Step 4 결과와 동일 →
+        Step-4 체크포인트 transfer 시 보존된 q·k 표현을 망치지 않는다.
+
+        Args:
+          src_token    : (B, P, E)
+          pair_features: (B, P, P, TARGET_PAIR_FEAT_DIM) or None
+                         (required/src, required/dst, eta_norm, proj_target/src)
         Returns:
-          (B, P, NUM_ACTIONS) — 5-way logits (idx 0 = skip)
+          (B, P, P)
+        """
+        q = self.target_q(src_token)                                    # (B, P, E)
+        k = self.target_k(src_token)                                    # (B, P, E)
+        logits = torch.matmul(q, k.transpose(-2, -1)) / (EMBED_DIM ** 0.5)
+        if pair_features is not None:
+            bias = self.target_bias_mlp(pair_features).squeeze(-1)      # (B, P, P)
+            logits = logits + self.target_bias_alpha * bias
+        return logits
+
+    def _amount_logits(self, src_token, target_idx, amount_features=None):
+        """Pair-wise amount head + per-bin cost bias (Phase A).
+
+        base:    a_logits[i, k] = amount_pair_head([H_i, H_target_i])[k]
+        Phase A: a_logits[i, 1+k] += α · amount_bin_bias_mlp(amount_features[i, k])
+                 (skip(idx 0) 은 candidate 가 없으므로 bias 없음 — 0 유지)
+
+        amount_features=None 또는 α=0 (init) → 정확히 base 결과 유지.
+
+        Args:
+          src_token      : (B, P, E)
+          target_idx     : (B, P) long — 각 source 가 가리키는 target index
+          amount_features: (B, P, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM) or None
+                           각 (src, chosen_dst, bin_k) 에 대한 candidate 지표.
+        Returns:
+          (B, P, NUM_ACTIONS)  — idx 0 = skip
         """
         B, P, E = src_token.shape
         idx_safe   = target_idx.clamp(0, P - 1)
         gather_idx = idx_safe.unsqueeze(-1).expand(-1, -1, E)
         dst_token  = src_token.gather(1, gather_idx)                    # (B, P, E)
         pair_input = torch.cat([src_token, dst_token], dim=-1)          # (B, P, 2E)
-        return self.amount_pair_head(pair_input)
+        logits     = self.amount_pair_head(pair_input)                  # (B, P, NUM_ACTIONS)
+        if amount_features is not None:
+            # bias_per_bin: (B, P, NUM_SHIPS_BINS)
+            bias_per_bin = self.amount_bin_bias_mlp(amount_features).squeeze(-1)
+            # skip dim 앞에 0 prepend → (B, P, NUM_ACTIONS)
+            zero_skip = torch.zeros_like(bias_per_bin[..., :1])
+            bias_full = torch.cat([zero_skip, bias_per_bin], dim=-1)
+            logits = logits + self.amount_bin_alpha * bias_full
+        return logits
 
-    def get_action_and_value(self, obs_flat, action_mask=None, target_mask=None):
+    def get_action_and_value(self, obs_flat, action_mask=None, target_mask=None,
+                              target_pair_features=None, amount_features=None):
         """PPO 학습용: target → amount sequential conditional sampling.
 
-        Sampling order:
-          1. target_i ~ Categorical(target_head(src_i))                       # masked
-          2. amount_i ~ Categorical(amount_pair_head(src_i, dst_target_i))    # masked
+        Sampling order (Step 4 + Phase A cost bias):
+          1. target_i ~ Categorical(q·k/√E + α_t · target_bias_mlp(pair_feats))     # masked
+          2. amount_i ~ Categorical(amount_pair_head + α_a · amount_bin_bias_mlp)   # masked
 
-        action_mask: (B, P, NUM_ACTIONS) bool — amount logits 마스킹.
-                     skip(idx 0) 은 항상 허용, bin(idx 1..) 은 source 가용성 따라.
-        target_mask: (B, P, P) bool — target logits 마스킹.
+        action_mask         : (B, P, NUM_ACTIONS) bool
+        target_mask         : (B, P, P) bool
+        target_pair_features: (B, P, P, TARGET_PAIR_FEAT_DIM) or None
+        amount_features     : (B, P, NUM_SHIPS_BINS, AMOUNT_BIN_FEAT_DIM) or None
 
         log_prob factorization (skip 흡수 방식):
           log p(action) = log p(amount | src, target) + is_launch · log p(target | src)
-          target sample 은 항상 뽑지만 launch=0(skip) 일 때 lp_target 게이팅으로
-          target_head 학습 신호 차단.
 
         Returns: action, log_prob, value, lp_heads (action layout = [a_onehot(K), t_onehot(P)])
         """
         src_token, value = self.forward(obs_flat)
 
         # Step 1: target sample
-        t_logits = self.target_head(src_token)                          # (B, P, P)
+        t_logits = self._target_logits(src_token, target_pair_features)  # (B, P, P)
         if target_mask is not None:
             t_logits = t_logits.masked_fill(~target_mask, -1e9)
         t_dist = torch.distributions.Categorical(logits=t_logits)
         target = t_dist.sample()                                         # (B, P) long
 
-        # Step 2: amount sample (conditional on target)
-        a_logits = self._amount_logits(src_token, target)                # (B, P, NUM_ACTIONS)
+        # Step 2: amount sample (conditional on target).
+        # amount_features 는 (B, P, P, K, F) 인 경우 chosen target 으로 gather,
+        # 또는 호출자가 미리 (B, P, K, F) 로 만들어 와도 됨. 여기서는 전자/후자 둘 다 수용.
+        a_features = self._gather_amount_features(amount_features, target)
+        a_logits = self._amount_logits(src_token, target, a_features)
         if action_mask is not None:
             a_logits = a_logits.masked_fill(~action_mask, -1e9)
         a_dist = torch.distributions.Categorical(logits=a_logits)
@@ -374,22 +472,26 @@ class OrbitWarsPolicy(nn.Module):
         lp_heads = torch.stack([lp_action, lp_target], dim=-1)
         return action, log_prob, value, lp_heads
 
-    def evaluate_actions(self, obs_flat, actions, action_mask=None, target_mask=None):
+    def evaluate_actions(self, obs_flat, actions, action_mask=None, target_mask=None,
+                          target_pair_features=None, amount_features=None):
         """PPO 업데이트용: 저장된 (target, amount) 의 log_prob + entropy + value.
 
-        rollout 시와 동일 마스크 사용해야 importance ratio 유효.
+        rollout 시와 동일 마스크 + 동일 cost feature 사용해야 importance ratio 유효.
+        amount_features 는 rollout 에서 이미 gather 된 (B, P, K, F) 를 받는다
+        (full (B,P,P,K,F) 도 받지만 _gather_amount_features 가 알아서 처리).
         """
         src_token, value = self.forward(obs_flat)
 
         a_idx  = actions[..., :NUM_ACTIONS].argmax(dim=-1)               # (B, P)
         target = actions[..., NUM_ACTIONS:].argmax(dim=-1)               # (B, P)
 
-        t_logits = self.target_head(src_token)
+        t_logits = self._target_logits(src_token, target_pair_features)
         if target_mask is not None:
             t_logits = t_logits.masked_fill(~target_mask, -1e9)
         t_dist = torch.distributions.Categorical(logits=t_logits)
 
-        a_logits = self._amount_logits(src_token, target)                # 저장된 target 으로 pair
+        a_features = self._gather_amount_features(amount_features, target)
+        a_logits   = self._amount_logits(src_token, target, a_features)  # 저장된 target 으로 pair
         if action_mask is not None:
             a_logits = a_logits.masked_fill(~action_mask, -1e9)
         a_dist = torch.distributions.Categorical(logits=a_logits)

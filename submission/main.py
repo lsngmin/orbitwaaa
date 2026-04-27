@@ -127,19 +127,26 @@ def _history(player, current_step):
 def _sample_action(model, src_token, analysis):
     """학습 OrbitWarsPolicy.get_action_and_value 와 동일한 sequential sampling.
 
-      1. target_i ~ Categorical(target_head(src_i))            # masked
-      2. amount_i ~ Categorical(amount_pair_head(src_i, dst))  # masked, 5-way
+      1. target_i ~ Categorical(q·k/√E + α_t · target_bias_mlp(pair_feats))     # masked
+      2. amount_i ~ Categorical(amount_pair_head + α_a · amount_bin_bias_mlp)   # masked
 
     src_token: (1, MAX_PLANETS, EMBED_DIM) CPU tensor
     return:    (MAX_PLANETS, ACTION_DIM) numpy — [a_onehot(K), t_onehot(P)]
     """
-    # Step 1: target sample
-    t_logits = model.target_head(src_token)[0]                              # (P, P)
+    # Phase A cost features (학습 train.py 와 동일 산출 — analyze_action_space 가 채움).
+    pair_feats   = analysis.pair_features_target.unsqueeze(0)               # (1, P, P, F_t)
+    amount_full  = analysis.amount_features_full.unsqueeze(0)               # (1, P, P, K, F_a)
+
+    # Step 1: target sample (pair-aware + cost bias)
+    t_logits = model.target_logits(src_token, pair_feats)[0]                # (P, P)
     t_logits = t_logits.masked_fill(~analysis.target_mask, -1e9)
     target   = torch.distributions.Categorical(logits=t_logits).sample()    # (P,)
 
-    # Step 2: amount sample (conditional on target)
-    a_logits = model.amount_logits(src_token, target.unsqueeze(0))[0]       # (P, NUM_ACTIONS)
+    # Step 2: amount sample (chosen target 으로 amount features gather)
+    P, _, K, F_a = amount_full.shape[1:]
+    gather_idx   = target.view(1, P, 1, 1, 1).expand(1, P, 1, K, F_a)
+    amount_gath  = amount_full.gather(2, gather_idx).squeeze(2)             # (1, P, K, F_a)
+    a_logits = model.amount_logits(src_token, target.unsqueeze(0), amount_gath)[0]
     a_logits = a_logits.masked_fill(~analysis.action_mask, -1e9)
     a_idx    = torch.distributions.Categorical(logits=a_logits).sample()    # (P,)
 
