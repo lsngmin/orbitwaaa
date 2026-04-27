@@ -42,6 +42,26 @@ class TrainingLogger:
             # Step 4 측정: active source(자기 행성+ships>0) 중 valid target 없어
             # skip 으로 빠진 비율. mask 가 너무 조이면 행동공간 막힘 신호.
             "self_fallback_active_rate",
+            # Phase A 진단 A: src.ships threshold 별 self_fallback rate.
+            # 작은 src(1~2)가 만든 false alarm 인지 vs 큰 src 도 진짜 막히는지 구분.
+            "self_fallback_active_rate_ge1",
+            "self_fallback_active_rate_ge5",
+            "self_fallback_active_rate_ge10",
+            "self_fallback_active_rate_ge20",
+            # Phase A 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
+            # send_required_ratio≈1.17 / send_fraction≈0.80 → req/src ≈ 0.68 가설.
+            "req_over_src_launched_mean",
+            "req_over_src_launched_p50",
+            "req_over_src_launched_p75",
+            "req_over_src_launched_p90",
+            "req_over_src_launched_p95",
+            # Phase A 진단 C: additive bias channel scalar α (model parameter, learned).
+            # 0 → off, 커지면 cost feature bias 가 정책에 영향 시작.
+            "target_bias_alpha", "amount_bin_alpha",
+            # Phase A 진단 D: send_frac × ships_bin 매트릭스 (multiplier 모드 동작 확인).
+            *(f"send_frac_bin{k}_mean" for k in range(_NUM_SHIPS_BINS)),
+            # bin0/bin{K-1} (양 극단) 만 p90 추적.
+            *(f"send_frac_bin{k}_p90" for k in sorted({0, _NUM_SHIPS_BINS - 1})),
             "mean_filtered_invalid_target", "mean_filtered_zero_ships", "mean_filtered_sun",
             "mean_filtered_path",
             "mean_out", "mean_sun_crash",
@@ -301,3 +321,29 @@ class TrainingLogger:
                 f" | loss: under={e_ul:.0%}(enm={e_uel:.0%})/sr={e_sl:.2f}]"
             )
             print(line8)
+
+        # Phase A 진단 (post-Phase-A 병목 분석):
+        #   sfb_ge*  : src.ships 임계 별 self_fallback (작은 src false alarm vs 진짜 mask 위기)
+        #   r/s p90  : per-launch req/src.ships (target 비용 분포 — 비싼 target 한계 추적)
+        #   α        : Phase A bias α (target/amount). 0 → off, 학습 진행 시 |α| 증가.
+        #   b{0/K-1} : send_frac bin0(just-cap) / bin top-mult (양 극단 p90)
+        sfb_ge1  = kwargs.get("self_fallback_active_rate_ge1",  "")
+        sfb_ge5  = kwargs.get("self_fallback_active_rate_ge5",  "")
+        sfb_ge10 = kwargs.get("self_fallback_active_rate_ge10", "")
+        sfb_ge20 = kwargs.get("self_fallback_active_rate_ge20", "")
+        ros_mean = kwargs.get("req_over_src_launched_mean", "")
+        ros_p50  = kwargs.get("req_over_src_launched_p50",  "")
+        ros_p90  = kwargs.get("req_over_src_launched_p90",  "")
+        ros_p95  = kwargs.get("req_over_src_launched_p95",  "")
+        a_t      = kwargs.get("target_bias_alpha", "")
+        a_a      = kwargs.get("amount_bin_alpha", "")
+        bin0_p90 = kwargs.get("send_frac_bin0_p90", "")
+        bin_top_p90 = kwargs.get(f"send_frac_bin{_NUM_SHIPS_BINS - 1}_p90", "")
+        if _is_num(sfb_ge1):
+            line9 = (
+                f"phaseA=[sfb≥1={sfb_ge1:.0%}/≥5={sfb_ge5:.0%}/≥10={sfb_ge10:.0%}/≥20={sfb_ge20:.0%}"
+                f" | r/s μ={ros_mean:.2f}/p50={ros_p50:.2f}/p90={ros_p90:.2f}/p95={ros_p95:.2f}"
+                f" | α_t={a_t:+.3f}/α_a={a_a:+.3f}"
+                f" | b0_p90={bin0_p90:.2f}/b{_NUM_SHIPS_BINS - 1}_p90={bin_top_p90:.2f}]"
+            )
+            print(line9)

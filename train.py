@@ -223,10 +223,12 @@ class ActionSpace:
 
     __slots__ = ("planets", "fleets", "pos_cache", "action_mask", "target_mask",
                  "av", "acting_player", "self_fallback_active",
+                 "self_fallback_by_thresh", "active_by_thresh",
                  "pair_features_target", "amount_features_full")
 
     def __init__(self, planets, fleets, pos_cache, action_mask, target_mask, av, acting_player,
                  self_fallback_active=0,
+                 self_fallback_by_thresh=None, active_by_thresh=None,
                  pair_features_target=None, amount_features_full=None):
         self.planets       = planets
         self.fleets        = fleets
@@ -240,6 +242,11 @@ class ActionSpace:
         # launchable=False → action_mask 로 skip 강제, 학습 contamination 없음.
         # 빈도 측정만 — 너무 크면 mask viability 보수화 검토 필요.
         self.self_fallback_active = self_fallback_active
+        # 진단: src.ships threshold 별 self_fallback / active 분해. 작은 src 가
+        # denominator 를 부풀리는 false alarm 인지 진짜 mask 위기인지 구분용.
+        # dict {1: int, 5: int, 10: int, 20: int}.
+        self.self_fallback_by_thresh = self_fallback_by_thresh or {}
+        self.active_by_thresh        = active_by_thresh or {}
         # ── Phase A explicit cost features ───────────────────────────────────
         # pair_features_target: (P, P, TARGET_PAIR_FEAT_DIM) float32
         #   [required/src_ships, required/dst_ships, eta_norm, proj_target/src_ships]
@@ -348,15 +355,28 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
                 amount_feats[i, j, k, 3] = eta_norm
 
     self_fallback_active = 0
+    # 진단: src.ships threshold 별 self_fallback / active 분해.
+    # 작은 src(1~2 ships)가 capacity-short Guard B 로 거의 항상 막혀
+    # denominator 를 부풀리는지(false alarm) vs 큰 src 도 진짜 막히는지 구분.
+    self_fallback_by_thresh = {1: 0, 5: 0, 10: 0, 20: 0}
+    active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
             continue
-        if target_mask[i].any():
+        has_target = bool(target_mask[i].any())
+        if has_target:
             launchable[i] = True
         else:
             # active source (소유 + ships>0) 인데 valid target 0 개 → self-fallback 대상.
             # 빈도 계측용 (학습 영향은 launchable=False 라 skip 강제로 차단됨).
             self_fallback_active += 1
+        # threshold-bucketed 분해 (진단 전용)
+        sh = int(src.ships)
+        for thresh in (1, 5, 10, 20):
+            if sh >= thresh:
+                active_by_thresh[thresh] += 1
+                if not has_target:
+                    self_fallback_by_thresh[thresh] += 1
 
     # All-false row fallback: Categorical NaN 방지용 self 허용
     # (launchable[i]=False → action_mask 가 skip 만 허용 → target lp 게이팅으로 학습 영향 없음)
@@ -372,6 +392,8 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player):
 
     return ActionSpace(planets, fleets, pos_cache, action_mask, target_mask, av, acting_player,
                        self_fallback_active=self_fallback_active,
+                       self_fallback_by_thresh=self_fallback_by_thresh,
+                       active_by_thresh=active_by_thresh,
                        pair_features_target=pair_feats,
                        amount_features_full=amount_feats)
 
@@ -385,7 +407,8 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
     acting_player: 절대 owner ID (0 or 1). 행성 소유 판정에 사용.
     return_counts: True면 (moves, counts, launches) 튜플 반환 (hit rate tracking용).
         launches: moves와 1:1 대응하는 메타 dict 리스트 (source_id, target_id,
-        ships, angle, start_x, start_y). fleet_id 매핑/resolve_step 입력으로 사용.
+        ships, angle, start_x, start_y, +진단 전용 src_ships_at_launch / required /
+        ships_bin). fleet_id 매핑/resolve_step 입력 + req_over_src/send_frac×bin 진단.
     analysis: ActionSpace. 있으면 planets/pos_cache 재사용 (mask 단계와 공유).
     """
     if analysis is not None:
@@ -541,6 +564,13 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             "angle": angle,
             "start_x": start_x,
             "start_y": start_y,
+            # 진단 전용 metadata (CSV logging 용, env 동작 무관):
+            #   src_ships_at_launch — launch 시점 source 잔존 ships (req_over_src 분모)
+            #   required             — launch 시점 required (req_over_src 분자)
+            #   ships_bin            — 0..K-1 (send_frac × bin 매트릭스 분류)
+            "src_ships_at_launch": int(p.ships),
+            "required": int(required),
+            "ships_bin": int(ships_bin),
         })
 
     # over-send 정산: target 별 합산 ships 가 required 초과한 만큼 누적.
@@ -619,6 +649,15 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     # 학습 영향 없음 (skip 강제) 이지만 mask viability 가 너무 보수/공격적인지 진단.
     sum_self_fallback_active = 0
     sum_active_sources       = 0
+    # 진단: src.ships threshold 별 분해 (작은 src 가 false alarm 만드는지 확인용)
+    sum_self_fallback_by_thresh = {1: 0, 5: 0, 10: 0, 20: 0}
+    sum_active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
+    # 진단: per-launch req/src.ships 분포 (target 비용 측면). p50/p75/p90/p95 산출용.
+    # source 깊은 깊이로 비싼 target 을 잡으면 reserve 가 줄어 다음 턴 방어 곤란 → all-in_rate 와 양의 상관.
+    req_over_src_list = []
+    # 진단: send_frac × ships_bin 매트릭스. 각 bin 의 send_frac 분포 (multiplier 모드 동작 확인).
+    # bin0 (1.00×) → send_frac ≈ required/src ; bin3 (1.20×) → send_frac ≈ ceil(req·1.20)/src
+    send_frac_by_bin = {k: [] for k in range(NUM_SHIPS_BINS)}
     # win_rate 계측: episode 종료 시 main(player=0) reward로 win/draw/loss 집계.
     # draw는 0.5 가중치 (eval과 동일 규약).
     sum_wins = 0.0
@@ -725,6 +764,17 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             sum_self_fallback_active += analysis.self_fallback_active
             sum_active_sources       += int(analysis.action_mask[:, 1:].any(dim=-1).sum().item()) \
                                         + analysis.self_fallback_active
+            # 진단: threshold-bucketed self_fallback / active. analysis 가 dict 로 보관.
+            for thresh in (1, 5, 10, 20):
+                sum_self_fallback_by_thresh[thresh] += analysis.self_fallback_by_thresh.get(thresh, 0)
+                sum_active_by_thresh[thresh]        += analysis.active_by_thresh.get(thresh, 0)
+            # 진단: per-launch req/src.ships 와 send_frac × bin. launches_main 에서 추출.
+            for lc in launches_main:
+                src_sh = max(int(lc["src_ships_at_launch"]), 1)
+                req_over_src_list.append(int(lc["required"]) / src_sh)
+                bk = int(lc["ships_bin"])
+                if 0 <= bk < NUM_SHIPS_BINS:
+                    send_frac_by_bin[bk].append(int(lc["ships"]) / src_sh)
 
             obs_list.append(obs_t)
             act_list.append(action_t.squeeze(0).cpu())
@@ -795,6 +845,12 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "sum_wins":     sum_wins,
         "sum_self_fallback_active": sum_self_fallback_active,
         "sum_active_sources":       sum_active_sources,
+        # 진단: threshold-bucketed (1/5/10/20) self_fallback / active 합산.
+        "sum_self_fallback_by_thresh": dict(sum_self_fallback_by_thresh),
+        "sum_active_by_thresh":        dict(sum_active_by_thresh),
+        # 진단: per-launch raw values (worker 합산 후 분포 산출용).
+        "req_over_src_list": req_over_src_list,
+        "send_frac_by_bin":  {k: list(v) for k, v in send_frac_by_bin.items()},
     }
     return (
         torch.stack(obs_list),
@@ -865,6 +921,10 @@ def _finalize_reward_stats(raw_list):
     total_wins = 0.0
     total_self_fallback_active = 0
     total_active_sources       = 0
+    total_self_fallback_by_thresh = {1: 0, 5: 0, 10: 0, 20: 0}
+    total_active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
+    total_req_over_src_list = []
+    total_send_frac_by_bin  = {k: [] for k in range(NUM_SHIPS_BINS)}
     for r in raw_list:
         for k, v in r["counters"].items():
             total_counters[k] += v
@@ -879,6 +939,17 @@ def _finalize_reward_stats(raw_list):
         total_wins     += r.get("sum_wins", 0.0)
         total_self_fallback_active += r.get("sum_self_fallback_active", 0)
         total_active_sources       += r.get("sum_active_sources", 0)
+        # 진단: threshold-bucketed
+        sf_bt = r.get("sum_self_fallback_by_thresh", {})
+        ac_bt = r.get("sum_active_by_thresh",        {})
+        for thresh in (1, 5, 10, 20):
+            total_self_fallback_by_thresh[thresh] += sf_bt.get(thresh, 0)
+            total_active_by_thresh[thresh]        += ac_bt.get(thresh, 0)
+        # 진단: per-launch lists 합산
+        total_req_over_src_list.extend(r.get("req_over_src_list", []))
+        sfb = r.get("send_frac_by_bin", {})
+        for k in range(NUM_SHIPS_BINS):
+            total_send_frac_by_bin[k].extend(sfb.get(k, []))
 
     stats = HitRateTracker.summary_from_counters(
         total_counters, total_n_steps, total_episodes,
@@ -901,6 +972,44 @@ def _finalize_reward_stats(raw_list):
     stats["self_fallback_active_rate"] = (
         total_self_fallback_active / max(total_active_sources, 1)
     )
+    # 진단 A: src.ships threshold 별 self_fallback_active_rate 분해.
+    # 가설: 전체 86% 가 작은 src(1~2 ships) 의 false alarm 인지 vs 큰 src 도 진짜 막히는지 구분.
+    # 만약 ge20 에서 5~10% 이하면 → 작은 src 영향 (false alarm). 반대로 ge20 이 여전히 30%+ →
+    # mask 가 진짜 보수적 → ships_rep / Guard A,B 재검토.
+    for thresh in (1, 5, 10, 20):
+        stats[f"self_fallback_active_rate_ge{thresh}"] = (
+            total_self_fallback_by_thresh[thresh] / max(total_active_by_thresh[thresh], 1)
+        )
+    # 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
+    # 가설: send_required_ratio≈1.17 / send_fraction≈0.80 → req/src ≈ 0.68. 너무 비싼 target →
+    # 발사 후 reserve 부족 → 다음 턴 방어 곤란. p90/p95 가 높으면 target 선택이 한계 비용에 몰림.
+    if total_req_over_src_list:
+        arr = np.asarray(total_req_over_src_list, dtype=np.float64)
+        stats["req_over_src_launched_mean"] = float(arr.mean())
+        for q, name in [(50, "p50"), (75, "p75"), (90, "p90"), (95, "p95")]:
+            stats[f"req_over_src_launched_{name}"] = float(np.percentile(arr, q))
+    else:
+        stats["req_over_src_launched_mean"] = 0.0
+        for name in ("p50", "p75", "p90", "p95"):
+            stats[f"req_over_src_launched_{name}"] = 0.0
+    # 진단 D: send_frac × ships_bin 분포 (multiplier 모드 동작 확인).
+    # bin0 (1.00×) → send_frac ≈ required/src ; bin3 (1.20×) → send_frac ≈ ceil(req·1.20)/src.
+    # bin0 p90 가 0.5+ 면 작은 src 가 just-capture 도 비싼 상태. bin3 p90 가 1.0 근접 →
+    # over-send 가 over_send_penalty 로 충분히 억제됐는지 사후 확인.
+    for k in range(NUM_SHIPS_BINS):
+        bin_list = total_send_frac_by_bin[k]
+        if bin_list:
+            barr = np.asarray(bin_list, dtype=np.float64)
+            stats[f"send_frac_bin{k}_mean"] = float(barr.mean())
+            stats[f"send_frac_bin{k}_count"] = int(len(bin_list))
+            # bin0/bin3 만 p90 추적 (양 극단). 중간은 mean 만.
+            if k == 0 or k == NUM_SHIPS_BINS - 1:
+                stats[f"send_frac_bin{k}_p90"] = float(np.percentile(barr, 90))
+        else:
+            stats[f"send_frac_bin{k}_mean"]  = 0.0
+            stats[f"send_frac_bin{k}_count"] = 0
+            if k == 0 or k == NUM_SHIPS_BINS - 1:
+                stats[f"send_frac_bin{k}_p90"] = 0.0
     # rollout 내 main(player=0) 승률. on-policy sampling이라 eval보다 noisy지만,
     # match_type별 log로 분포별 성능을 바로 볼 수 있는 이점.
     stats["win_rate"]      = total_wins / max(total_episodes, 1)
@@ -1462,6 +1571,13 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                        old_logp_heads=logp_heads_e, action_masks=amasks_e, target_masks=tmasks_e,
                        pair_features=pair_feats_e, amount_features=amount_feats_e)
 
+            # 진단 C: Phase A additive bias channel 의 학습 강도 (scalar α).
+            # 초기값 0 (residual=off) → 학습 진행에 따라 |α| 증가 = bias 가 정책에 영향 시작.
+            # 너무 크면 (e.g. >2) bias 가 main logit 을 압도 → 단순 cost greedy. 작으면 (≈0)
+            # bias 채널이 무시됨 → MLP feature 만으로 충분 / 또는 학습 자체가 안 됨.
+            target_bias_alpha = float(main_model.target_bias_alpha.detach().cpu().item())
+            amount_bin_alpha  = float(main_model.amount_bin_alpha.detach().cpu().item())
+
             logger.log(
                 generation=generation, total_steps=total_steps, match_type=match_type,
                 policy_loss=p_loss, value_loss=v_loss, entropy_loss=e_loss,
@@ -1482,6 +1598,27 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 # skip 으로 빠진 비율. 높으면 mask 가 너무 조이거나 dst 제약(파라볼라/부족)
                 # 으로 행동공간이 막힌 상태. target_q/k pair-aware 도입 효과 확인용.
                 self_fallback_active_rate=rew_stats.get("self_fallback_active_rate", 0.0),
+                # 진단 A: src.ships threshold 별 self_fallback rate (작은 src false alarm 식별).
+                self_fallback_active_rate_ge1=rew_stats.get("self_fallback_active_rate_ge1", 0.0),
+                self_fallback_active_rate_ge5=rew_stats.get("self_fallback_active_rate_ge5", 0.0),
+                self_fallback_active_rate_ge10=rew_stats.get("self_fallback_active_rate_ge10", 0.0),
+                self_fallback_active_rate_ge20=rew_stats.get("self_fallback_active_rate_ge20", 0.0),
+                # 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
+                req_over_src_launched_mean=rew_stats.get("req_over_src_launched_mean", 0.0),
+                req_over_src_launched_p50=rew_stats.get("req_over_src_launched_p50", 0.0),
+                req_over_src_launched_p75=rew_stats.get("req_over_src_launched_p75", 0.0),
+                req_over_src_launched_p90=rew_stats.get("req_over_src_launched_p90", 0.0),
+                req_over_src_launched_p95=rew_stats.get("req_over_src_launched_p95", 0.0),
+                # 진단 C: Phase A additive bias channel scalar α (model parameter, learned).
+                target_bias_alpha=target_bias_alpha,
+                amount_bin_alpha=amount_bin_alpha,
+                # 진단 D: send_frac × ships_bin 매트릭스 (bin 별 mean + 양 극단 p90).
+                **{f"send_frac_bin{k}_mean": rew_stats.get(f"send_frac_bin{k}_mean", 0.0)
+                   for k in range(NUM_SHIPS_BINS)},
+                # bin0 (just-capture) / bin{K-1} (top multiplier) p90 만 추적 — 양 극단 over/under 지표.
+                # NUM_SHIPS_BINS==1 edge: 동일 bin → set 으로 중복 제거.
+                **{f"send_frac_bin{k}_p90": rew_stats.get(f"send_frac_bin{k}_p90", 0.0)
+                   for k in {0, NUM_SHIPS_BINS - 1}},
                 mean_filtered_invalid_target=rew_stats["mean_filtered_invalid_target"],
                 mean_filtered_zero_ships=rew_stats["mean_filtered_zero_ships"],
                 mean_filtered_sun=rew_stats["mean_filtered_sun"],
