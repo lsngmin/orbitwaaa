@@ -50,7 +50,8 @@ jobs:
           # CI 의존성 최소 set — verify + forward smoke 만 돌리면 충분
           pip install \
             "torch==2.3.1+cpu" --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy pyyaml kaggle
+          # gym: env_wrapper.py 가 OrbitWarsEnv(gym.Env) 정의 위해 필요 (forward smoke 시 import).
+          pip install numpy pyyaml kaggle "gym==0.26.2"
 
       - name: Resolve checkpoint from submission.yaml
         id: resolve
