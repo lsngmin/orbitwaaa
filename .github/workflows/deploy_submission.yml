@@ -41,7 +41,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          # cache: pip 는 requirements.txt/pyproject.toml 필요 — 둘 다 없으니 생략.
+          # CI 의존성은 4-5개 정도라 매번 fresh install 해도 시간 무시 가능.
 
       - name: Install deps
         run: |
