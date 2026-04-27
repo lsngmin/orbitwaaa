@@ -1867,13 +1867,37 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 self_fallback_active_rate_ge5=rew_stats.get("self_fallback_active_rate_ge5", 0.0),
                 self_fallback_active_rate_ge10=rew_stats.get("self_fallback_active_rate_ge10", 0.0),
                 self_fallback_active_rate_ge20=rew_stats.get("self_fallback_active_rate_ge20", 0.0),
+                # 진단 A': mask first-failure 분해 (4 게이트 × 4 src.ships threshold = 16 cols).
+                # finalize 가 stats 에 채워준 키를 logger 로 forward — 안 빼먹어야 CSV 채워짐.
+                **{f"mask_block_{g}_ge{t}": rew_stats.get(f"mask_block_{g}_ge{t}", 0.0)
+                   for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+                   for t in (1, 5, 10, 20)},
                 # 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
                 req_over_src_launched_mean=rew_stats.get("req_over_src_launched_mean", 0.0),
                 req_over_src_launched_p50=rew_stats.get("req_over_src_launched_p50", 0.0),
                 req_over_src_launched_p75=rew_stats.get("req_over_src_launched_p75", 0.0),
                 req_over_src_launched_p90=rew_stats.get("req_over_src_launched_p90", 0.0),
                 req_over_src_launched_p95=rew_stats.get("req_over_src_launched_p95", 0.0),
-                # 진단 C: Phase A additive bias channel scalar α (model parameter, learned).
+                # 진단 B': production-axis (req/prod, req/(prod×ETA)).
+                # req_over_src 가 p90=1.0 saturated 일 때 "회복 가능 vs 자살" 가르는 신호.
+                req_over_prod_launched_mean=rew_stats.get("req_over_prod_launched_mean", 0.0),
+                req_over_prod_launched_p50=rew_stats.get("req_over_prod_launched_p50", 0.0),
+                req_over_prod_launched_p75=rew_stats.get("req_over_prod_launched_p75", 0.0),
+                req_over_prod_launched_p90=rew_stats.get("req_over_prod_launched_p90", 0.0),
+                req_over_prod_launched_p95=rew_stats.get("req_over_prod_launched_p95", 0.0),
+                req_over_prod_eta_launched_mean=rew_stats.get("req_over_prod_eta_launched_mean", 0.0),
+                req_over_prod_eta_launched_p50=rew_stats.get("req_over_prod_eta_launched_p50", 0.0),
+                req_over_prod_eta_launched_p75=rew_stats.get("req_over_prod_eta_launched_p75", 0.0),
+                req_over_prod_eta_launched_p90=rew_stats.get("req_over_prod_eta_launched_p90", 0.0),
+                req_over_prod_eta_launched_p95=rew_stats.get("req_over_prod_eta_launched_p95", 0.0),
+                # 진단 C: per-launch eta_advantage_norm 분포 (race signal).
+                # 양수 = 적보다 빨리 도달 (race 우위), 음수 = 늦음 (보내봤자 경합 손실).
+                eta_advantage_launched_mean=rew_stats.get("eta_advantage_launched_mean", 0.0),
+                eta_advantage_launched_p50=rew_stats.get("eta_advantage_launched_p50", 0.0),
+                eta_advantage_launched_p75=rew_stats.get("eta_advantage_launched_p75", 0.0),
+                eta_advantage_launched_p90=rew_stats.get("eta_advantage_launched_p90", 0.0),
+                eta_advantage_launched_p95=rew_stats.get("eta_advantage_launched_p95", 0.0),
+                # 진단 D: Phase A additive bias channel scalar α (model parameter, learned).
                 target_bias_alpha=target_bias_alpha,
                 amount_bin_alpha=amount_bin_alpha,
                 # 진단 D: send_frac × ships_bin 매트릭스 (bin 별 mean + 양 극단 p90).
