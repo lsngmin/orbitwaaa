@@ -121,6 +121,35 @@ def test_fleet_dst_and_eta_no_hit():
     assert eta == math.inf
 
 
+def test_fleet_dst_and_eta_av_affects_orbiting_target():
+    """Tier C: av 파라미터가 공전 target 예측에 반영됨.
+
+    같은 fleet/target 이라도 av=0 (정적 가정) 와 av != 0 (실제 공전) 의 예측
+    결과가 달라야 함. target 은 orbital_radius=30, radius 5 → is_orbiting.
+    """
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=10, production=0)
+    f = _fleet(0, owner=0, x=10.0, y=20.0, angle=0.0, ships=20)
+
+    # av=0: target 은 현재 위치 고정 → fleet 이 정확히 hit.
+    dst_static, eta_static = fleet_dst_and_eta(f, [target], av=0.0)
+    assert dst_static == 0, "av=0 정적 view: target hit 예상"
+
+    # av=0.5: target 이 매우 빠르게 회전 → 정적 가정과 다른 결과.
+    dst_orbit, eta_orbit = fleet_dst_and_eta(f, [target], av=0.5)
+    assert (dst_orbit, eta_orbit) != (dst_static, eta_static), \
+        "av 적용 시 결과가 정적 가정과 달라야 함 (Tier C: orbit 진행 반영)"
+
+
+def test_fleet_dst_and_eta_sun_cross_excludes_target():
+    """A1: 경로가 sun 가로지르면 target 도달 못 함 (engine: fleet 소멸)."""
+    # target 이 sun 너머. fleet 동쪽 발사 → 경로가 sun(50,50) 통과 → 소멸.
+    target = _planet(0, owner=1, x=80.0, y=50.0, ships=10, production=0)
+    f = _fleet(0, owner=0, x=20.0, y=50.0, angle=0.0, ships=20)
+    dst_pid, eta = fleet_dst_and_eta(f, [target], av=0.0)
+    assert dst_pid == -1, "sun 통과 경로 → fleet 소멸, target 도달 못 함"
+    assert eta == math.inf
+
+
 # ── Guard A: analyze_action_space 동작 회귀 ──────────────────────────────
 
 
