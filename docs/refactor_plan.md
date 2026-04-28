@@ -246,8 +246,9 @@ opponent attention pool:
 ## 6. Action space 설계
 
 ### 6.1 현재 가정
-- one launch per turn (sequential decoder).
-- (src, tgt, amount) tuple.
+- **source 별 독립 launch decision** (sequential decoder, source 마다 자신의 (target, amount) 를 독립 sampling).
+- 여러 source 가 우연히 같은 target 을 고를 수는 있으나, 같은 target 에 대한 **synchronized multi-source set 을 하나의 joint action** 으로 평가하지는 못한다 (이 가정 깨는 게 6.2.1 의 목표).
+- (src, tgt, amount) tuple per source.
 - target type: enemy / neutral / own (support).
 
 ### 6.2 확장
@@ -273,7 +274,14 @@ opponent attention pool:
    현재 amount 가 카테고리라면, 연속 fraction (0,1) head 를 둠. denial / spoiler 의 minimum-ship send 정밀도 향상.
 
 ### 6.3 mask 정책
-mask 는 hard invalid (sun/path/owner physical impossibility) 만. 의사결정 가능한 모든 행동은 reward/feature 로 처리. **own planet support 는 항상 열려있어야** (정책 4, 5의 토대).
+**장기 원칙**: mask 는 hard invalid (sun/path/owner physical impossibility) 만. 의사결정 가능한 모든 행동은 reward/feature 로 처리.
+
+**Support mask 의 철학** (현 구현·plan 모두 정확히 다음 의미):
+- *action 자체* (target_type=support) 는 항상 존재. policy head 에서 support 결정 자체는 막히지 않음.
+- *target 선택* 은 필요성 기반 guard 가 붙는다 (현 구현: enemy_incoming > 0 OR required > 0, 35% cap). 이건 hard invalid 가 아니라 **action-space guard** — "본진 비우기·support 난사·source depletion" 방지.
+- 즉 "own planet support 는 항상 열림" 이라는 표현은 정확하지 않다. 정확한 표현: **support action 은 모드로서 항상 존재하지만, target 은 방어 필요성 신호가 있을 때만 열린다.**
+
+장기적으로 reward (own_planet_loss_penalty, support_defense_bonus) 가 충분히 학습되면 guard 강도를 낮추는 게 정공법. 단 가드 0 으로 가지 않고 (support 난사 risk), reward 신호가 axis metric 으로 검증된 후 단계적 완화.
 
 ---
 
@@ -313,51 +321,52 @@ advantage normalization 은 **mode 별 별도 running stats** (2p / 4p episode �
 
 ### 7.3 Reward component 카탈로그
 
-기존(■) + 신규(●) + 메트릭전용(○).
+상태 분류:
+- **[현]** 현재 `reward/components.py` 의 COMPONENTS 튜플에 실재.
+- **[단]** 단기 후보 (Phase 2 예정, plan 8 component 직후 다음 wave).
+- **[장]** 장기 후보 (Phase 4·5 이후).
+- **[메트릭]** reward 화 금지 또는 매우 약하게만, logger 컬럼만.
+- **[aux]** RL reward 아닌 supervised loss.
 
 ```text
-경제·점령
-  ■ early_close_neutral_capture_bonus      정책 1
-  ■ capture_hold_bonus                     정책 5
-  ■ post_capture_reloss_penalty            정책 5
+[현] 현재 stateless reward (8개 — gain/loss 분리 후 기준)
+  dense_reward                           정책 8 (production share advantage)
+  neutral_capture_bonus                  정책 1 (gain)
+  own_planet_loss_penalty                정책 4 (loss)
+  all_in_penalty (weak)                  정책 3
+  over_send_penalty (weak)               정책 3 / 6
+  under_invested_penalty (weak)          정책 3
+  launch_cost_penalty (weak)             정책 3
+  terminal_reward                        승리
 
-방어·지원
-  ■ support_defense_bonus                  정책 4
-  ● reinforce_young_planet_bonus           B4 vacuum 대응
-  ● own_planet_loss_penalty                정책 4
+[단] 단기 후보 (Phase 2 — 현재 병목과 직결)
+  early_close_neutral_capture_bonus      정책 1 (현 neutral_capture 의 거리·early 가중판)
+  post_capture_reloss_penalty            정책 5 (현 own_loss 의 "갓 잡은 행성" 가중판)
+  capture_hold_bonus                     정책 5
+  support_defense_bonus                  정책 4 (support 가 실제 enemy fleet 막은 결과)
+  reinforce_young_planet_bonus           정책 4 / B4 vacuum 대응
 
-비용
-  ■ launch_cost_penalty (weak)             정책 3
-  ■ all_in_penalty (weak)                  정책 3
-  ○ source_opportunity_cost                메트릭만
+[장] 장기 후보 (Phase 4·5 이후)
+  race_won_capture_bonus                 정책 10
+  weak race_lost_attempt_penalty         정책 10 (균형)
+  denial_bonus                           정책 11
+  synchronized_arrival_capture_bonus     정책 6 / B2 alpha
+  coordinated_capture_bonus              정책 6 (multi-src 활성 후)
+  rank_progress_bonus                    정책 16 (4p 활성 후)
+  rank_decay_penalty                     정책 16
 
-공격·조정
-  ● race_won_capture_bonus                 정책 10
-  ● weak race_lost_attempt_penalty         정책 10 (균형)
-  ● synchronized_arrival_capture_bonus     정책 6, B2 alpha
-  ● weak over_send_penalty                 정책 6
-  ● coordinated_capture_bonus              정책 6 (multi-src)
+[메트릭] reward 아님 (logger 만)
+  source_opportunity_cost                정책 3 보조
+  pressure_index                         정책 9
+  enemy_idle_ratio                       정책 9
+  filtered_path_rate                     정책 7 (※ reward 화 신중)
+  sun_crash_rate                         정책 7 (※ reward 화 신중)
 
-거부
-  ● denial_bonus                           정책 11
-
-위협 회피
-  ● weak filtered_path_penalty             정책 7
-  ● weak sun_crash_penalty                 정책 7
-
-장기·승리
-  ■ production_share_advantage (dense)     정책 8
-  ■ terminal_win                           승리
-
-4인전 전용
-  ● rank_progress_bonus                    정책 16
-  ● rank_decay_penalty                     정책 16
-  ○ pressure_index                         메트릭만 (정책 9)
-  ○ enemy_idle_ratio                       메트릭만 (정책 9)
-
-aux loss (reward 아님)
-  ● opponent_pred_ce (정책 12)             encoder 표현 강화
+[aux] RL reward 아닌 supervised loss
+  opponent_pred_ce                       정책 12 (encoder 표현 강화, weight 0.1~0.3)
 ```
+
+**weak filtered_path / weak race_lost_attempt 의 위치**: CLAUDE.md "reward 는 행동 가능성을 판단하지 않는다" 와 충돌 risk 가 있어 위 카탈로그에서 *기본은 메트릭*. 메트릭이 baseline 대비 유의 악화할 때만 reward 화 검토 (도입 단계는 15.2.7 참조).
 
 가중치 원칙:
 - terminal 을 **신호의 backbone** 으로. dense 는 항상 terminal 보다 작게.
@@ -569,54 +578,191 @@ mirror 만 돌리면 자기 정책 corner 에 갇힘.
 
 이 장만 우선순위·구현순서. 다른 장은 청사진.
 
-### Phase 1 — 표현·관측 기반
-```
-- arrival_schedule 내장 (5.3)
-- multi-relation graph attention (5.2)
-- per-opponent feature (5.6, 4인전 zero-pad 으로 2인전도 같은 입력)
-- player_count embedding (5.5)
-- opponent_pred aux head (8.3)
-```
-이 단계는 reward 거의 안 건드림. encoder 의 표현력을 끌어올려 모든 후속 reward 의 효율성을 높임.
+각 phase 의 **게임 성능** 항목은 그 단계가 완료됐을 때 모델이 *게임 안에서 어떻게 보이는지* 를 게임 플레이 용어로 적은 것이다. metric 이 아니라 행동 묘사 — 관전자가 봤을 때 "아 이런 식으로 두는구나" 라고 느낄 변화.
 
-### Phase 2 — Reward 확장 (action space 동일)
+### Phase -1 — 현재 변경 안정화 (5~10 generation 검증)
+
+15.2.x 의 보완을 시작하기 전에, 직전 리팩토링 (5게이트 mask + support-mode + reward gain/loss 분리) 이 정말 정착했는지 확인. 새 설계로 넘어가기 전에 *지금 고친 게 깨지지 않았는지* 가 우선.
+
 ```
-- denial_bonus (정책 11)
-- race_won_capture_bonus + weak race_lost_attempt_penalty (정책 10)
-- post_capture_reloss_penalty + capture_hold_bonus 강화 (정책 5)
-- support_defense_bonus + reinforce_young_planet_bonus (정책 4, B4)
-- early_close_neutral_capture_bonus 미세 조정 (정책 1)
+- 5게이트 hard mask + support-mode 가드 검증
+  · mean_filtered_invalid_target ≈ 0 유지
+  · support_launches_per_step > 0 (방어 행동 자체는 일어남)
+- gain/loss 분리 reward parity 유지
+  · 분리 전후 win_rate ±1σ 이내
+- 회복 지표
+  · early_neutral_captured_per_episode ≥ 1.0
+  · capture_hold_k_rate 추세 ↑
+  · post_capture_reloss_rate_k 추세 ↓
+- 5~10 gen 후 위 5개가 모두 안정이면 Phase 0 진입
 ```
+
+**게임 성능 (예상)**: "본진 안 비우는 안정형 그리디". 가까운 중립을 빠르게 확보하고, 본진에 적이 들어올 때만 짧게 support 하며, 갓 잡은 행성을 즉시 잃는 빈도가 줄어든 *기본기 봇*. 동시 도착·연합 공격·king-maker 같은 상위 정책은 아직 없음.
+
+### Phase 0 — 인프라 / 측정 / 환경 audit (코드 기반 다지기)
+
+대형 변경을 시작하기 전에 *측정 가능성과 환경 가정* 을 확정. 이 phase 동안 모델은 변하지 않는다 (게임 성능 변화 없음). 그러나 이걸 안 깔면 Phase 1~5 의 회귀 검출이 불가능.
+
+```
+- env adapter audit (15.2.3)
+  · obs 에서 fleet (src, tgt, launch_turn, eta, owner) 노출 여부 grep
+  · 누락 필드는 obs delta 추론 가능성 검증 + plan 명시
+- logger 16정책 컬럼 등록 (15.2.6, 단 NaN / available_flag 방식)
+- fixed-seed eval harness 구축
+  · seed 32~64 고정, opponent set = 현 baseline snapshot + greedy_radius rule-bot 1
+  · 매 N=1k step 자동 실행 + axis metric diff 알람
+- rule-bot greedy_radius 1개 우선 구현 (Phase 3 의 일부 선행)
+- (병렬 0-track) 4p env wrapper 가능성 조사 — 자체 sim or Kaggle 4p 룰
+```
+
+**게임 성능**: 변화 없음. **회귀 검출 능력** 만 생긴다. (이 phase 의 산출물은 이후 모든 phase 의 안전벨트.)
+
+### Phase 1 — 표현·관측 기반 (4 sub-phase 로 분할)
+
+원래 plan 이 한 phase 로 묶었던 5개 변경을 4개 sub-phase 로 쪼갠다 (15.2.1). 각 sub-phase 끝마다 fixed-seed eval 회귀 검사 (≥ baseline - σ).
+
+#### Phase 1a — arrival_schedule 내장 + future rollout (5.3, 5.4)
+
+결정론적 시뮬, 모델 구조 변경 없음. feature 만 추가. 가장 안전한 선행 변경.
+
+```
+- 각 planet 에 다음 K=8 turn 의 (incoming_arrivals, expected_owner_t, expected_threat_t) feature concat
+- gradient 안 흘리는 deterministic rollout 만, imagined branch 는 Phase 6
+```
+
+**게임 성능**: "이미 잡힐 행성에 추가 ship 안 보내는 절약형". turn t 에 도착 예정 fleet 으로 capture 가 확정된 target 에는 더 보내지 않음. over_send 자연 감소. 단순 알뜰함.
+
+#### Phase 1b — player_count embedding + per-opponent feature pad (5.5, 5.6)
+
+2p 환경에서도 입력 layout 을 4p 와 통일. opponent slot 은 0-pad. 모델 변경은 input dim 확장만.
+
+```
+- player_count_onehot {2,4} 입력 (현재는 [1,0] 고정)
+- per_opponent_features (3, F_o) — 2p 면 opp1 만 채우고 나머지 2개는 0
+- encoder 통과는 동일, 마지막 head 만 단일 분기 유지
+```
+
+**게임 성능**: 2p 한정 변화 거의 없음. **4p 환경이 0-track 에서 준비되면 즉시 합류 가능한 입력 형태** 가 갖춰진다는 게 핵심 (인프라 변경).
+
+#### Phase 1c — multi-relation graph attention (5.2)
+
+가장 큰 모델 구조 변경. 단독 sub-phase 로. 13장에 13.8 (encoder swap curriculum) 추가 후 진입 (15.2.8).
+
+```
+- 5종 relation: planet←fleet (arrival), fleet↔fleet (same-tgt), fleet↔fleet (same-src), planet↔planet (k-NN spatial), planet↔planet (same-owner)
+- multi-head, multi-relation attention layer
+- encoder swap curriculum: old encoder freeze + new linear-probe → 점진적 unfreeze
+- win_rate 가 baseline - 2σ 이상 떨어지면 즉시 rollback
+```
+
+**게임 성능**: 이 단계부터 실제 *플레이 스타일* 이 바뀐다.
+- **지역 거점 형성**: k-NN spatial relation 이 자기 행성 클러스터를 인지. 멀리 떨어진 행성을 무리하게 안 먹고 *연결된 영토* 를 만든다 (정책 2 — 지역 네트워크).
+- **race / 동시 launch 인지**: same-target relation 이 적이 같은 target 에 ship 보내는 걸 본다. 도착 시점 비교가 표현에 들어감 (정책 10 의 토대).
+- **본진 방어 회로**: same-owner + planet←fleet 결합으로 "내 행성에 들어오는 fleet 합" 이 한 번에 보임. 분산된 위협을 *통합된 위협 지도* 로.
+- 관전자 인상: "더 이상 무계획 그리디가 아니라, 자기 영토를 인지하고 행동하는 봇".
+
+#### Phase 1d — opponent_pred aux head (8.3)
+
+1c 가 끝나야 의미. shared encoder 에 적의 다음 launch target 예측 supervised head 부착.
+
+```
+- 라벨링: self-play replay 는 직접 access, 외부 봇은 fleet delta 추론 (15.2.4)
+- 라벨 신뢰도 < 0.7 step 은 mask out
+- weight 0.1 ~ 0.3
+```
+
+**게임 성능**: "적의 다음 수를 미리 보는 카운터 플레이의 토대". reward 변화 없이도, encoder 표현이 *어디가 위협인가* 를 더 잘 인코딩 → 같은 reward 로도 위협 행성에 사전 cap 차단·source 비우기 패턴이 미세하게 빨라짐. 아직 *명시적* counter 행동은 안 나옴 (그건 Phase 2 의 denial/race reward 가 켜져야).
+
+### Phase 2 — Reward 확장 (action space 동일, 순서 재배치)
+
+현재 병목 (초반 확장 / hold / reloss / support) 이 직접 신호이고, denial/race 는 그 다음. 따라서 plan 원안의 순서를 **단기 catalog → 장기 catalog** 로 바꾼다 (사용자 지적 반영).
+
+```
+2.1 단기 [단] catalog (Phase 1 의 표현이 차이를 만든다는 가정 위에)
+  - early_close_neutral_capture_bonus 미세 조정 (정책 1)
+  - post_capture_reloss_penalty (정책 5, 현 own_loss 의 가중판)
+  - capture_hold_bonus (정책 5)
+  - support_defense_bonus (정책 4, support 가 실제로 막은 결과만)
+  - reinforce_young_planet_bonus (정책 4 / B4)
+
+2.2 장기 [장] catalog (단기 axis metric 안정 후)
+  - denial_bonus (정책 11)
+  - race_won_capture_bonus + weak race_lost_attempt_penalty (정책 10)
+```
+
+각 component 도입 게이트 (15.2.5): cross-corr < 0.5, 부재 시 axis metric 정체 ablation 증거, log-grid weight sweep, mode 별 별도. 통과 못 하면 메트릭만.
+
+**게임 성능 (2.1 후)**: "초반 확장 정확도 ↑ + 점령 행성 hold ↑ + 본진 방어 결과 인지". 갓 잡은 행성을 다시 뺏기는 빈도 추가 감소, support 가 *적 fleet 을 실제로 막을 때만* 강화 → support 난사 줄어들고 정확한 방어. 게임 흐름 안정도 상승.
+**게임 성능 (2.2 후)**: "거부 (denial) 와 race 의 등장". 적이 곧 잡을 중립을 *내가 못 먹어도 minimum-ship 으로 막아둠*. 같은 target 에 적보다 빠르면 race 시도, 늦으면 포기 (race_lost weak penalty). 관전자 인상: "이제 적의 흐름을 끊는다". 단, 4p 정책 (king-maker, ranking) 은 아직 없음.
 
 ### Phase 3 — League 다양성
+
+Phase 2 의 reward 가 *한 가지 적 분포에서만* 효과가 있는 corner 가 아닌지 깨는 단계.
+
 ```
-- rule-bot 4종 구현 + pool 편성 (9.1)
-- sibling reward seed 1~2개 학습 + pool 합류
-- 평가 매트릭스 운영 시작 (11.4)
+- rule-bot 4종 (greedy_radius, turtle_threshold, rush_target_nearest, sync_attacker)
+- 의무 편성: 70% snapshot / 20% rule-bot / 10% sibling
+- sibling reward seed: 별도 full run 1개 (main 안정화 후, 15.2.10) — 그 외엔 multi-head reward 또는 curriculum-weight snapshot 으로 의사-sibling
+- 평가 매트릭스 (11.4) 운영 시작
 ```
 
-### Phase 4 — 4인전 학습
+**게임 성능**: "다양한 archetype 대응". turtle 상대로는 경제 우위 → 점진 확장으로 압박, rush 상대로는 본진 방어 + 빈 source 카운터, sync_attacker 상대로는 race intercept. 한 가지 메타에 갇히지 않고 *상대 보고 두는 봇*.
+
+### Phase 4 — 4인전 학습 (0-track 의 4p env 가 준비된 후)
+
 ```
-- 4인 head + per_opponent_attention 활성 (8.4)
-- ranking-based terminal reward 도입 (7.2)
-- rank_progress reward (정책 16)
-- role-asymmetric 4인 매치 (9.2)
-- curriculum 1st-only → ordinal (7.2)
+- 4인 head + per_opponent_attention 활성 (8.4, 1b 의 0-pad slot 활성화)
+- ranking-based terminal reward (7.2): Phase A (1st-only) → Phase B (ordinal [+3,+1,-1,-3]) → Phase C (mix)
+- rank_progress_bonus / rank_decay_penalty (정책 16)
+- role-asymmetric 4인 매치 템플릿 (9.2)
+- 2p/4p 비율 curriculum: 80/20 → 50/50 → 60/40
+- mode 별 advantage normalizer 별도 (13.3)
 ```
 
-### Phase 5 — Action space 확장
+**게임 성능**:
+- **Phase A (1st-only)**: 공격적. "1등 못 하면 의미 없으니 일단 친다". king-maker 행동 자주 등장 (4등이 1등 침).
+- **Phase B (ordinal)**: 신중. 1등 못 할 거 같으면 *2등 굳히기*, 4등 회피. 위협 ranking 인지 — 매 턴 누가 1등인지 동적 판단해 그 상대에 우선 압박.
+- **Phase C (mix)**: 결정적 행동 회복 + ranking 인식. 게임 후반 *삼자 견제 (triangulation)* — 두 상대를 서로 싸우게 만들고 본인은 영토 굳히기 시도.
+- 관전자 인상: 4p 에서 *어느 상대를 적으로 삼느냐* 를 매 턴 다시 평가하는 봇.
+
+### Phase 5 — Action space 확장 (2 sub-phase 로 분할)
+
+#### Phase 5a — list-aware action infrastructure (single-source 강제 유지)
+
+PPO buffer / advantage / log_prob 모두 list-aware 로 리팩터, 단 max_sources=1 강제 (15.2.9). 동작은 single-source 와 동등해야 함 (회귀 검사).
+
 ```
-- multi-source coordinated decoder (6.2.1, 8.2)
-- synchronized_arrival_capture_bonus (정책 6, B2)
-- partial launch fraction head (6.2.4)
+- step 당 (s, [a_1...a_K], [log_prob_1...K], [adv_1...K]) shape 로 변경
+- max_sources=1 cap → 기존 single-source 동작 보존
+- fixed-seed eval 통과 = baseline 동등 ± σ
 ```
+
+**게임 성능**: 변화 없음. 5b 진입 안전성만 확보.
+
+#### Phase 5b — multi-source 활성 + synchronized reward + fraction head
+
+```
+- max_sources 점진적 증가 (1→2→3)
+- synchronized_arrival_capture_bonus (정책 6, B2 alpha)
+- partial launch fraction head (6.2.4) — denial/spoiler minimum-ship 정밀도
+- coordinated_capture_bonus 활성
+```
+
+**게임 성능**: 게임 외관이 가장 크게 바뀌는 단계.
+- **Alpha strike**: 같은 turn 에 여러 source 에서 동일 target 으로 동시 도착. defense 가 사이에 끼어들 틈 없이 한 번에 capture.
+- **연합 공격**: 본진 방어와 공격을 한 turn 에 병행. multi-source set 이 자연스러움.
+- **Spoiler 정밀**: minimum-ship 으로 적 capture 만 차단, 잉여 전력은 다른 target.
+- 관전자 인상: "이 봇 한 턴에 movement 가 여러 개네" — 이제 *플레이어 같다*.
 
 ### Phase 6 — 고급 / 선택
+
 ```
-- Q-style joint candidate evaluation (6.2.2)
-- macro / option (6.2.3)
-- imagined-branch rollout (5.4 확장)
+- Q-style joint candidate evaluation (6.2.2): 4인전·연합 공격에서 결정적
+- macro / option (6.2.3): "행성 P 를 hold", "K턴에 동시도착" 매크로
+- imagined-branch rollout (5.4 확장): MCTS 1-step lookahead
 ```
+
+**게임 성능**: "장기 plan 이 보인다". M턴 hold 매크로 — capture 직후 vacuum 단계에서 K턴 동안 자동 reinforce. K턴 동시도착 매크로 — 미리 송출해놓고 도착 시점에 stack. imagined branch — *지금 launch 안 하면 K턴 뒤가 어떨까* 를 1-step look-ahead 로 비교, 그 결과를 정책에 반영.
 
 ---
 
@@ -632,7 +778,8 @@ mirror 만 돌리면 자기 정책 corner 에 갇힘.
 mask 가 *판단 가능한 행동* 까지 막으면 정책이 학습 자체를 못 한다. 원칙:
 - mask 는 sun/path/물리 invalid 만.
 - "비효율적인 행동" 은 reward 로 표현, mask 가 아님.
-- own planet support / enemy-incoming neutral / race-disadvantage target 모두 *열어둘 것*.
+- own planet support / enemy-incoming neutral / race-disadvantage target 모두 *모드로서 열어둘 것* (action 자체를 막지 않음).
+- 단 **action-space guard** (target filter, send-fraction cap 등) 는 학습 안정화 단계에선 허용. reward 신호가 axis metric 으로 검증된 후 단계적 완화 (6.3 참조).
 
 ### 13.3 4인전이 2인전 정책을 망가뜨림
 4인전 noise 가 큼. shared encoder 가 4p episode 의 분산에 끌려가면 2p 정책이 흔들림.
@@ -661,3 +808,135 @@ opponent_pred aux 가 RL loss 를 압도하지 않도록 weight 0.1~0.3.
 > **정책은 16축으로 보되 reward 는 그중 결과로 검증 가능한 것만 표현하고, fleet/planet 을 시점이 아닌 궤적으로 다루는 temporal-aware encoder 를 토대로 2인전·4인전을 구분된 head 와 ranking-aware reward 로 학습시키며, league 다양성과 rule-bot 의무 편성으로 self-play corner 를 깨고, action space 는 multi-source coordinated decoder 까지 확장한다.**
 
 이 한 줄을 시스템 전체의 북극성으로 둔다.
+
+---
+
+## 15. 본 청사진의 단점 / 한계 — 현 코드 기준 진단 + 보완 (2026-04-28 추가)
+
+### 15.1 현 코드 진단 (Plan 대비 위치)
+
+현재 `main` 코드를 plan 의 각 장과 비교하면 사실상 **Phase A 기준선**이다. 즉 plan 의 1~6 phase 모두가 미착수.
+
+| 영역 | 현 상태 | Plan 목표 | 갭 |
+|---|---|---|---|
+| Mask (`mask/`) | 5게이트 hard mask 정렬됨 (`target_owner_allowed, flight_path_clear, projected_arrival_state, attack_still_needed, capacity_sufficient`). attack/support parity 정렬, invalid target 차단. 단 support target 은 *enemy_incoming OR required + 35% cap* guard — hard invalid 가 아닌 **action-space guard**. | 장기적으로 hard-invalid-only + own_loss / support_defense reward 가 가드를 대체 | **구조는 안정, 철학 일부 불일치** (작음) |
+| Reward (`reward/components.py`) | 7 component (`dense, neutral_capture, all_in, over_send, under_invested, launch_cost, terminal`) | ~20+ component, ranking/race/denial/coordinated 추가, 4p 모드별 분리 | **큼** |
+| Feature/Encoder (`model.py`) | snapshot + HISTORY=20 temporal, planet/fleet MLP+attention | arrival_schedule, multi-relation graph attn (5종), per-opponent encoder, player_count embed, future rollout sim | **매우 큼** |
+| Architecture (`model.py`) | single-source decoder, 단일 critic, cost-bias MLP (Phase A) | multi-source coord decoder, aux opponent_pred head, 2p/4p 분기 head, FiLM mode gate | **매우 큼** |
+| Action space | one-launch-per-turn, 이산 ship multiplier | multi-source set per turn, 연속 fraction head | **큼** |
+| League (`train.py LeaguePool`) | snapshot rotation only | rule-bot 4종 의무 편성, sibling reward seed, 2p/4p curriculum, role-asymmetric 4p match | **매우 큼** |
+| Logger (`utils/logger.py`) | ~140 컬럼, 정책 1/4/5/6 만 부분 검증 | 정책 1~16 전체 검증 metric, 4p rank dist | **중간** (절반) |
+| Eval | 2p win_rate 기반, fixed-seed pool 없음 | fixed-seed eval matrix (rule-bot/sibling/snapshot-N), 4p rank distribution | **큼** |
+| Player-count 분기 | 없음 (Kaggle 2p 전제 단일 코드) | 2p/4p 별 head·normalizer·env·league·reward·eval 모두 분리 | **결정적** (4p 인프라 0%) |
+| Stateful event infra | `HitRateTracker` (진단 전용) | `events.py / trackers.py` 기반 reward 컴포넌트 | **중간** (인프라는 있고 reward 연결만 부재) |
+
+요약: **mask 는 구조적으로 정렬됨 (philosophy 는 plan 의 hard-invalid-only 와 일부 불일치, support target guard 가 잔존)**, 나머지 9개 영역은 미착수. 4인전은 환경부터 0%.
+
+### 15.2 청사진의 단점 + 보완
+
+#### 15.2.1 단점 — Phase 1 자체가 거대해서 단일 phase 로 다룰 수 없음
+Phase 1 은 (a) arrival_schedule (b) multi-relation graph attention (5종 관계) (c) per-opponent encoder (d) player_count embedding (e) opponent_pred aux head — 다섯 개의 독립 변경을 한 phase 로 묶었다. 각각이 1~2주 작업이고 디버깅까지 합치면 phase 1 만 1~3개월. 이 동안 reward·league 쪽 진척이 0 인 risk.
+**보완**: Phase 1 을 1a~1d 로 쪼갠다.
+- **1a**: arrival_schedule 내장 + future rollout (5.3, 5.4) — 결정론적 시뮬, 모델 변경 없음. 가장 안전. 먼저.
+- **1b**: player_count embedding + per-opponent feature pad (4p 0-pad 으로 2p 도 입력 통일) — feature dim 만 변동.
+- **1c**: multi-relation graph attention — 가장 큰 모델 변경. 단독 phase 로.
+- **1d**: opponent_pred aux head — 1c 끝나야 의미 있음.
+각 단계 끝마다 기존 win_rate 회귀 검사 (≥ baseline - σ).
+
+#### 15.2.2 단점 — 4인전 환경이 0%인데 plan 의 30% 가 4p 전제
+5.6 (per-opponent encoder), 7.2 (4p reward), 8 (4p head, FiLM gate), 9.2 (4p league), 11.4 (4p eval) — 모두 4p env 가 있어야 검증 가능. 현재 코드는 Kaggle 2p 환경만 사용. plan 에 "4p env 어떻게 만드나" 가 없다.
+**보완**: Phase 0 ("4p env trakck") 를 main track 과 **병렬**로 분리 신설.
+- 0-track: 4p sim 환경 wrapper (Kaggle 4p 룰 또는 자체 sim) + 4p match runner + 4p eval harness — main 트랙과 독립적으로 진행, **2p main 트랙은 plan Phase 1~3 까지 4p 무관하게 진행**.
+- Phase 4 진입 시점에 0-track 산출물이 준비되어 있어야 main 트랙이 4p 로 합류.
+- 만약 0-track 이 늦으면 Phase 4·일부 5 를 보류하고 Phase 5 (multi-source) 를 2p 안에서 먼저.
+
+#### 15.2.3 단점 — Plan 이 env observability 를 무검증 가정
+arrival_schedule (5.3), opponent_pred aux (8.3), per-opponent target distribution (11.2) 모두 fleet 의 (src, tgt, launch_turn, eta) 와 상대 launch event 가 obs 로 노출된다고 전제. Kaggle 환경이 이걸 모두 노출하는지 plan 은 검증하지 않음.
+**보완**: Phase 1a 진입 전에 **env adapter audit** 1주 작업 추가.
+- 현 obs 에서 fleet 별 (src, tgt, launch_turn, eta, owner) 가 직접 노출되는지 grep.
+- 누락된 필드는 obs delta 로 inference 가능한지 (예: 새 fleet 등장 = launch event) 검증.
+- inference 도 불가능한 필드 (예: opponent 의 ship 의도, 미래 launch 계획) 는 plan 에서 명시적으로 제외.
+
+#### 15.2.4 단점 — Aux opponent_pred 의 ground-truth 정의 모호
+8.3 은 "predict opponent's next target, CE with realized action" 이라고 쓰지만, Kaggle obs 에서 opponent action 이 atomic 하게 노출되지 않을 수 있다. fleet delta 로 추론 시 noise 가 들어가고, multi-source 환경에선 어느 src 의 어느 tgt 인지 라벨이 모호.
+**보완**: 라벨링 layer 명시.
+- self-play replay 에서는 opponent action 직접 access (그라운드트루스 100%).
+- 외부 봇 매치는 fleet delta 로 inferred target — 다중 launch 면 single-target softmax 대신 multi-label BCE.
+- 라벨 신뢰도 < 0.7 인 step 은 aux loss 에서 mask out.
+
+#### 15.2.5 단점 — Reward catalog 폭증 → cross-correlation/weight 탐색 비용 폭발
+7.3 catalog 는 component 13개+, 4p 전용 4개 추가. 각각 weight 가 필요하고 mode 별 (2p/4p) 별도. 단순 grid 로도 (3 weight per comp)^17 = 천문학적. plan 은 13.1 에 "corr > 0.7 이면 합치거나 폐기" 만 쓰고 *추가 시점 게이트* 가 약함.
+**보완**: 새 component 추가 게이트 강화.
+- (a) 기존 component 와의 cross-corr < 0.5 (0.7 → 0.5).
+- (b) **해당 component 없을 때** 정책 metric 이 정체된다는 ablation 증거 (사후가 아닌 사전).
+- (c) weight 는 단일 점이 아닌 logarithmic 3-point grid (×0.3, ×1, ×3) 로만 sweep, mode 별 별도.
+- 둘 다 통과 못 하면 component 화 보류, **metric 으로만 logger 추가**.
+
+#### 15.2.6 단점 — Logger 가 16정책 중 4정책만 검증 가능 → 측정 없는 학습 risk
+Phase 1·2 변화의 효과를 axis 별로 측정 못 하면 "encoder 가 정책 11/13 을 실제로 강화했는지" 판단 불가. plan 11.2 가 정의는 했지만 *언제 logger 에 추가하나* 가 phase 에 없음.
+**보완**: Phase 0 에 **metric infra** 명시 추가 — Phase 1 시작 *전에* logger 에 정책 2/9/10/11/12/13~16 컬럼 추가. 단 **값을 0 으로 채우지 말 것** (0 이 "측정했는데 0" 인지 "미구현" 인지 모호). 두 가지 방식 중 택일:
+- **방식 A**: 미구현 metric 은 NaN / blank 로 두고, 동일 행에 `metric_available_<name> ∈ {0, 1}` flag 컬럼 동반.
+- **방식 B (더 단순)**: 해당 정책의 **phase 진입 시점에만** 그 metric 컬럼을 추가 (phase 0 에선 컬럼 schema 만 코드에 등록, 실제 CSV 는 phase 별 활성).
+어느 쪽이든 **컬럼 없는 reward component 도입 금지** 룰은 유지.
+
+#### 15.2.7 단점 — Plan 7.3 의 "weak filtered_path_penalty / weak race_lost_attempt_penalty" 와 CLAUDE.md "reward = 결과만 평가" 충돌 의심
+filtered_path 는 mask 가 거른 행동을 다시 reward 로 평가하는 모양새고, race_lost_attempt 는 "도착이 늦었으니 시도 자체가 잘못" 이라는 행동가능성 판정에 가깝다. CLAUDE.md 최종 규칙 ("Reward 는 행동 가능성을 판단하지 않는다") 와 마찰.
+**보완**: 이런 보더라인 component 는 도입 단계 명시.
+- 1단계: **metric only** (logger 에 rate 만 기록, reward 화 X).
+- 2단계: 정책 metric (race_attempt_rate, filtered_path_rate) 이 baseline 대비 유의 악화 시에만 reward 화 검토.
+- 3단계: 도입 시 weight 0.05 미만, 1만 step 후 axis metric 회복 못 하면 즉시 0.
+이렇게 하면 "결과 평가" 원칙과 "약한 nudge" 의 타협점이 측정 기반.
+
+#### 15.2.8 단점 — 13.5 는 action space curriculum 만 언급, encoder 변경 시 정책 붕괴 risk 미언급
+Phase 1c (multi-relation graph attention) 처럼 encoder 가 통째로 바뀌면 기존 학습 정책의 표현이 mismatch 되어 win_rate 가 한 번 무너진다. plan 13.5 는 action space 만 다루지 encoder swap curriculum 은 없음.
+**보완**: 13장에 **13.8 encoder swap curriculum** 항목 추가 (별도 보완은 아래 코드 변경엔 포함 안 함, 본 단점 노트로만 — 추후 phase 1c 직전에 13.8 작성).
+- old encoder 는 freeze, new encoder 만 학습 → linear probe 로 동일 task 만 → 점진적 unfreeze.
+- 또는 dual-stream + gating: gate 가 점진적으로 new encoder 쪽으로 이동.
+- win_rate 가 baseline - 2σ 이상 떨어지면 즉시 rollback.
+
+#### 15.2.9 단점 — Phase 5 multi-source decoder 는 "head 추가" 가 아닌 RL pipeline 전면 리팩터
+PPO buffer 는 step 당 (s, a, log_prob, advantage) 가정. multi-source 면 step 당 (s, [a_1...a_K], [log_prob_1...K], [adv_1...K]) 으로 텐서 shape, advantage 분배, KL 계산 모두 변경. 단순 model 변경이 아니라 train loop 변경이라서 plan Phase 5 의 작업량이 크게 과소평가됨.
+**보완**: Phase 5 를 5a/5b 로 분리.
+- **5a (infra)**: action representation 을 list 로 리팩터 (단, max_sources=1 강제 → 동작은 single-source 와 동일). PPO buffer/advantage/log_prob 모두 list-aware. 회귀 검사 = baseline 동등.
+- **5b (활성)**: max_sources 점진적 증가 (1→2→3). 5a 가 통과해야 5b 진입.
+
+#### 15.2.10 단점 — Sibling reward seed 의 GPU·시간 비용 미반영
+9.4 는 "다른 weight 로 학습된 sibling 을 pool 에 합류" 하는데, sibling 1개 = full 학습 run 1개 = main 학습과 동일 비용. 2~3개 sibling 이면 GPU 시간 3~4배. plan 은 이 비용을 다루지 않음.
+**보완**: sibling 을 별도 full run 으로 만들지 말고,
+- (a) **multi-head reward**: 하나의 학습에서 head 별로 다른 reward weight 로 학습 (encoder 공유). 의사-sibling 효과.
+- (b) **single-run snapshot diversity**: 학습 도중 reward weight 를 주기적으로 변동 (curriculum 형태) → 그때 snapshot 을 sibling 처럼 풀에 합류.
+- (c) 진짜 별도 sibling run 은 main 모델이 한 번 충분히 안정화된 *후* 1개만 학습 — 처음부터 병렬 N개는 ROI 부족.
+
+#### 15.2.11 단점 — Fixed-seed eval matrix 부재 (전 phase 의 회귀 검출 불가)
+11.4 는 "fix seed 풀" 을 명시하지만 phase 1 의 어디에도 *언제* 만드는지 없음. 회귀 검사 (15.2.1, 15.2.8 의 보완) 가 모두 fixed eval 에 의존하는데 정작 그게 없음.
+**보완**: Phase 0 (15.2.6 의 metric infra 와 같이 묶음) 에 **fixed-seed eval harness** 도 포함.
+- seed 32~64개 고정, opponent set = {현 baseline snapshot, 단순 rule-bot 1개 (greedy_radius 만이라도 먼저)}.
+- 매 N=1k step 자동 평가, win_rate + axis metric 차분 알람.
+- Phase 1~5 의 모든 회귀 검사가 이 harness 의 출력으로만 판단.
+
+### 15.3 종합 — Plan 본문 반영 현황 (이번 turn 에 완료)
+
+15.2 의 단점들을 반영해 **plan 본문을 다음과 같이 수정 완료**:
+
+```text
+[적용됨]
+- 6.1: "one launch per turn" → "source 별 독립 launch decision, joint action 미평가" 로 정확화
+- 6.3: support mask 철학 명시 — "action 자체는 항상 존재 / target 은 필요성 기반 guard" (15.2 의 사용자 지적)
+- 7.3: reward catalog 를 [현]/[단]/[장]/[메트릭]/[aux] 5분류로 재작성. 현재 구현 8개 component 명시
+- 12장 (로드맵):
+    Phase -1 (현재 변경 안정화) 신설
+    Phase 0 (인프라/측정/환경 audit) 신설
+    Phase 1 → 1a (arrival_schedule) / 1b (player_count + per-opponent pad) / 1c (graph attention) / 1d (opponent_pred aux) 로 분할
+    Phase 2 의 component 도입 순서를 [단] → [장] 으로 재배치
+    Phase 5 → 5a (list-aware infra, max_sources=1 강제) / 5b (multi-source 활성) 로 분할
+    각 phase 에 게임 성능 (관전자 시점 행동 묘사) 추가
+- 13.2: support mask 표현 부드럽게 — "모드로서 열림 / guard 는 단계적 완화"
+- 15.1: mask 진단을 "구조 정렬 / 철학 일부 불일치" 로 재분류
+- 15.2.6: logger 미구현 metric 처리 — NaN+available_flag 또는 phase 진입 시점 컬럼 등록 (값 0 채우지 않음)
+
+[보류 — 별도 turn]
+- 13.8 encoder swap curriculum 본문 추가는 Phase 1c 직전에 작성 (지금은 15.2.8 에 의도만 기록)
+- 2.2.1 source_opportunity_cost 식 정정 — 사용자 지적 (현 식의 ships_sent × prod_rate 가 의미 모호) 은 별도 turn 에 정리
+```
+
+이 변경은 **plan 의 야심을 줄이지 않으면서 phase 단위 회귀 위험을 제어** 하기 위한 것이다.
