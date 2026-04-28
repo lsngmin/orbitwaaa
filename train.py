@@ -41,6 +41,7 @@ from prediction import (
     aim, crosses_sun, first_collision_on_path, PositionCache,
     resolve_ships_for_capture, project_target_at_eta,
 )
+from mask import MaskContext, build_target_mask, build_action_mask
 
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 with open(_cfg_path) as f:
@@ -313,8 +314,6 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
     planets      = [Planet(*p) for p in raw_planets[:MAX_PLANETS]]
     fleets       = [Fleet(*f)  for f in raw_fleets]
     pos_cache    = PositionCache(planets, av)
-    launchable   = torch.zeros(MAX_PLANETS, dtype=torch.bool)
-    target_mask  = torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool)
 
     # Phase A: explicit cost-feature tensors. mask 가 False 인 (i,j) 위치는
     # 0 으로 둠 (logit -1e9 마스크가 우선이라 영향 없음).
@@ -360,71 +359,48 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
                 best = float(e_turns)
         dst_to_enemy_eta[j] = min(best, ENEMY_ETA_CAP)
 
+    # ── Build masks via mask/ module ────────────────────────────────────────
+    # 게이트 우선순위: owner_rule → sun_path → enemy_neutral_filter → capacity_short
+    # ctx.scratch 에 aim/proj/required 캐시 저장 → 아래 feature 루프가 재활용.
+    ctx = MaskContext(
+        planets=planets, fleets=fleets, av=av, acting_player=acting_player,
+        pos_cache=pos_cache, num_planets=MAX_PLANETS, num_actions=NUM_ACTIONS,
+    )
+    target_result = build_target_mask(ctx)
+    action_result = build_action_mask(ctx, target_result)
+
     # ── Mask first-failure decomposition counters ───────────────────────────
-    # 4 게이트 × 4 src.ships threshold (1/5/10/20).
-    # 각 (src, dst) pair 는 첫 실패 게이트 한 곳에만 카운트.
-    GATE_NAMES = ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+    # 4 게이트 × 4 src.ships threshold (1/5/10/20). 각 (src, dst) pair 는 첫 실패
+    # 게이트 한 곳에만 카운트 (target_result.blocked_by 가 이미 first-fail idx 보유).
     THRESHOLDS = (1, 5, 10, 20)
-    mask_block_by_thresh = {g: {t: 0 for t in THRESHOLDS} for g in GATE_NAMES}
-
-    def _bump_mask_block(gate, src_ships):
-        """첫 실패 게이트에 (src.ships threshold 별) 1 증가."""
-        sh = int(src_ships)
-        bucket = mask_block_by_thresh[gate]
-        for t in THRESHOLDS:
-            if sh >= t:
-                bucket[t] += 1
-
+    mask_block_by_thresh = {g: {t: 0 for t in THRESHOLDS} for g in target_result.gate_names}
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
             continue
-        src_ships_safe = max(int(src.ships), 1)
-        for j, tgt in enumerate(planets):
-            # Gate 1: owner_rule (self target or own-owned target).
-            if i == j or tgt.owner == acting_player:
-                _bump_mask_block("owner_rule", src.ships)
+        sh = int(src.ships)
+        for j in range(len(planets)):
+            gate_idx = int(target_result.blocked_by[i, j].item())
+            if gate_idx < 0:
                 continue
-            # Gate 3a (path): direct sun crossing — 게이트 우선순위 상 sun_path.
-            if crosses_sun(src.x, src.y, tgt.x, tgt.y):
-                _bump_mask_block("sun_path", src.ships)
-                continue
-            ships_rep = int(src.ships)
-            angle, tx, ty, turns = aim(src, tgt, av, ships_rep, pos_cache=pos_cache)
-            max_turns = min((turns or 0) + 2, 120) if turns else 120
-            cause, hit_pid = first_collision_on_path(
-                src, angle, ships_rep, planets, av, max_turns=max_turns,
-                pos_cache=pos_cache,
-            )
-            # Gate 3b (path collision): 의도된 tgt 에 도달 못함 → sun_path 버킷 통합.
-            if cause != "planet" or hit_pid != tgt.id:
-                _bump_mask_block("sun_path", src.ships)
-                continue
-            # Gate 2: Guard A → enemy_neutral_filter (target ownership at ETA).
-            #   도착 시점에 내 행성이 될 예정 = "이미 잡혀 있을 enemy/neutral" 분류 실패.
-            eff_turns = turns if turns else 1
-            proj_owner, proj_ships = project_target_at_eta(
-                tgt, eff_turns, planets, fleets,
-            )
-            if proj_owner == acting_player:
-                _bump_mask_block("enemy_neutral_filter", src.ships)
-                continue
-            # Gate 4: capacity_short — src.ships < required (도착 시점 적 ships+1).
-            #   prediction._required_at 와 동일 식: max(1, int(proj_ships) + 1).
-            required = max(1, int(proj_ships) + 1)
-            if src.ships < required:
-                _bump_mask_block("capacity_short", src.ships)
-                continue
-            target_mask[i, j] = True
+            gate_name = target_result.gate_names[gate_idx]
+            for t in THRESHOLDS:
+                if sh >= t:
+                    mask_block_by_thresh[gate_name][t] += 1
 
-            # ── Pair-level cost features (target head) ──────────────────────
-            # 채널 0~3: 기존 capacity-axis (linear clip)
-            # 채널 4~5: production-axis (log1p) — req_over_src 포화(=1.0) 상태에서
-            #   "회복 가능한 베팅 vs 자살 베팅" 을 가르는 신규 신호.
-            # 채널 6:   eta_advantage_norm — (enemy_min_eta - my_eta) / 30 ∈ [-1,1].
-            #   양수 = 적보다 빨리 도달 → 초반 중립 race 시그널.
-            # 채널 7:   turn_norm — phase awareness (bias_mlp 가 phase × 다른 채널
-            #   조합으로 phase-conditional weighting 학습).
-            # ETA 는 required 산출에 쓰인 eff_turns 와 동일 (정합성).
+    # ── Pair / amount cost features ─────────────────────────────────────────
+    # mask 통과한 (i,j) 만 채움. ctx.scratch 의 aim/proj/required 캐시 재활용.
+    # 채널 의미는 pair_feats 0~7 / amount_feats 0~7 모두 동일 (capacity / production /
+    # eta_adv / phase). 자세한 채널 정의는 ActionSpace 도크스트링 참조.
+    for i in range(len(planets)):
+        for j in range(len(planets)):
+            if not target_result.mask[i, j]:
+                continue
+            src = planets[i]
+            tgt = planets[j]
+            _, _, _, turns          = ctx.scratch[("aim",  i, j)]
+            _, proj_ships, eff_turns = ctx.scratch[("proj", i, j)]
+            required                = ctx.scratch[("required", i, j)]
+            src_ships_safe = max(int(src.ships), 1)
             tgt_ships_safe = max(int(tgt.ships), 1)
             src_prod_safe  = max(float(src.production), 1.0)
             eta_safe       = max(int(eff_turns), 1)
@@ -444,13 +420,6 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
             pair_feats[i, j, 5] = req_over_prod_eta
             pair_feats[i, j, 6] = eta_adv_norm
             pair_feats[i, j, 7] = tn
-
-            # ── Per-bin candidate features (amount head) ────────────────────
-            # SHIPS_BINS = SHIPS_MULTIPLIERS (multiplier mode) or SHIPS_SURPLUS_BINS.
-            # candidate_ships 는 mode 에 따라 다른 식 (decode 와 동일).
-            # production-axis 는 candidate 기준으로 계산 (cand 도 src.production 으로
-            # 회복하는 데 몇 턴/도착-전 회복가능성 — required 와 동일 의미).
-            # 채널 6/7 은 pair-level 과 동일 (bin 무관 — race 와 phase).
             for k, bv in enumerate(SHIPS_BINS):
                 if AMOUNT_MODE == "multiplier":
                     raw = required * bv
@@ -475,23 +444,20 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
                 amount_feats[i, j, k, 6] = eta_adv_norm
                 amount_feats[i, j, k, 7] = tn
 
-    self_fallback_active = 0
-    # 진단: src.ships threshold 별 self_fallback / active 분해.
-    # 작은 src(1~2 ships)가 capacity-short Guard B 로 거의 항상 막혀
-    # denominator 를 부풀리는지(false alarm) vs 큰 src 도 진짜 막히는지 구분.
+    # ── self_fallback / active 진단 ──────────────────────────────────────────
+    # 작은 src(1~2 ships)가 capacity-short 로 거의 항상 막혀 denominator 를 부풀리는지
+    # (false alarm) vs 큰 src 도 진짜 막히는지 src.ships threshold 별로 구분.
+    self_fallback_active    = 0
     self_fallback_by_thresh = {1: 0, 5: 0, 10: 0, 20: 0}
     active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
     for i, src in enumerate(planets):
         if src.owner != acting_player or src.ships <= 0:
             continue
-        has_target = bool(target_mask[i].any())
-        if has_target:
-            launchable[i] = True
-        else:
-            # active source (소유 + ships>0) 인데 valid target 0 개 → self-fallback 대상.
-            # 빈도 계측용 (학습 영향은 launchable=False 라 skip 강제로 차단됨).
+        has_target = bool(target_result.mask[i].any())
+        if not has_target:
+            # valid target 0 개 → self-fallback 대상. action_mask 가 launch 차단하므로
+            # 학습 contamination 없음 — 빈도 계측용.
             self_fallback_active += 1
-        # threshold-bucketed 분해 (진단 전용)
         sh = int(src.ships)
         for thresh in (1, 5, 10, 20):
             if sh >= thresh:
@@ -500,18 +466,14 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
                     self_fallback_by_thresh[thresh] += 1
 
     # All-false row fallback: Categorical NaN 방지용 self 허용
-    # (launchable[i]=False → action_mask 가 skip 만 허용 → target lp 게이팅으로 학습 영향 없음)
+    # (launchable[i]=False → action_mask 가 skip 만 허용 → target lp 게이팅으로 학습 영향 없음).
+    # raw mask 는 build_action_mask 가 이미 launchable 도출에 사용했으므로 여기서 clone 후 수정.
+    target_mask = target_result.mask.clone()
     for i in range(MAX_PLANETS):
         if not target_mask[i].any():
             target_mask[i, i] = True
 
-    # action_mask: (P, NUM_ACTIONS) — skip(idx 0) 은 항상 True, bin(idx 1..) 은 launchable.
-    # launchable=False 인 source 는 skip 만 가능 → 정책이 "발사 안 함" 을 강제 학습.
-    action_mask = torch.zeros(MAX_PLANETS, NUM_ACTIONS, dtype=torch.bool)
-    action_mask[:, 0] = True
-    action_mask[:, 1:] = launchable.unsqueeze(-1)
-
-    return ActionSpace(planets, fleets, pos_cache, action_mask, target_mask, av, acting_player,
+    return ActionSpace(planets, fleets, pos_cache, action_result.mask, target_mask, av, acting_player,
                        self_fallback_active=self_fallback_active,
                        self_fallback_by_thresh=self_fallback_by_thresh,
                        active_by_thresh=active_by_thresh,
@@ -571,7 +533,15 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                "under_invested_count_neutral": 0, "under_invested_count_enemy": 0,
                # ── 1차 진단 metric (자원 보존 측정) ──────────────────────────
                "all_in_launches": 0,
-               "remaining_ships_after_launch_sum": 0}
+               "remaining_ships_after_launch_sum": 0,
+               # ── launch cost (continuous) ─────────────────────────────────
+               # max(0, req/src - 0.5) 를 누적 → reward 에 곱해서 penalty.
+               # 0~0.5 : cheap launch (penalty 0)
+               # 0.5~1.0 : 50%~100% src use (penalty 단조↑)
+               # 1.0+   : capacity short (penalty cap = req/src 그대로)
+               # all_in_penalty (binary 80%) 와 별개 channel — cost feature
+               # 와 reward 사이 continuous gradient 다리.
+               "launch_cost_excess_sum": 0.0}
     # action 5-way 선택 히스토그램: idx 0 = skip, idx 1..K = bin (k-1).
     # ships_bin_hist_k 는 발사된 launch 들의 bin (0..K-1) 분포.
     # action_skip_count 는 skip 선택된 source step 수 (per-source 발사 보류 빈도).
@@ -674,6 +644,18 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         if p.ships > 0 and ships_needed >= HitRateTracker.ALL_IN_THRESHOLD * p.ships:
             counts["all_in_launches"] += 1
         counts["remaining_ships_after_launch_sum"] += max(p.ships - ships_needed, 0)
+        # launch cost (continuous): req/src 가 0.5 초과 시 비례 penalty 누적.
+        #   threshold 0.5 → 절반 이하 비용은 무료 (정상 launch 인센티브 보존).
+        #   excess = max(0, required/src - 0.5)
+        #   cheap launch  (req/src=0.4) → 0
+        #   moderate      (req/src=0.7) → 0.2
+        #   all-in        (req/src=1.0) → 0.5
+        #   capacity short(req/src=1.5) → 1.0
+        # 이 값을 reward 에서 -coef × Σ 로 곱함 → cost feature 와 reward 의
+        # 연속 gradient 다리 (alpha 가 자라야 할 reward signal 생성).
+        if p.ships > 0:
+            req_over_src_lin = float(required) / float(p.ships)
+            counts["launch_cost_excess_sum"] += max(0.0, req_over_src_lin - 0.5)
 
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
@@ -777,6 +759,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
     sum_over_send_penalty = 0.0   # 다중 source 협조 실패 페널티 (음수 누적)
     sum_under_invested_penalty = 0.0   # capacity-short launch 시도 페널티 (음수 누적)
+    sum_launch_cost_penalty = 0.0   # Phase B: per-launch req/src cost penalty (continuous)
     # Step 4 계측: active source (acting_player 소유 + ships>0) 중 valid target=0 인 비율.
     # 학습 영향 없음 (skip 강제) 이지만 mask viability 가 너무 보수/공격적인지 진단.
     sum_self_fallback_active = 0
@@ -834,6 +817,10 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     # 발사 *시도* 당 페널티. 1-A 가 decode 단에서 ships=0 으로 차단하지만
     # mask 가 못 잡는 edge (target_mask 이후 fixed-point oscillation 등) 를 reward 로 억제.
     under_invested_penalty_coef = float(T.get("under_invested_penalty", 0.0))
+    # Phase B: launch cost penalty (continuous). 0 이면 비활성.
+    # all_in_penalty (binary 80%) 와 별개 — req/src > 0.5 부터 단조 페널티.
+    # cost feature 가 reward 와 묶여 target_bias_alpha 가 자랄 신호 생성.
+    launch_cost_penalty_coef = float(T.get("launch_cost_penalty", 0.0))
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
@@ -899,8 +886,12 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             over_send_penalty = -over_send_penalty_coef * decode_counts.get("over_send_excess_sum", 0)
             # under-invested: src.ships < required 상태에서의 launch 시도 수에 비례한 페널티.
             under_invested_penalty = -under_invested_penalty_coef * decode_counts.get("under_invested_count", 0)
+            # Phase B: launch cost (continuous). max(0, req/src - 0.5) 의 step 합계.
+            #   target cost feature 와 reward 사이 직접 다리 — 비싼 target 고를수록 손해.
+            launch_cost_penalty = -launch_cost_penalty_coef * decode_counts.get("launch_cost_excess_sum", 0.0)
             terminal_r     = 0.0
-            reward         = dense_r + cap_bonus + all_in_penalty + over_send_penalty + under_invested_penalty
+            reward         = (dense_r + cap_bonus + all_in_penalty + over_send_penalty
+                              + under_invested_penalty + launch_cost_penalty)
             prev_score     = curr_score
 
             if ep_done:
@@ -916,6 +907,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             sum_all_in_penalty += all_in_penalty
             sum_over_send_penalty += over_send_penalty
             sum_under_invested_penalty += under_invested_penalty
+            sum_launch_cost_penalty += launch_cost_penalty
             sum_terminal += terminal_r
             # Step 4 계측: 이 step 의 self_fallback 빈도. active_sources 는 분모 (acting
             # player 소유 + ships>0 인 src 수) — 매 step launchable[i] 결정 후 알 수 있음.
@@ -1021,6 +1013,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "sum_all_in_penalty": sum_all_in_penalty,
         "sum_over_send_penalty": sum_over_send_penalty,
         "sum_under_invested_penalty": sum_under_invested_penalty,
+        "sum_launch_cost_penalty": sum_launch_cost_penalty,
         "sum_terminal": sum_terminal,
         "sum_wins":     sum_wins,
         "sum_self_fallback_active": sum_self_fallback_active,
@@ -1105,6 +1098,7 @@ def _finalize_reward_stats(raw_list):
     total_all_in_penalty = 0.0
     total_over_send_penalty = 0.0
     total_under_invested_penalty = 0.0
+    total_launch_cost_penalty = 0.0
     total_wins = 0.0
     total_self_fallback_active = 0
     total_active_sources       = 0
@@ -1129,6 +1123,7 @@ def _finalize_reward_stats(raw_list):
         total_all_in_penalty += r.get("sum_all_in_penalty", 0.0)
         total_over_send_penalty += r.get("sum_over_send_penalty", 0.0)
         total_under_invested_penalty += r.get("sum_under_invested_penalty", 0.0)
+        total_launch_cost_penalty += r.get("sum_launch_cost_penalty", 0.0)
         total_terminal += r["sum_terminal"]
         total_wins     += r.get("sum_wins", 0.0)
         total_self_fallback_active += r.get("sum_self_fallback_active", 0)
@@ -1167,6 +1162,8 @@ def _finalize_reward_stats(raw_list):
     stats["mean_over_send_penalty"] = total_over_send_penalty / steps_safe
     # capacity-short launch 시도 페널티 (음수). under_invested_penalty=0 이면 0.
     stats["mean_under_invested_penalty"] = total_under_invested_penalty / steps_safe
+    # Phase B: per-step launch cost penalty (음수). launch_cost_penalty=0 이면 0.
+    stats["mean_launch_cost_penalty"] = total_launch_cost_penalty / steps_safe
     # Step 4 계측: active source (acting_player 소유 + ships>0) 중 valid target=0 인
     # source 의 비율. 학습 contamination 없음 (skip 강제) 이지만 mask viability 진단:
     #   - <1% : 거의 무시 가능
@@ -1940,6 +1937,8 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_terminal_rew=rew_stats["mean_terminal"],
                 # Sprint 2: 발사 시 자원 보존 페널티 (음수). all_in_penalty=0 이면 0.
                 mean_all_in_penalty=rew_stats.get("mean_all_in_penalty", 0.0),
+                # Phase B: per-launch cost penalty (continuous, req/src>0.5 부터). 0 이면 비활성.
+                mean_launch_cost_penalty=rew_stats.get("mean_launch_cost_penalty", 0.0),
                 mean_attempts=rew_stats["mean_attempts"],
                 mean_launched=rew_stats["mean_launched"],
                 launch_rate=rew_stats["launch_rate"],

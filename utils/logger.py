@@ -36,6 +36,9 @@ class TrainingLogger:
             "mean_dense_rew", "mean_cap_bonus", "mean_terminal_rew",
             # Sprint 2: 발사 시 자원 보존 페널티 (음수 mean). all_in_penalty=0 이면 0.
             "mean_all_in_penalty",
+            # Phase B: per-launch cost penalty (continuous, req/src>0.5). 0 이면 비활성.
+            #   target cost feature ↔ reward 다리. alpha 가 자랄 신호 만든다.
+            "mean_launch_cost_penalty",
             # 다중 source over-send 페널티 (음수 mean). over_send_penalty=0 이면 0.
             "mean_over_send_penalty",
             "mean_attempts", "mean_launched", "launch_rate",
