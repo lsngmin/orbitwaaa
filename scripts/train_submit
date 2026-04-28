@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$HOME/orbitwaaa"
+CKPT_ROOT="$ROOT/checkpoints"
+
+# run-dir: CLI 인자 우선, 없으면 가장 최근 pairwise-* (mtime 기준)
+if [ $# -ge 1 ]; then
+  RUN_NAME="$1"
+else
+  RUN_NAME=$(find "$CKPT_ROOT" -maxdepth 1 -type d -name 'pairwise-*' \
+              -printf '%T@ %f\n' | sort -rn | head -n1 | cut -d' ' -f2-)
+  if [ -z "${RUN_NAME:-}" ]; then
+    echo "no pairwise-* run-dir found under $CKPT_ROOT" >&2
+    exit 1
+  fi
+fi
+
+CKPT="$CKPT_ROOT/$RUN_NAME/main_latest.pt"
+if [ ! -f "$CKPT" ]; then
+  echo "checkpoint not found: $CKPT" >&2
+  exit 1
+fi
+
+cd "$ROOT"
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+OUT_DIR="$ROOT/submissions"
+mkdir -p "$OUT_DIR"
+OUT_PATH="$OUT_DIR/${RUN_NAME}.tar.gz"
+
+echo "[train_submit] run-dir: $RUN_NAME"
+echo "[train_submit] ckpt:    $CKPT"
+echo "[train_submit] bundle:  $OUT_PATH"
+
+python submission/build_submission.py "$CKPT" -o "$OUT_PATH"
+
+echo "[train_submit] uploading to Kaggle (message: $RUN_NAME)..."
+kaggle competitions submit orbit-wars -f "$OUT_PATH" -m "$RUN_NAME"
+
+echo "[train_submit] done. status: kaggle competitions submissions orbit-wars"

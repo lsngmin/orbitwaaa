@@ -58,8 +58,8 @@ NUM_ACTIONS        = 1 + NUM_SHIPS_BINS
 # Action layout (env_wrapper / decode 호환): [a_onehot(NUM_ACTIONS), t_onehot(P)]
 ACTION_DIM         = NUM_ACTIONS + MAX_PLANETS
 # Phase A cost-feature dims (model.py 와 동기)
-TARGET_PAIR_FEAT_DIM = 4
-AMOUNT_BIN_FEAT_DIM  = 4
+TARGET_PAIR_FEAT_DIM = 8
+AMOUNT_BIN_FEAT_DIM  = 8
 
 
 def _make_transformer(layers):

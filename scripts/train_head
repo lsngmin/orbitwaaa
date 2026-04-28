@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="train"
+
+tmux kill-server 2>/dev/null || true
+
+CKPT_ROOT="$HOME/orbitwaaa/checkpoints"
+gen_suffix() {
+  # head -c N 은 N바이트 후 종료해서 tr 에 SIGPIPE(141) 를 보냄.
+  # pipefail 환경에서 죽지 않도록 서브셸에서 pipefail 끔.
+  ( set +o pipefail; LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 3 )
+}
+for _ in $(seq 1 100); do
+  SUFFIX=$(gen_suffix)
+  RUN_NAME="pairwise-${SUFFIX}"
+  [ -e "${CKPT_ROOT}/${RUN_NAME}" ] || break
+  RUN_NAME=""
+done
+if [ -z "${RUN_NAME}" ]; then
+  echo "failed to find unused run-dir suffix after 100 attempts" >&2
+  exit 1
+fi
+RUN_DIR="checkpoints/${RUN_NAME}"
+
+tmux new-session -d -s "$SESSION" -c "$HOME/orbitwaaa"
+tmux send-keys -t "$SESSION" 'cd ~/orbitwaaa && source .venv/bin/activate && git pull' C-m
+tmux send-keys -t "$SESSION" 'cd ~/orbitwaaa/checkpoints/logs/' C-m
+tmux send-keys -t "$SESSION" "echo ${RUN_NAME}" C-m
+tmux send-keys -t "$SESSION" 'date' C-m
+tmux send-keys -t "$SESSION" "cd ~/orbitwaaa && python train.py --gpu 0 --run-dir ${RUN_DIR}" C-m
+
+echo "tmux session '$SESSION' started; run-dir: ${RUN_DIR}"
