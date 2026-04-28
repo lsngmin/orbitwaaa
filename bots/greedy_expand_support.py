@@ -26,10 +26,9 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
 from prediction import (
     PositionCache,
-    aim,
     compute_support_required,
     crosses_sun,
-    project_target_at_eta,
+    fleet_dst_and_eta,
     resolve_ships_for_capture,
     resolve_ships_for_support,
 )
@@ -122,6 +121,17 @@ class GreedyExpandSupportBot:
         if not my_planets:
             return []
 
+        # Step 시작에 한 번만: in-flight fleet 들의 도착지 맵.
+        # 용도는 (1) support 게이팅: 위협 없는 내 행성은 보강 후보 자체에서 제외,
+        # (2) capture 의 net-arrival 보정: 해당 dst 로 향하는 같은-소유주 fleet 의
+        # 합을 staticrequired 에서 깎아줘 (점령 ship 절약). dynamic project_target
+        # 호출은 봇에선 비활성 — 1초 budget 보호. 약간의 정확도 손실 < 시간 초과.
+        inbound_to_target = {}   # dst_pid → list[(fleet_owner, fleet_ships, eta)]
+        for f in fleets:
+            dpid, eta = fleet_dst_and_eta(f, planets, av=av, pos_cache=cache)
+            if dpid != -1:
+                inbound_to_target.setdefault(dpid, []).append((f.owner, f.ships, eta))
+
         # 후보 enumerate — (src, dst) 모든 쌍.
         # mask 영역 (sun cross / ships_needed==0 / required==None) 통과한 것만.
         candidates = []  # list of dict
@@ -136,20 +146,28 @@ class GreedyExpandSupportBot:
                 if crosses_sun(src.x, src.y, dst.x, dst.y):
                     continue
 
+                inbound = inbound_to_target.get(dst.id, ())
+
                 if dst.owner == player:
-                    # support 후보: 도착 시점 위협이 있을 때만 의미.
-                    angle, tx, ty, eta = aim(src, dst, av, max(1, src.ships),
-                                              pos_cache=cache)
-                    proj_owner, proj_ships = project_target_at_eta(
-                        dst, eta, planets, fleets, av=av, pos_cache=cache,
-                    )
-                    if proj_owner == player and proj_ships >= dst.ships:
-                        # 보강 불필요 (이미 안전).
+                    # support 후보: 적 inbound 있을 때만 의미.
+                    enemy_in = sum(s for o, s, _ in inbound if o != player)
+                    if enemy_in <= 0:
                         continue
+                    ally_in  = sum(s for o, s, _ in inbound if o == player)
+                    # 도착 시 net = my_garrison + ally_in - enemy_in (eta-aware production
+                    # 까지 정확히 안 잡지만, 휴리스틱 보강 의도에 충분).
+                    net = dst.ships + ally_in - enemy_in
+                    if net >= dst.ships:
+                        continue   # 이미 충분.
+                    proj_owner = player if net > 0 else (
+                        max(((s, o) for o, s, _ in inbound if o != player),
+                            default=(0, -1))[1]
+                    )
+                    proj_ships = abs(net) if net > 0 else (enemy_in - dst.ships)
                     required = compute_support_required(src, dst, proj_owner,
                                                          proj_ships, player)
                     if required is None:
-                        continue   # source cap 초과 → mask 차단.
+                        continue
                     ships, angle, tx, ty, eta, _req = resolve_ships_for_support(
                         src, dst, av, bin_value=1.0,
                         src_ships=src.ships, required=required,
@@ -162,14 +180,25 @@ class GreedyExpandSupportBot:
                         "ships": ships, "eta": eta, "is_support": True,
                     })
                 else:
-                    # capture 후보 — neutral / enemy 공통.
-                    ships, angle, tx, ty, eta, required, conv = resolve_ships_for_capture(
+                    # capture 후보 — static path (resolve 가 fleets=None 이면 내부적으로
+                    # dst.ships + prod*eta + 1 공식 사용). 같은-적 inbound 의 합은
+                    # 도착 시 garrison 에 더해질 거라 required 에 가산해서 보정.
+                    same_owner_in = sum(s for o, s, _ in inbound if o == dst.owner)
+                    ships, angle, tx, ty, eta, required, _ = resolve_ships_for_capture(
                         src, dst, av, bin_value=1.0,
                         src_ships=src.ships,
-                        pos_cache=cache, fleets=fleets, planets=planets,
+                        pos_cache=cache,
+                        fleets=None, planets=None,
                     )
                     if ships <= 0 or required <= 0:
-                        continue   # capacity short / 도착 시 이미 내 거.
+                        continue
+                    if same_owner_in > 0:
+                        # 보정: 적 같은편 보강 도착하면 더 많이 필요. src 부족하면 폐기.
+                        adj_required = required + same_owner_in
+                        if adj_required > src.ships - 1:
+                            continue
+                        ships = max(ships, adj_required)
+                        required = adj_required
                     candidates.append({
                         "src": src, "dst": dst, "angle": angle,
                         "ships": ships, "eta": eta, "is_support": False,
