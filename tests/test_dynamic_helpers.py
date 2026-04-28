@@ -43,10 +43,11 @@ def test_no_fleets_only_production():
 
 def test_self_fleet_reinforces_owner():
     """같은 owner fleet 도착 → 함선 +."""
-    target = _planet(0, owner=1, x=50.0, y=50.0, ships=10, production=0)
-    src    = _planet(99, owner=1, x=10.0, y=50.0, ships=0)
-    # fleet at (15, 50) angle=0 (east) → planet 0 방향
-    fleet  = _fleet(0, owner=1, x=15.0, y=50.0, angle=0.0, ships=20, from_pid=99)
+    # y=20 — sun(50,50) 안 가로지르는 위치 (행성이 sun 위에 있을 수 없으므로).
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=10, production=0)
+    src    = _planet(99, owner=1, x=10.0, y=20.0, ships=0)
+    # fleet at (15, 20) angle=0 (east) → planet 0 방향
+    fleet  = _fleet(0, owner=1, x=15.0, y=20.0, angle=0.0, ships=20, from_pid=99)
     proj_owner, proj_ships = project_target_at_eta(
         target, eta=30, planets=[target, src], fleets=[fleet],
     )
@@ -57,9 +58,9 @@ def test_self_fleet_reinforces_owner():
 
 def test_enemy_fleet_captures_when_overwhelming():
     """적 fleet 의 ships > defender → 점령 swap."""
-    target = _planet(0, owner=1, x=50.0, y=50.0, ships=5, production=0)
-    src    = _planet(99, owner=0, x=10.0, y=50.0, ships=0)
-    fleet  = _fleet(0, owner=0, x=15.0, y=50.0, angle=0.0, ships=20, from_pid=99)
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=5, production=0)
+    src    = _planet(99, owner=0, x=10.0, y=20.0, ships=0)
+    fleet  = _fleet(0, owner=0, x=15.0, y=20.0, angle=0.0, ships=20, from_pid=99)
     proj_owner, proj_ships = project_target_at_eta(
         target, eta=30, planets=[target, src], fleets=[fleet],
     )
@@ -69,9 +70,9 @@ def test_enemy_fleet_captures_when_overwhelming():
 
 def test_enemy_fleet_attack_repelled_when_undermanned():
     """적 fleet 의 ships ≤ defender → 점령 실패, owner 유지."""
-    target = _planet(0, owner=1, x=50.0, y=50.0, ships=50, production=0)
-    src    = _planet(99, owner=0, x=10.0, y=50.0, ships=0)
-    fleet  = _fleet(0, owner=0, x=15.0, y=50.0, angle=0.0, ships=20, from_pid=99)
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=50, production=0)
+    src    = _planet(99, owner=0, x=10.0, y=20.0, ships=0)
+    fleet  = _fleet(0, owner=0, x=15.0, y=20.0, angle=0.0, ships=20, from_pid=99)
     proj_owner, proj_ships = project_target_at_eta(
         target, eta=30, planets=[target, src], fleets=[fleet],
     )
@@ -103,8 +104,8 @@ def test_fleet_after_eta_ignored():
 
 def test_fleet_dst_and_eta_basic():
     """ray-cast 가 첫 충돌 행성 + 도착 turn 반환."""
-    p = _planet(7, x=80.0, y=50.0)
-    f = _fleet(0, owner=0, x=15.0, y=50.0, angle=0.0, ships=10)
+    p = _planet(7, x=80.0, y=20.0)
+    f = _fleet(0, owner=0, x=15.0, y=20.0, angle=0.0, ships=10)
     dst_pid, eta = fleet_dst_and_eta(f, [p])
     assert dst_pid == 7
     assert eta >= 1   # 도착 시간 양수

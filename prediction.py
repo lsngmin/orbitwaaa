@@ -238,9 +238,7 @@ def fleet_dst_and_eta(fleet, planets, radius_margin=1.5):
     ⚠️ 한계 (project_target_at_eta 가 결과를 그대로 신뢰):
       - radius_margin=1.5: 엔진 정확 radius 보다 lenient → over-predict
         (실제로 빗맞을 fleet 도 도착 대상에 포함될 수 있음).
-      - 태양 통과 미체크: 태양 너머 행성을 hit 으로 잡음
-        (실제 엔진은 sun cross 시 fleet 소멸).
-      - 보드 밖 미체크: 100x100 밖으로 나가는 ray 도 hit 으로 잡음.
+        [의도적 — encoder dst_idx parity 유지용. 손대지 말 것.]
       - 행성 공전 진행 미반영: target 의 현재 위치만으로 ray-cast.
         비행 중 target 이 자전해서 빗나가는 케이스 못 봄.
         정확한 ETA 가 필요하면 aim() 사용.
@@ -261,6 +259,10 @@ def fleet_dst_and_eta(fleet, planets, radius_margin=1.5):
         cy = fleet.y + t * dy
         if math.hypot(cx - p.x, cy - p.y) > p.radius * radius_margin:
             continue
+        # A1: 경로가 sun 통과하면 fleet 은 도달 전 소멸 (GAME_RULES "Fleet Movement").
+        # 엔진 정확 일치 위해 SUN_RADIUS 명시 (default 10.5 는 mask 보수성용).
+        if crosses_sun(fleet.x, fleet.y, cx, cy, sun_radius=SUN_RADIUS):
+            continue
         if t < first_t:
             first_t = t
             dst_pid = p.id
@@ -278,19 +280,15 @@ def project_target_at_eta(target, eta, planets, fleets):
     "freeze" 가정 외부 — 이 함수는 obs 에 보이는 사실만 사용 (적이 새로 안 쏠
     거라는 가정은 호출자 수준의 한계이지 이 함수의 한계가 아님).
 
-    production 은 owner 무관하게 누적 (기존 required_ships 공식과 동일 동작).
-    점령 swap 발생 시 sim_owner 갱신, defender 함선 0 미만 안 되도록 클램핑.
+    production 은 sim_owner != -1 구간에만 누적 (GAME_RULES "Production":
+    owned planet 만 함선 생성). 점령 swap 발생 시 sim_owner 갱신, defender
+    함선 0 미만 안 되도록 클램핑.
 
-    ⚠️ GAME_RULES 와 다른 점:
-      1. Combat 처리: 같은 ETA 에 서로 다른 owner fleet 이 여럿 도착할 때
-         GAME_RULES "Combat" 은 "largest vs second largest 먼저 → 잔존이
-         garrison 과 전투". 이 함수는 시간순 1:1 처리 → 4P 게임 동시 도착
-         부정확. (2P 게임에선 적이 1명이라 영향 미미.)
-      2. 중립 production: GAME_RULES 상 owned planet (owner ∈ 0..3) 만 production
-         발동. 이 함수는 sim_owner 무관하게 누적 → 중립 target 의 proj_ships 가
-         실제보다 (production × turns) 만큼 과대 → required 과대 → 의미 있는
-         capture 가 mask 에서 차단될 수 있음.
-         (의도적 — 기존 공식 호환. 정정하려면 sim_owner==-1 구간 production=0.)
+    ⚠️ GAME_RULES 와 다른 점 (남은 한계):
+      Combat 처리: 같은 ETA 에 서로 다른 owner fleet 이 여럿 도착할 때
+      GAME_RULES "Combat" 은 "largest vs second largest 먼저 → 잔존이
+      garrison 과 전투". 이 함수는 시간순 1:1 처리 → 4P 게임 동시 도착
+      부정확. (2P 게임에선 적이 1명이라 영향 미미.)
 
     Args:
         target:   Planet — 시뮬 대상
@@ -313,7 +311,9 @@ def project_target_at_eta(target, eta, planets, fleets):
 
     last_t = 0
     for arrive_t, f in arrivals:
-        sim_ships += target.production * (arrive_t - last_t)
+        # A3: 중립(owner=-1) 구간엔 production 없음 (GAME_RULES).
+        if sim_owner != -1:
+            sim_ships += target.production * (arrive_t - last_t)
         if f.owner == sim_owner:
             sim_ships += f.ships
         else:
@@ -324,7 +324,8 @@ def project_target_at_eta(target, eta, planets, fleets):
                 sim_ships -= f.ships
         last_t = arrive_t
 
-    sim_ships += target.production * (eta - last_t)
+    if sim_owner != -1:
+        sim_ships += target.production * (eta - last_t)
     return sim_owner, sim_ships
 
 
@@ -432,10 +433,9 @@ def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
                 # 도착 시점에 이미 내 거 — 점령 의미 없음 (호출자가 mask off)
                 return 0
             return max(1, int(proj_ships) + 1)
-        # ⚠️ static fallback — project_target_at_eta 와 동일한 중립 production 버그.
-        # GAME_RULES 상 중립(owner=-1) 은 production 안 됨. 여기선 dst.owner 무관하게
-        # production 을 누적 → 중립 target 의 required 가 (production × turns) 만큼
-        # 과대 추정. 정정하려면 dst.owner == -1 일 때 production 항 빼기.
+        # A4: static fallback — 중립(owner=-1) 은 production 없음 (GAME_RULES).
+        if dst.owner == -1:
+            return dst.ships + 1
         return dst.ships + dst.production * eff_turns + 1
 
     def _send_for(req):
