@@ -832,7 +832,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     #     evaluate_actions 시 _gather_amount_features 의 4D pass-through 분기 탐.
     pair_feat_list, amount_feat_list = [], []
     hit_tracker = HitRateTracker()
-    sum_dense = sum_cap = sum_terminal = 0.0
+    sum_dense = sum_terminal = 0.0
+    # cap_bonus 분리: gain (중립 → 내것) / loss (내것 → 잃음).
+    # CSV mean_cap_bonus 는 둘의 합으로 deprecated 유지.
+    sum_neutral_capture_bonus  = 0.0
+    sum_own_planet_loss_penalty = 0.0
     sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
     sum_over_send_penalty = 0.0   # 다중 source 협조 실패 페널티 (음수 누적)
     sum_under_invested_penalty = 0.0   # capacity-short launch 시도 페널티 (음수 누적)
@@ -983,7 +987,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             prev_score = curr_score
 
             sum_dense                  += breakdown.dense
-            sum_cap                    += breakdown.cap_bonus
+            sum_neutral_capture_bonus  += breakdown.neutral_capture_bonus
+            sum_own_planet_loss_penalty += breakdown.own_planet_loss_penalty
             sum_all_in_penalty         += breakdown.all_in_penalty
             sum_over_send_penalty      += breakdown.over_send_penalty
             sum_under_invested_penalty += breakdown.under_invested_penalty
@@ -1089,7 +1094,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "n_steps":      hit_tracker.n_steps,
         "episodes":     hit_tracker.episodes,
         "sum_dense":    sum_dense,
-        "sum_cap":      sum_cap,
+        "sum_neutral_capture_bonus":  sum_neutral_capture_bonus,
+        "sum_own_planet_loss_penalty": sum_own_planet_loss_penalty,
         "sum_all_in_penalty": sum_all_in_penalty,
         "sum_over_send_penalty": sum_over_send_penalty,
         "sum_under_invested_penalty": sum_under_invested_penalty,
@@ -1174,7 +1180,9 @@ def _finalize_reward_stats(raw_list):
     total_counters = defaultdict(float)
     total_n_steps = 0
     total_episodes = 0
-    total_dense = total_cap = total_terminal = 0.0
+    total_dense = total_terminal = 0.0
+    total_neutral_capture_bonus  = 0.0
+    total_own_planet_loss_penalty = 0.0
     total_all_in_penalty = 0.0
     total_over_send_penalty = 0.0
     total_under_invested_penalty = 0.0
@@ -1199,7 +1207,8 @@ def _finalize_reward_stats(raw_list):
         total_n_steps  += r["n_steps"]
         total_episodes += r["episodes"]
         total_dense    += r["sum_dense"]
-        total_cap      += r["sum_cap"]
+        total_neutral_capture_bonus  += r.get("sum_neutral_capture_bonus", 0.0)
+        total_own_planet_loss_penalty += r.get("sum_own_planet_loss_penalty", 0.0)
         total_all_in_penalty += r.get("sum_all_in_penalty", 0.0)
         total_over_send_penalty += r.get("sum_over_send_penalty", 0.0)
         total_under_invested_penalty += r.get("sum_under_invested_penalty", 0.0)
@@ -1234,7 +1243,10 @@ def _finalize_reward_stats(raw_list):
     )
     steps_safe = max(total_n_steps, 1)
     stats["mean_dense"]    = total_dense    / steps_safe
-    stats["mean_cap"]      = total_cap      / steps_safe
+    # cap_bonus 분리 (gain/loss). mean_cap (deprecated) = 둘의 합 — 옛 로그와의 추세 비교용.
+    stats["mean_neutral_capture_bonus"]  = total_neutral_capture_bonus  / steps_safe
+    stats["mean_own_planet_loss_penalty"] = total_own_planet_loss_penalty / steps_safe
+    stats["mean_cap"]      = stats["mean_neutral_capture_bonus"] + stats["mean_own_planet_loss_penalty"]
     stats["mean_terminal"] = total_terminal / steps_safe
     # Sprint 2: per-step all-in launch penalty (음수). all_in_penalty=0 이면 0.
     stats["mean_all_in_penalty"] = total_all_in_penalty / steps_safe
@@ -2016,6 +2028,10 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 # rollout 내 승률 (on-policy, noisy지만 match_type별로 분포별 성능 확인 가능).
                 win_rate=rew_stats.get("win_rate", 0.0),
                 mean_dense_rew=rew_stats["mean_dense"],
+                # 분리 후 (정식 컬럼).
+                mean_neutral_capture_bonus=rew_stats["mean_neutral_capture_bonus"],
+                mean_own_planet_loss_penalty=rew_stats["mean_own_planet_loss_penalty"],
+                # Deprecated: 옛 로그 추세 비교용. = neutral_capture_bonus + own_planet_loss_penalty.
                 mean_cap_bonus=rew_stats["mean_cap"],
                 mean_terminal_rew=rew_stats["mean_terminal"],
                 # Sprint 2: 발사 시 자원 보존 페널티 (음수). all_in_penalty=0 이면 0.

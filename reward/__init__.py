@@ -132,13 +132,18 @@ RewardContext 필드 규약
 RewardBreakdown 필드 규약
 
 CSV / log 이름과 최대한 일치시킨다 (utils/logger.py).
-    breakdown.dense                  ↔ mean_dense_rew
-    breakdown.cap_bonus              ↔ mean_cap_bonus
-    breakdown.terminal               ↔ mean_terminal_rew
-    breakdown.all_in_penalty         ↔ mean_all_in_penalty
-    breakdown.over_send_penalty      ↔ mean_over_send_penalty
-    breakdown.launch_cost_penalty    ↔ mean_launch_cost_penalty
-    breakdown.under_invested_penalty ↔ mean_under_invested_penalty
+    breakdown.dense                   ↔ mean_dense_rew
+    breakdown.neutral_capture_bonus   ↔ mean_neutral_capture_bonus
+    breakdown.own_planet_loss_penalty ↔ mean_own_planet_loss_penalty
+    breakdown.terminal                ↔ mean_terminal_rew
+    breakdown.all_in_penalty          ↔ mean_all_in_penalty
+    breakdown.over_send_penalty       ↔ mean_over_send_penalty
+    breakdown.launch_cost_penalty     ↔ mean_launch_cost_penalty
+    breakdown.under_invested_penalty  ↔ mean_under_invested_penalty
+
+Deprecated compatibility 컬럼:
+    mean_cap_bonus = mean_neutral_capture_bonus + mean_own_planet_loss_penalty
+    (분리 전 옛 로그와의 추세 비교용. 새 분석은 분리된 두 값을 직접 본다.)
 
 새 component 추가 시 동기화 필수:
     1. components.py: 함수 정의 + COMPONENTS 튜플 등록
@@ -206,15 +211,21 @@ def post_capture_reloss_penalty(ctx: RewardContext) -> float:
 ────────────────────────────────────────────────────────────────────────────
 현재 components (reward/components.py, COMPONENTS 순서)
 
-    dense_reward             # Δstate_score × dense_coef
-    neutral_capture_bonus    # 중립 → 내것 (early_boost) / 내것 → 잃음
-    all_in_penalty           # source 80%+ 비우는 발사
-    over_send_penalty        # target 별 Σships - required 초과분
-    under_invested_penalty   # src.ships < required 발사 시도
-    launch_cost_penalty      # max(0, req/src - 0.5) 합계 (Phase B continuous)
-    terminal_reward          # ±terminal_win_reward / 0
+    dense_reward              # Δstate_score × dense_coef
+    neutral_capture_bonus     # 중립 → 내것 (gain only, early_boost)
+    own_planet_loss_penalty   # 내것 → 잃음 (loss only, no early_boost)
+    all_in_penalty            # source 80%+ 비우는 발사
+    over_send_penalty         # target 별 Σships - required 초과분
+    under_invested_penalty    # src.ships < required 발사 시도
+    launch_cost_penalty       # max(0, req/src - 0.5) 합계 (Phase B continuous)
+    terminal_reward           # ±terminal_win_reward / 0
 
 순서 자체는 reward 합산에 영향 없음 (덧셈 교환). 진단 / breakdown 출력 순서 용도.
+
+neutral_capture_bonus 와 own_planet_loss_penalty 는 의도적으로 분리:
+    - 같은 "행성 소유권 transition" 이지만 게임 의미가 다름 (확장 강화 vs 방어 학습).
+    - early_boost 적용 비대칭 (gain 만 amplify, loss 는 phase 무관).
+    - 별도 계수 (cap_gain_coef / cap_loss_coef) 로 ablation 가능.
 
 ────────────────────────────────────────────────────────────────────────────
 최종 규칙 한 줄
@@ -269,13 +280,14 @@ class RewardBreakdown:
     """Step 단위 reward component 분해. .total 이 PPO 가 받는 단일 스칼라.
 
     필드명은 component 함수명을 의미적으로 축약 (dense_reward → dense,
-    neutral_capture_bonus → cap_bonus, terminal_reward → terminal).
+    terminal_reward → terminal). 그 외엔 component 함수명과 동일.
 
     CSV 컬럼과의 매핑 / 동기화 규약은 모듈 docstring 의
     "RewardBreakdown 필드 규약" 참조.
     """
     dense: float = 0.0
-    cap_bonus: float = 0.0
+    neutral_capture_bonus: float = 0.0
+    own_planet_loss_penalty: float = 0.0
     all_in_penalty: float = 0.0
     over_send_penalty: float = 0.0
     under_invested_penalty: float = 0.0
@@ -286,7 +298,8 @@ class RewardBreakdown:
     def total(self) -> float:
         return (
             self.dense
-            + self.cap_bonus
+            + self.neutral_capture_bonus
+            + self.own_planet_loss_penalty
             + self.all_in_penalty
             + self.over_send_penalty
             + self.under_invested_penalty
@@ -298,6 +311,7 @@ class RewardBreakdown:
 from reward.components import (
     dense_reward,
     neutral_capture_bonus,
+    own_planet_loss_penalty,
     all_in_penalty,
     over_send_penalty,
     under_invested_penalty,
@@ -313,6 +327,7 @@ __all__ = [
     "RewardBreakdown",
     "dense_reward",
     "neutral_capture_bonus",
+    "own_planet_loss_penalty",
     "all_in_penalty",
     "over_send_penalty",
     "under_invested_penalty",
