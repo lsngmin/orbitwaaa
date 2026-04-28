@@ -329,21 +329,28 @@ advantage normalization 은 **mode 별 별도 running stats** (2p / 4p episode �
 - **[aux]** RL reward 아닌 supervised loss.
 
 ```text
-[현] 현재 stateless reward (8개 — gain/loss 분리 후 기준)
+[현] 현재 COMPONENTS 튜플 (총 9개, 2026-04-28 기준)
+  ── stateless (8개) — components.py 한 함수당 한 step 입력만 사용
   dense_reward                           정책 8 (production share advantage)
-  neutral_capture_bonus                  정책 1 (gain)
-  own_planet_loss_penalty                정책 4 (loss)
+  neutral_capture_bonus                  정책 1 (gain — neutral → me)
+  own_planet_loss_penalty                정책 4 (loss — me → other)
   all_in_penalty (weak)                  정책 3
   over_send_penalty (weak)               정책 3 / 6
   under_invested_penalty (weak)          정책 3
   launch_cost_penalty (weak)             정책 3
   terminal_reward                        승리
 
-[단] 단기 후보 (Phase 2 — 현재 병목과 직결)
-  early_close_neutral_capture_bonus      정책 1 (현 neutral_capture 의 거리·early 가중판)
-  post_capture_reloss_penalty            정책 5 (현 own_loss 의 "갓 잡은 행성" 가중판)
-  capture_hold_bonus                     정책 5
-  support_defense_bonus                  정책 4 (support 가 실제 enemy fleet 막은 결과)
+  ── event-consuming (1개) — ctx.capture_events 소비, trackers 가 launch→capture 매칭
+  early_close_neutral_capture_bonus      정책 1 (early 0.25 + nearest_rank ≤ 1
+                                          + req/src ≤ 0.5 자격 launch 가 capture 로
+                                          이어졌을 때 prod-가중 보너스, coef 0.007 활성)
+
+[단] 단기 후보 (Phase 2 — 현재 병목과 직결, 모두 event-consuming 으로 구현 권장)
+  post_capture_reloss_penalty            정책 5 (own_loss 의 "갓 잡은 행성" 가중판
+                                          — capture_event 의 age 기반)
+  capture_hold_bonus                     정책 5 (capture 후 K턴 hold 성공)
+  support_defense_bonus                  정책 4 (support launch 가 실제 enemy
+                                          incoming 을 막은 결과 — support→defense 매칭 필요)
   reinforce_young_planet_bonus           정책 4 / B4 vacuum 대응
 
 [장] 장기 후보 (Phase 4·5 이후)
@@ -585,19 +592,28 @@ mirror 만 돌리면 자기 정책 corner 에 갇힘.
 15.2.x 의 보완을 시작하기 전에, 직전 리팩토링 (5게이트 mask + support-mode + reward gain/loss 분리) 이 정말 정착했는지 확인. 새 설계로 넘어가기 전에 *지금 고친 게 깨지지 않았는지* 가 우선.
 
 ```
-- 5게이트 hard mask + support-mode 가드 검증
+[완료된 항목 — 진행 중 검증]
+  · 5게이트 hard mask + support-mode 가드 정착
+  · cap_bonus → neutral_capture_bonus / own_planet_loss_penalty 분리
+  · reward/events.py + reward/trackers.py 파이프 (LaunchMetadata,
+    CaptureEvent, LaunchCaptureTracker — 30턴 window, target_id 매칭)
+  · early_close_neutral_capture_bonus (event-consuming) 0.007 활성
+    — capture_events 의 첫 소비자, 파이프 동작 검증대 역할
+
+[잔여 검증 — 5~10 gen 안정성 확인]
   · mean_filtered_invalid_target ≈ 0 유지
   · support_launches_per_step > 0 (방어 행동 자체는 일어남)
-- gain/loss 분리 reward parity 유지
-  · 분리 전후 win_rate ±1σ 이내
-- 회복 지표
-  · early_neutral_captured_per_episode ≥ 1.0
+  · 분리 전후 win_rate ±1σ 이내 (gain/loss + early_close 추가의 parity)
+  · early_neutral_captured_per_episode ≥ 1.0 회복
   · capture_hold_k_rate 추세 ↑
   · post_capture_reloss_rate_k 추세 ↓
-- 5~10 gen 후 위 5개가 모두 안정이면 Phase 0 진입
+  · linked_launches_per_capture_neutral / _enemy 의 분포 sanity
+    (window 30턴 이 너무 길/짧으면 multiplicity 가 비정상)
+  · early_close_* 의 trigger rate (너무 자주 → coef 과다, 너무 드뭄 → threshold 재조정)
+- 위 8개가 모두 안정이면 Phase 0 진입
 ```
 
-**게임 성능 (예상)**: "본진 안 비우는 안정형 그리디". 가까운 중립을 빠르게 확보하고, 본진에 적이 들어올 때만 짧게 support 하며, 갓 잡은 행성을 즉시 잃는 빈도가 줄어든 *기본기 봇*. 동시 도착·연합 공격·king-maker 같은 상위 정책은 아직 없음.
+**게임 성능 (현재)**: "본진 안 비우는 안정형 그리디 + 초반 가까운 중립 우선 가산". 가까운 중립을 빠르게 확보 (early_close 가 그 행동을 prod-가중으로 보상), 본진에 적이 들어올 때만 짧게 support, 갓 잡은 행성을 즉시 잃는 빈도가 줄어든 *기본기 봇*. 동시 도착·연합 공격·king-maker 같은 상위 정책은 아직 없음.
 
 ### Phase 0 — 인프라 / 측정 / 환경 audit (코드 기반 다지기)
 
@@ -677,13 +693,19 @@ mirror 만 돌리면 자기 정책 corner 에 갇힘.
 
 현재 병목 (초반 확장 / hold / reloss / support) 이 직접 신호이고, denial/race 는 그 다음. 따라서 plan 원안의 순서를 **단기 catalog → 장기 catalog** 로 바꾼다 (사용자 지적 반영).
 
+`early_close_neutral_capture_bonus` 는 Phase -1 단계에서 이미 도입·활성 (0.007). Phase 2.1 의 잔여 4개는 모두 같은 events/trackers 파이프를 재사용 (post_capture_reloss·capture_hold 는 capture_event.age 기반, support_defense·reinforce_young 은 별도 SupportDefenseTracker 가 필요할 수 있음).
+
 ```
-2.1 단기 [단] catalog (Phase 1 의 표현이 차이를 만든다는 가정 위에)
-  - early_close_neutral_capture_bonus 미세 조정 (정책 1)
-  - post_capture_reloss_penalty (정책 5, 현 own_loss 의 가중판)
-  - capture_hold_bonus (정책 5)
-  - support_defense_bonus (정책 4, support 가 실제로 막은 결과만)
-  - reinforce_young_planet_bonus (정책 4 / B4)
+[Phase -1 단계에서 이미 도입]
+  ✓ early_close_neutral_capture_bonus (정책 1, 활성 0.007)
+  ✓ neutral_capture / own_planet_loss 분리
+
+2.1 단기 [단] catalog (잔여 4개 — Phase 1 의 표현이 차이를 만든다는 가정 위에)
+  - post_capture_reloss_penalty (정책 5, capture_event.age ≤ N 일 때 own_loss 가중)
+  - capture_hold_bonus (정책 5, capture 후 K턴 hold 성공 시)
+  - support_defense_bonus (정책 4, support launch 가 실제 적 incoming 막은 결과만
+    — 새 SupportDefenseTracker 또는 LaunchCaptureTracker 의 변형 필요)
+  - reinforce_young_planet_bonus (정책 4 / B4 vacuum 대응)
 
 2.2 장기 [장] catalog (단기 axis metric 안정 후)
   - denial_bonus (정책 11)
@@ -815,22 +837,22 @@ opponent_pred aux 가 RL loss 를 압도하지 않도록 weight 0.1~0.3.
 
 ### 15.1 현 코드 진단 (Plan 대비 위치)
 
-현재 `main` 코드를 plan 의 각 장과 비교하면 사실상 **Phase A 기준선**이다. 즉 plan 의 1~6 phase 모두가 미착수.
+현재 `main` 코드를 plan 의 각 장과 비교하면 **Phase A 기준선 + Phase -1 의 일부 진척** (events/trackers 파이프 + 첫 event-consuming component 활성). 단 Phase 1 ~ 6 의 본격 항목들 (encoder 변경, multi-source, 4p 등) 은 모두 미착수.
 
 | 영역 | 현 상태 | Plan 목표 | 갭 |
 |---|---|---|---|
 | Mask (`mask/`) | 5게이트 hard mask 정렬됨 (`target_owner_allowed, flight_path_clear, projected_arrival_state, attack_still_needed, capacity_sufficient`). attack/support parity 정렬, invalid target 차단. 단 support target 은 *enemy_incoming OR required + 35% cap* guard — hard invalid 가 아닌 **action-space guard**. | 장기적으로 hard-invalid-only + own_loss / support_defense reward 가 가드를 대체 | **구조는 안정, 철학 일부 불일치** (작음) |
-| Reward (`reward/components.py`) | 7 component (`dense, neutral_capture, all_in, over_send, under_invested, launch_cost, terminal`) | ~20+ component, ranking/race/denial/coordinated 추가, 4p 모드별 분리 | **큼** |
+| Reward (`reward/components.py`) | **9 component** — stateless 8개 (`dense, neutral_capture, own_planet_loss, all_in, over_send, under_invested, launch_cost, terminal`) + **event-consuming 1개** (`early_close_neutral_capture_bonus`, coef 0.007 활성). gain/loss 분리 + capture_events 첫 소비자 정착. | ~20+ component, ranking/race/denial/coordinated 추가, 4p 모드별 분리 | **큼** (단, 단기 catalog 의 첫 한 칸은 채워짐) |
 | Feature/Encoder (`model.py`) | snapshot + HISTORY=20 temporal, planet/fleet MLP+attention | arrival_schedule, multi-relation graph attn (5종), per-opponent encoder, player_count embed, future rollout sim | **매우 큼** |
 | Architecture (`model.py`) | single-source decoder, 단일 critic, cost-bias MLP (Phase A) | multi-source coord decoder, aux opponent_pred head, 2p/4p 분기 head, FiLM mode gate | **매우 큼** |
 | Action space | one-launch-per-turn, 이산 ship multiplier | multi-source set per turn, 연속 fraction head | **큼** |
 | League (`train.py LeaguePool`) | snapshot rotation only | rule-bot 4종 의무 편성, sibling reward seed, 2p/4p curriculum, role-asymmetric 4p match | **매우 큼** |
-| Logger (`utils/logger.py`) | ~140 컬럼, 정책 1/4/5/6 만 부분 검증 | 정책 1~16 전체 검증 metric, 4p rank dist | **중간** (절반) |
+| Logger (`utils/logger.py`) | ~140+ 컬럼, 정책 1/4/5/6 부분 검증. 신규: `mean_neutral_capture_bonus`, `mean_own_planet_loss_penalty`, `mean_early_close_neutral_capture_bonus`, `linked_launches_per_capture_{neutral,enemy}` (정책 6 multiplicity). | 정책 1~16 전체 검증 metric, 4p rank dist | **중간** (절반, 정책 6 multiplicity 는 새로 활성) |
 | Eval | 2p win_rate 기반, fixed-seed pool 없음 | fixed-seed eval matrix (rule-bot/sibling/snapshot-N), 4p rank distribution | **큼** |
 | Player-count 분기 | 없음 (Kaggle 2p 전제 단일 코드) | 2p/4p 별 head·normalizer·env·league·reward·eval 모두 분리 | **결정적** (4p 인프라 0%) |
-| Stateful event infra | `HitRateTracker` (진단 전용) | `events.py / trackers.py` 기반 reward 컴포넌트 | **중간** (인프라는 있고 reward 연결만 부재) |
+| Stateful event infra | **활성화됨**. `reward/events.py` (LaunchMetadata, CaptureEvent — `linked_launches` 포함), `reward/trackers.py` (LaunchCaptureTracker, 30턴 window, owner-change 감지 + target_id 매칭). `early_close_neutral_capture_bonus` 가 `ctx.capture_events` 첫 소비자. 별도 `HitRateTracker` 는 진단 전용 그대로. | 다수의 event-consuming component (post_capture_reloss, capture_hold, support_defense …) 가 같은 파이프 사용 | **작음** (파이프 정착, 추가 소비자만 늘리면 됨) |
 
-요약: **mask 는 구조적으로 정렬됨 (philosophy 는 plan 의 hard-invalid-only 와 일부 불일치, support target guard 가 잔존)**, 나머지 9개 영역은 미착수. 4인전은 환경부터 0%.
+요약: **mask 정렬 + reward 파이프 (events/trackers) 정착 + 첫 event-consuming component (early_close) 활성**. 그 외 7개 영역 (encoder, architecture, action, league, eval, player-count, 단기 reward catalog 잔여 4개) 은 미착수. 4인전은 환경부터 0%.
 
 ### 15.2 청사진의 단점 + 보완
 
@@ -937,6 +959,15 @@ PPO buffer 는 step 당 (s, a, log_prob, advantage) 가정. multi-source 면 ste
 [보류 — 별도 turn]
 - 13.8 encoder swap curriculum 본문 추가는 Phase 1c 직전에 작성 (지금은 15.2.8 에 의도만 기록)
 - 2.2.1 source_opportunity_cost 식 정정 — 사용자 지적 (현 식의 ships_sent × prod_rate 가 의미 모호) 은 별도 turn 에 정리
+
+[코드↔doc 재정렬 (2회차) — 2026-04-28 후반]
+main 에 `0271820 → dae0af4 → 2a20954 → 3bca09e → 5cb59cc` 5개 커밋이 들어왔고
+(reward/ 패키지 + cap_bonus 분리 + events.py/trackers.py + early_close_neutral_capture_bonus + 활성화 0.007),
+이를 doc 에 반영:
+  - 7.3 [현] 카탈로그를 8 → 9 로 갱신, stateless 8 + event-consuming 1 분류 신설
+  - 15.1 reward / event infra / logger 행 갱신 — events/trackers 파이프 활성화 + early_close 가 첫 소비자
+  - Phase -1 의 "완료된 항목" 명시 (events 파이프 정착 + early_close 활성)
+  - Phase 2.1 단기 catalog 에서 early_close 빼고 잔여 4개로 축소
 ```
 
 이 변경은 **plan 의 야심을 줄이지 않으면서 phase 단위 회귀 위험을 제어** 하기 위한 것이다.
