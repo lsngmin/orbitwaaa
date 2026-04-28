@@ -333,3 +333,57 @@ def test_empty_prev_map_zero_in_both():
     )
     assert neutral_capture_bonus(ctx) == 0.0
     assert own_planet_loss_penalty(ctx) == 0.0
+
+
+# ── B 단계 — capture_events parity ────────────────────────────────────────────
+#
+# B 도입 후에도 어떤 component 도 ctx.capture_events 를 소비하지 않음.
+# 따라서 capture_events 가 비어있든 채워져 있든 reward 값은 동일해야 함 (parity).
+
+def test_capture_events_does_not_affect_existing_rewards():
+    """ctx.capture_events 가 채워져도 기존 component 의 출력은 변화 없음."""
+    from reward import LaunchMetadata, CaptureEvent
+
+    base_kwargs = dict(
+        prev_score=0.0, curr_score=1.0,
+        prev_map={0: (-1, 5)},
+        curr_obs=_obs([(0, 0, 0, 0, 0, 10, 5)]),
+        decode_counts={"all_in_launches": 1, "over_send_excess_sum": 2,
+                       "under_invested_count": 0, "launch_cost_excess_sum": 0.3},
+        turn_norm=0.0, ep_done=False, raw_terminal=0, player=0,
+        dense_coef=1.0,
+        all_in_penalty_coef=0.05, over_send_penalty_coef=0.02,
+        under_invested_penalty_coef=0.01, launch_cost_penalty_coef=0.04,
+        cap_gain_coef=0.10, cap_loss_coef=0.05, cap_early_multiplier=1.0,
+        terminal_win_reward=1.0,
+    )
+    ctx_empty = RewardContext(**base_kwargs)
+
+    fake_meta = LaunchMetadata(
+        turn=0, source_id=99, target_id=0, target_owner_at_launch=-1,
+        target_kind="attack", ships_sent=10, eta_turns=3,
+        req_over_src=0.5, req_over_prod=2.0,
+        nearest_neutral_rank=1, target_prod=5.0,
+    )
+    fake_event = CaptureEvent(
+        turn=1, planet_id=0, prev_owner=-1, new_owner=0,
+        target_prod=5.0, linked_launches=[fake_meta],
+    )
+    ctx_with_events = RewardContext(**base_kwargs, capture_events=[fake_event])
+
+    b_empty = compose_rewards(ctx_empty)
+    b_full  = compose_rewards(ctx_with_events)
+    assert b_empty.total == pytest.approx(b_full.total, abs=1e-12)
+    # field-by-field
+    for f in ("dense", "neutral_capture_bonus", "own_planet_loss_penalty",
+              "all_in_penalty", "over_send_penalty", "under_invested_penalty",
+              "launch_cost_penalty", "terminal"):
+        assert getattr(b_empty, f) == pytest.approx(getattr(b_full, f), abs=1e-12), (
+            f"field {f} 가 capture_events 에 영향받음 — B 단계 parity 위반"
+        )
+
+
+def test_capture_events_default_empty_list():
+    """RewardContext 기본값에 capture_events=[] 있어야 (현재 호출부 영향 없도록)."""
+    ctx = RewardContext()
+    assert ctx.capture_events == []

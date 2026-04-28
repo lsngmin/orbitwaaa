@@ -44,6 +44,8 @@ from prediction import (
 )
 from mask import MaskContext, build_target_mask, build_action_mask
 from reward import RewardContext, compose_rewards
+from reward.events import LaunchMetadata
+from reward.trackers import LaunchCaptureTracker
 
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 with open(_cfg_path) as f:
@@ -706,19 +708,13 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             req_over_src_lin = float(required) / float(p.ships)
             counts["launch_cost_excess_sum"] += max(0.0, req_over_src_lin - 0.5)
 
-        # 초반 중립 확장 진단: turn_norm < 0.25 AND target.owner == -1.
-        #   nearest_rank: src 에서 launchable 한 모든 중립을 ETA 오름차순 정렬,
-        #     선택한 target 의 순위. 1=가장 가까운 중립, 8=8번째로 가까운 중립.
-        #   eta_advantage: pair_features ch6, >0 = 적보다 빨리 도달.
-        # analysis 가 None 이면 pair_features 접근 불가 → skip.
-        EARLY_PHASE_THRESHOLD = 0.25
-        if (turn_norm < EARLY_PHASE_THRESHOLD
-                and target.owner == -1
-                and analysis is not None):
-            counts["early_neutral_count"] += 1
-            counts["early_neutral_eta_sum"] += float(turns) if turns else 1.0
-            counts["early_neutral_req_over_src_sum"] += float(required) / max(p.ships, 1)
-            # nearest_rank 산출: src=i 에서 launchable 한 중립들을 eta_norm (ch2) 으로 정렬.
+        # nearest_rank: src 에서 launchable 한 모든 중립을 ETA 오름차순 정렬,
+        #   선택한 target 의 순위. 1=가장 가까운, 0=계산 안 됨 (target 비중립 또는 analysis 없음).
+        # 분리 전엔 early_neutral 진단 블록 안에서만 계산했으나, B 단계에서 launches
+        # metadata (reward attribution 입력) 로도 쓰이므로 phase 무관 / 모든 중립 launch
+        # 에서 계산. early_neutral_nearest_rank_sum 누적은 분기 안에서 그대로 진행.
+        nearest_rank = 0
+        if target.owner == -1 and analysis is not None:
             pair_feats = analysis.pair_features_target  # (P, P, F_t)
             tmask_row = analysis.target_mask[i]          # (P,) bool
             candidates = []
@@ -727,12 +723,26 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                     eta_val = float(pair_feats[i, j, 2])  # ch2 = eta_norm
                     candidates.append((j, eta_val))
             candidates.sort(key=lambda x: x[1])
-            rank = next((idx + 1 for idx, (j, _) in enumerate(candidates)
-                         if j == target_idx), 0)
-            if rank > 0:
-                counts["early_neutral_nearest_rank_sum"] += rank
-            # eta_advantage = pair_features ch6.
-            counts["early_neutral_eta_advantage_sum"] += float(pair_feats[i, target_idx, 6])
+            nearest_rank = next((idx + 1 for idx, (j, _) in enumerate(candidates)
+                                 if j == target_idx), 0)
+
+        # 초반 중립 확장 진단: turn_norm < 0.25 AND target.owner == -1.
+        EARLY_PHASE_THRESHOLD = 0.25
+        if (turn_norm < EARLY_PHASE_THRESHOLD
+                and target.owner == -1
+                and analysis is not None):
+            counts["early_neutral_count"] += 1
+            counts["early_neutral_eta_sum"] += float(turns) if turns else 1.0
+            counts["early_neutral_req_over_src_sum"] += float(required) / max(p.ships, 1)
+            if nearest_rank > 0:
+                counts["early_neutral_nearest_rank_sum"] += nearest_rank
+            # eta_advantage = pair_features ch6, >0 = 적보다 빨리 도달.
+            counts["early_neutral_eta_advantage_sum"] += float(
+                analysis.pair_features_target[i, target_idx, 6]
+            )
+
+        # target_kind: support (자기 행성) / attack (그 외). Phase C 분기와 동일 의미.
+        target_kind = "support" if target.owner == acting_player else "attack"
 
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
@@ -742,7 +752,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             "target_id": target.id,
             "source_idx": i,                # planets[] index (eta_advantage lookup 용)
             "target_idx": target_idx,       # planets[] index
-            "target_owner": target.owner,   # -1: neutral, 그 외: 적 (우리는 self 마스킹됨)
+            "target_owner": target.owner,   # -1: neutral, 그 외: 적/자기
             "ships": ships_needed,
             "angle": angle,
             "start_x": start_x,
@@ -758,6 +768,16 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             "ships_bin": int(ships_bin),
             "src_prod_at_launch": float(p.production),
             "eta_turns": int(turns) if turns else 1,
+            # B 단계 — reward 의 LaunchMetadata 로 매핑되는 metadata.
+            #   target_kind            : "attack" | "support" (Phase C 분기와 동일)
+            #   nearest_neutral_rank   : src 기준 중립 ETA 정렬 시 target 순위 (1=가장 가까움, 0=N/A)
+            #   req_over_src/prod      : cost 측 ratio (이미 진단에서 분포로도 추적 중)
+            # turn 은 caller (train.py) 가 ep_step 을 채움 (decode 는 ep_step 모름).
+            "target_kind": target_kind,
+            "nearest_neutral_rank": nearest_rank,
+            "req_over_src": float(required) / max(p.ships, 1),
+            "req_over_prod": float(required) / max(p.production, 1),
+            "target_prod_at_launch": float(target.production),
         })
 
     # over-send 정산: target 별 합산 ships 가 required 초과한 만큼 누적.
@@ -879,6 +899,10 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     env = make("orbit_wars", debug=False)
     env.reset()
     hit_tracker.reset_episode(env.state[0].observation)
+    # B 단계 — reward attribution 용 stateful tracker. 매 step register_launches +
+    # update_step 호출. update_step 결과를 ctx.capture_events 로 reward component 에 전달.
+    # 현재는 어떤 component 도 capture_events 를 소비하지 않음 (C 단계에서 도입).
+    capture_tracker = LaunchCaptureTracker()
     # episode-level step counter (buffer 의 `step` 과 다름 — 에피소드 내 0..episodeSteps-1).
     # turn_norm = ep_step / episode_steps_max ∈ [0, 1] phase 신호로 모델/reward 에 전달.
     episode_steps_max = int(getattr(env.configuration, "episodeSteps", 500) or 500)
@@ -948,6 +972,27 @@ def _collect_single(main_model, opponent_model, n_steps, device):
                 analysis=analysis, turn_norm=turn_norm,
             )
             hit_tracker.record(decode_counts)
+            # B 단계 — launches dict → LaunchMetadata 변환 + tracker 등록.
+            #   decode 는 ep_step 을 모르므로 turn 은 여기서 채운다.
+            #   ships_sent=0 인 noop launch 는 attribution 무의미 → 제외.
+            launch_metadata_main = [
+                LaunchMetadata(
+                    turn=ep_step,
+                    source_id=int(l["source_id"]),
+                    target_id=int(l["target_id"]),
+                    target_owner_at_launch=int(l["target_owner"]),
+                    target_kind=str(l["target_kind"]),
+                    ships_sent=int(l["ships"]),
+                    eta_turns=int(l["eta_turns"]),
+                    req_over_src=float(l["req_over_src"]),
+                    req_over_prod=float(l["req_over_prod"]),
+                    nearest_neutral_rank=int(l["nearest_neutral_rank"]),
+                    target_prod=float(l["target_prod_at_launch"]),
+                )
+                for l in launches_main
+                if int(l["ships"]) > 0
+            ]
+            capture_tracker.register_launches(launch_metadata_main)
 
             raw_obs_opp = env.state[1].observation
             obs_opp, raw_planets_opp, raw_fleets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
@@ -964,6 +1009,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             curr_obs_main  = env.state[0].observation
             max_speed      = env.configuration.shipSpeed
             hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
+            # B 단계 — capture 검출 + window 안 launch 와 attribution.
+            # 현재 component 가 소비 안 하지만 ctx 로 흘려보내 C 단계 도입 시 즉시 사용 가능.
+            capture_events = capture_tracker.update_step(
+                prev_map, curr_obs_main, player=0, turn=ep_step,
+            )
             curr_score     = (state_score(curr_obs_main, player=0)
                             - state_score(env.state[1].observation, player=1))
             raw_terminal   = env.state[0].reward if ep_done else 0
@@ -980,6 +1030,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
                 ep_done=ep_done,
                 raw_terminal=raw_terminal,
                 player=0,
+                capture_events=capture_events,
                 **reward_coefs,
             )
             breakdown  = compose_rewards(ctx)
@@ -1063,6 +1114,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         env = make("orbit_wars", debug=False)
         env.reset()
         hit_tracker.reset_episode(env.state[0].observation)
+        capture_tracker.reset_episode()
         episode_steps_max = int(getattr(env.configuration, "episodeSteps", 500) or 500)
         ep_step       = 0
         prev_score    = (state_score(env.state[0].observation, player=0)

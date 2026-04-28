@@ -74,8 +74,15 @@
 reward/
     __init__.py        # RewardContext, RewardBreakdown, 규약 (이 파일)
     components.py      # stateless components + COMPONENTS 튜플 + compose_rewards
-    events.py          # stateful reward 도입 시 추가
-    trackers.py        # stateful reward 도입 시 추가
+    events.py          # LaunchMetadata, CaptureEvent dataclass (data only, 로직 없음)
+    trackers.py        # LaunchCaptureTracker — launch metadata 보관 + capture attribution
+
+events / trackers (B 단계 — 도입됨, 아직 어떤 component 도 소비 X):
+    launch 시점에 LaunchMetadata 생성 → tracker 가 window 내 보관 →
+    매 step prev_map vs curr_obs 비교로 capture 검출 + window 내 target_id
+    일치하는 launches 를 linked_launches 로 묶어 CaptureEvent 생성.
+    train.py 가 ctx.capture_events 로 component 에 전달. C 단계
+    (early_close_neutral_capture_bonus 등) 부터 실제 소비.
 
 ────────────────────────────────────────────────────────────────────────────
 함수 / 변수 네이밍
@@ -249,6 +256,7 @@ class RewardContext:
     필드 분류:
       state     prev/curr_score, prev_map, curr_obs, decode_counts
                 turn_norm, ep_done, raw_terminal, player
+      events    capture_events (B 단계 — LaunchCaptureTracker 결과)
       coefs     dense_coef ∼ terminal_win_reward (config 에서 한 번 주입)
 
     필드 추가 / 금지 규칙은 모듈 docstring 의 "RewardContext 필드 규약" 참조.
@@ -263,6 +271,10 @@ class RewardContext:
     ep_done: bool = False
     raw_terminal: int = 0                                # env.state[player].reward, ep_done=True 일 때만 의미
     player: int = 0
+    # ── events (stateful tracker 가 만든 이번 step 의 capture 기록) ─────────
+    # B 단계 — LaunchCaptureTracker.update_step() 결과. 0 이면 이번 step 에 변동 없음.
+    # 현재 어떤 component 도 이 필드를 소비하지 않음 (C 단계에서 도입 예정).
+    capture_events: list = field(default_factory=list)
     # ── coefs (training config 에서 주입, episode 내 불변) ──────────────────
     dense_coef: float = 0.0
     all_in_penalty_coef: float = 0.0
@@ -321,6 +333,8 @@ from reward.components import (
     COMPONENT_NAMES,
     compose_rewards,
 )
+from reward.events import LaunchMetadata, CaptureEvent
+from reward.trackers import LaunchCaptureTracker
 
 __all__ = [
     "RewardContext",
@@ -336,4 +350,7 @@ __all__ = [
     "COMPONENTS",
     "COMPONENT_NAMES",
     "compose_rewards",
+    "LaunchMetadata",
+    "CaptureEvent",
+    "LaunchCaptureTracker",
 ]
