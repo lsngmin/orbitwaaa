@@ -89,6 +89,9 @@ BUNDLE_FILES: list[tuple[str, Path]] = [
 ]
 BUNDLE_DIRS: list[tuple[str, Path]] = [
     ("utils", ROOT),
+    # Phase C 이후 train.py 가 `from mask import ...` 함. 누락 시 Kaggle agent
+    # import 단계에서 ImportError → 매 턴 status=ERROR (실제 episode 75585463 사례).
+    ("mask",  ROOT),
 ]
 
 
