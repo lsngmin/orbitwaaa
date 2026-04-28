@@ -83,9 +83,11 @@ class HitRateTracker:
         "under_invested_count_neutral", "under_invested_count_enemy",
         # ── 연계 공격 계측 (단발 실패 vs 계획된 연속 압박 구분) ──────────────
         # repeat_target: 같은 target에 REPEAT_K턴 내 2회 이상 발사 (현재 발사가 N≥2번째)
-        # launch_to_cap_k_{neu,enm}: 발사 후 LAUNCH_TO_CAP_K턴 내 그 target이 결국 점령된 launch 수
+        # launch_to_cap_k_{neu,enm}: capture 1회 = 대표 launch 1개만 +1 (rate, ≤1).
+        # linked_launches_per_capture_{neu,enm}: window 내 linked launch 전부 +1 (multiplicity).
         "repeat_target",
         "launch_to_cap_k_neutral", "launch_to_cap_k_enemy",
+        "linked_launches_per_capture_neutral", "linked_launches_per_capture_enemy",
         # ── 1차 진단 metric 묶음 (방향: 단발 점령 + 유지 + 자원 보존 측정) ───
         # decode-time:
         #   all_in_launches              : ships_needed >= ALL_IN_THRESHOLD * src.ships
@@ -189,23 +191,33 @@ class HitRateTracker:
             }
             target_owner = meta.get("target_owner")
             target_id    = meta.get("target_id")
-            if target_owner == -1:
+            # action kind 분류 (Phase C):
+            #   support: target_owner == player_id (mask 의 target_owner_allowed 가 own+threat 만 허용)
+            #   neutral attack: target_owner == -1
+            #   enemy   attack: target_owner != player_id and != -1
+            is_support = (target_owner is not None and target_owner == self.player_id)
+            if is_support:
+                # support 는 capture 통계 (target_neutral/target_enemy, launch_to_cap_k_*) 에
+                # 절대 섞지 않는다. decoder 의 support_launches 카운트로만 집계.
+                pass
+            elif target_owner == -1:
                 self.counters["target_neutral"] += 1
                 if is_early:
                     self.counters["early_neutral_attempts"] += 1
-            elif target_owner is not None and target_owner != self.player_id:
+            elif target_owner is not None:
                 self.counters["target_enemy"] += 1
                 if is_early:
                     self.counters["early_enemy_attempts"] += 1
 
-            # 연계 공격 계측: 같은 target에 REPEAT_K턴 내 재발사인가?
-            # 현재 발사가 N≥2번째일 때 repeat_target += 1 (첫 발사는 아직 "연계" 아님).
-            if target_id is not None:
+            # 연계 공격 계측: 같은 target 에 REPEAT_K 턴 내 재발사인가?
+            # support 는 "공격 연계" 가 아니므로 repeat 집계에서도 제외.
+            if target_id is not None and not is_support:
                 last = self.last_launch_turn.get(target_id)
                 if last is not None and (self.episode_turn - last) <= self.REPEAT_K:
                     self.counters["repeat_target"] += 1
                 self.last_launch_turn[target_id] = self.episode_turn
-                # launch_to_cap_k 추적용 (target 점령 시점에 역조회)
+                # launch_to_cap_k 추적용 (target 점령 시점에 역조회).
+                # support launch 는 등록 안 함 — own→enemy→own 회복 시점에 분자 누수 방지.
                 self.launches_by_target[target_id].append((self.episode_turn, target_owner))
 
     # ── V2: 해소 ────────────────────────────────────────────────────────────
@@ -309,10 +321,14 @@ class HitRateTracker:
             else:
                 self.counters["unknown_removal"] += 1
 
-        # launch_to_cap_k: 이번 턴에 "내 행성이 된" planet을 찾아,
-        # LAUNCH_TO_CAP_K턴 내 그 planet을 target으로 쏜 launch들을 successful로 카운트.
-        # 기존 captured_{suffix}는 fleet 충돌 attribution에 의존 (한 캡처당 1회만)
-        # 여기서는 연계 launch 전부 카운트 → "지금은 부족해 보여도 결국 먹었나?" 분석용.
+        # launch_to_cap_k: 이번 턴에 "내 행성이 된" planet 을 찾아 capture 귀속 카운트.
+        # 두 종류 지표를 동시에 유지:
+        #   launch_to_cap_k_{kind}            = 1 capture = 대표 launch 1개만 +1 (rate, ≤1)
+        #   linked_launches_per_capture_{kind} = window 내 모든 linked launch 카운트 (multiplicity, >1 가능)
+        # 대표 launch = 가장 최근 launch (capture 의 결정타로 가정 — 단순/명료).
+        # 분모 (target_{kind}) = launch 수. 따라서:
+        #   launch_to_cap_rate_{kind} = launch_to_cap_k_{kind} / target_{kind}    ∈ [0, 1]
+        #   협력 launch 평가는 linked_launches_per_capture_{kind} 로 별도 추적.
         for pid, curr_planet in curr_planet_map.items():
             prev_planet = prev_planet_map.get(pid)
             if prev_planet is None:
@@ -320,11 +336,20 @@ class HitRateTracker:
             if prev_planet[1] == self.player_id or curr_planet[1] != self.player_id:
                 continue
             launches = self.launches_by_target.pop(pid, [])
-            for l_turn, l_owner in launches:
-                if self.episode_turn - l_turn > self.LAUNCH_TO_CAP_K:
-                    continue
-                kind = "neutral" if l_owner == -1 else "enemy"
-                self.counters[f"launch_to_cap_k_{kind}"] += 1
+            in_window = [
+                (l_turn, l_owner) for l_turn, l_owner in launches
+                if self.episode_turn - l_turn <= self.LAUNCH_TO_CAP_K
+            ]
+            if not in_window:
+                continue
+            # 대표 launch = 가장 최근 (turn max). kind 는 그 launch 의 launch-time owner.
+            _, rep_owner = max(in_window, key=lambda x: x[0])
+            rep_kind = "neutral" if rep_owner == -1 else "enemy"
+            self.counters[f"launch_to_cap_k_{rep_kind}"] += 1
+            # multiplicity: window 내 linked launch 전부 카운트 (kind 는 각자 owner).
+            for _, l_owner in in_window:
+                m_kind = "neutral" if l_owner == -1 else "enemy"
+                self.counters[f"linked_launches_per_capture_{m_kind}"] += 1
 
         # 윈도우 만료 launch 정리 (메모리는 작지만 일관성 위해)
         for pid in list(self.launches_by_target.keys()):
@@ -481,12 +506,19 @@ class HitRateTracker:
                 out[f"send_required_ratio_mean_{kind}"] = counters.get(f"send_required_ratio_sum_{kind}", 0.0) / n_launch
                 out[f"under_invested_rate_{kind}"]      = counters.get(f"under_invested_count_{kind}", 0) / n_launch
                 out[f"launch_to_cap_rate_{kind}"]       = counters.get(f"launch_to_cap_k_{kind}", 0) / n_launch
+                # multiplicity: capture 1회당 평균 linked launch 수.
+                # 분모는 capture 수 (= launch_to_cap_k_{kind} — 대표 launch 1개 = capture 1개).
+                n_cap = counters.get(f"launch_to_cap_k_{kind}", 0)
+                out[f"linked_launches_per_capture_{kind}"] = (
+                    counters.get(f"linked_launches_per_capture_{kind}", 0) / max(n_cap, 1)
+                )
             else:
                 out[f"ships_to_send_mean_{kind}"]       = 0.0
                 out[f"required_ships_mean_{kind}"]      = 0.0
                 out[f"send_required_ratio_mean_{kind}"] = 0.0
                 out[f"under_invested_rate_{kind}"]      = 0.0
                 out[f"launch_to_cap_rate_{kind}"]       = 0.0
+                out[f"linked_launches_per_capture_{kind}"] = 0.0
 
         # repeat_target_rate: 같은 target에 REPEAT_K턴 내 재발사 비율.
         # (첫 발사는 repeat 아니므로 최대값 ≈ (launched-unique_targets)/launched)

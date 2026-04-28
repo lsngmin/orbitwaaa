@@ -150,6 +150,8 @@ class TrainingLogger:
             # 연계 공격 (단발 실패 vs 연속 압박 구분)
             "repeat_target_rate",
             "launch_to_cap_rate_neutral", "launch_to_cap_rate_enemy",
+            # multiplicity: capture 1회당 평균 linked launch 수 (협력 공격 측정, ≥1).
+            "linked_launches_per_capture_neutral", "linked_launches_per_capture_enemy",
             # ── 1차 진단 metric (단발 점령 + 유지 + 자원 보존) ────────────
             "single_shot_capture_rate",
             "capture_hold_k_rate",

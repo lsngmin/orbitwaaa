@@ -2141,6 +2141,8 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 repeat_target_rate=rew_stats.get("repeat_target_rate", 0.0),
                 launch_to_cap_rate_neutral=rew_stats.get("launch_to_cap_rate_neutral", 0.0),
                 launch_to_cap_rate_enemy=rew_stats.get("launch_to_cap_rate_enemy", 0.0),
+                linked_launches_per_capture_neutral=rew_stats.get("linked_launches_per_capture_neutral", 0.0),
+                linked_launches_per_capture_enemy=rew_stats.get("linked_launches_per_capture_enemy", 0.0),
                 # 1차 진단 metric 묶음 (단발 점령 + 유지 + 자원 보존)
                 # 이 6개가 main rollout row(self/league/exploiter)에 찍혀야
                 # Sprint 1 baseline → Sprint 2 비교가 가능. 빠지면 row 빈칸 → 측정 의미 상실.
