@@ -9,24 +9,61 @@ ctx.scratch 캐시 키 (다운스트림 feature 계산이 재활용):
     ("aim", src, dst)      = (angle, tx, ty, turns)              # sun_path 통과 시
     ("proj", src, dst)     = (proj_owner, proj_ships, eff_turns) # enemy_neutral_filter 통과 시
     ("required", src, dst) = int                                  # capacity_short 통과 시
+
+[Phase C] owner_rule 선택적 open — 자기 행성 중 적 fleet 가 incoming 인 곳만
+support target 으로 허용. 후속 게이트가 자동 필터:
+    - enemy_neutral_filter: 적이 약해서 어차피 내가 지킨다 (proj_owner==own) → 차단
+    - capacity_short: 자원 부족 → 차단
+즉 owner_rule 만 풀어주면 “위협 없는 자기 행성” 은 enemy_neutral_filter 가
+잡아내므로 action space 가 폭발하지 않음.
 """
 from __future__ import annotations
 import torch
 
-from prediction import aim, crosses_sun, first_collision_on_path, project_target_at_eta
+from prediction import aim, crosses_sun, first_collision_on_path, project_target_at_eta, fleet_dst_and_eta
 from . import MaskContext, MaskResult
 
 
+def _has_enemy_incoming(ctx: MaskContext, dst: int) -> bool:
+    """dst 행성으로 향하는 적 fleet 가 하나라도 있으면 True.
+
+    fleet_dst_and_eta(f, planets) 는 ray-cast 로 fleet 의 첫 충돌 행성 id 를
+    반환. cache 안 함 — 자기 행성은 P 의 작은 부분 (보통 5~10 개) 이라
+    per-mask-build 에 비용 부담 없음.
+    """
+    dst_id = ctx.planets[dst].id
+    for f in ctx.fleets:
+        if f.owner == ctx.acting_player:
+            continue
+        target_id, _ = fleet_dst_and_eta(f, ctx.planets)
+        if target_id == dst_id:
+            return True
+    return False
+
+
 def owner_rule(ctx: MaskContext, src: int, dst: int) -> bool:
-    """train.py:378-386 — padded idx / self-target / src 미소유·ships=0 / dst 내것 차단."""
+    """train.py:378-386 + Phase C support open.
+
+    차단:
+      - padded idx (src/dst >= P_actual)
+      - self-target (src == dst)
+      - src 미소유 또는 src.ships == 0
+      - dst 내 행성 AND 적 incoming 없음 (안전 → 지원 불필요)
+    허용:
+      - dst 적/중립 (기존 capture 경로)
+      - dst 내 행성 AND 적 incoming 있음 (Phase C support 경로)
+    """
     P_actual = len(ctx.planets)
     if src >= P_actual or dst >= P_actual or src == dst:
         return False
     src_p = ctx.planets[src]
     if src_p.owner != ctx.acting_player or src_p.ships <= 0:
         return False
-    if ctx.planets[dst].owner == ctx.acting_player:
-        return False
+    dst_p = ctx.planets[dst]
+    if dst_p.owner == ctx.acting_player:
+        # 자기 행성 — 적 incoming 있을 때만 support target 허용.
+        if not _has_enemy_incoming(ctx, dst):
+            return False
     return True
 
 
