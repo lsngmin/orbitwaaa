@@ -82,6 +82,20 @@ training:
   #   - cap_bonus(-0.011, gen 24) 와 같은 magnitude → 압도하지 않으면서 의미 있는 신호
   # 0 이면 비활성 (Phase A baseline 재현).
   launch_cost_penalty: 0.02
+  # ── early_close_neutral_capture_bonus (C 단계, capture_events 기반) ─────────
+  # 초반에 가깝고 저비용인 중립을 점령했을 때 추가 가산. 모든 조건 만족할 때만.
+  #   coef                              : kill switch. 0.0 = off (default).
+  #                                       양수 시작 시 cap_bonus_gain (0.008) 보다
+  #                                       작거나 같은 스케일 권장 (0.005~0.01).
+  #                                       양수 가산이라 PPO 지배 시 mean_early_close
+  #                                       도 양수 mean 으로 잡혀 진단 가능.
+  #   threshold_turn_norm               : launch 시점 turn_norm < 이 값 (default 0.25).
+  #   max_nearest_rank                  : src 기준 ETA 정렬 시 ≤ 이 값 (1=가장 가까움).
+  #   max_req_over_src                  : required/src.ships ≤ 이 값 (0.5=절반 이하).
+  early_close_neutral_capture_bonus: 0.0
+  early_close_threshold_turn_norm: 0.25
+  early_close_max_nearest_rank: 1
+  early_close_max_req_over_src: 0.5
   state_score_ship_weight: 0.1    # timeout 승자 판정(total ships)에 더 가깝게 정렬
   state_score_prod_weight: 0.5    # 생산력은 ships로 이어지는 간접 힌트만 유지
   state_score_planet_weight: 0.5  # planet_count 편향 완화 (기존 2.0에서 축소)

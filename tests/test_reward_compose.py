@@ -23,6 +23,7 @@ from reward import (
     dense_reward,
     neutral_capture_bonus,
     own_planet_loss_penalty,
+    early_close_neutral_capture_bonus,
     all_in_penalty,
     over_send_penalty,
     under_invested_penalty,
@@ -45,11 +46,12 @@ def test_breakdown_total_is_sum_of_all_fields():
         dense=0.123,
         neutral_capture_bonus=0.456,
         own_planet_loss_penalty=-0.10,
+        early_close_neutral_capture_bonus=0.08,
         all_in_penalty=-0.05, over_send_penalty=-0.02,
         under_invested_penalty=-0.01, launch_cost_penalty=-0.07,
         terminal=1.0,
     )
-    expected = 0.123 + 0.456 - 0.10 - 0.05 - 0.02 - 0.01 - 0.07 + 1.0
+    expected = 0.123 + 0.456 - 0.10 + 0.08 - 0.05 - 0.02 - 0.01 - 0.07 + 1.0
     assert b.total == pytest.approx(expected, abs=1e-12)
 
 
@@ -86,14 +88,15 @@ def test_compose_fills_all_breakdown_fields():
         terminal_win_reward=2.0,
     )
     b = compose_rewards(ctx)
-    assert b.dense                   == pytest.approx(dense_reward(ctx))
-    assert b.neutral_capture_bonus   == pytest.approx(neutral_capture_bonus(ctx))
-    assert b.own_planet_loss_penalty == pytest.approx(own_planet_loss_penalty(ctx))
-    assert b.all_in_penalty          == pytest.approx(all_in_penalty(ctx))
-    assert b.over_send_penalty       == pytest.approx(over_send_penalty(ctx))
-    assert b.under_invested_penalty  == pytest.approx(under_invested_penalty(ctx))
-    assert b.launch_cost_penalty     == pytest.approx(launch_cost_penalty(ctx))
-    assert b.terminal                == pytest.approx(terminal_reward(ctx))
+    assert b.dense                             == pytest.approx(dense_reward(ctx))
+    assert b.neutral_capture_bonus             == pytest.approx(neutral_capture_bonus(ctx))
+    assert b.own_planet_loss_penalty           == pytest.approx(own_planet_loss_penalty(ctx))
+    assert b.early_close_neutral_capture_bonus == pytest.approx(early_close_neutral_capture_bonus(ctx))
+    assert b.all_in_penalty                    == pytest.approx(all_in_penalty(ctx))
+    assert b.over_send_penalty                 == pytest.approx(over_send_penalty(ctx))
+    assert b.under_invested_penalty            == pytest.approx(under_invested_penalty(ctx))
+    assert b.launch_cost_penalty               == pytest.approx(launch_cost_penalty(ctx))
+    assert b.terminal                          == pytest.approx(terminal_reward(ctx))
 
 
 def test_compose_total_matches_manual_sum():
@@ -122,9 +125,10 @@ def test_compose_total_matches_manual_sum():
 
 
 def test_components_tuple_matches_names():
-    """COMPONENTS 와 COMPONENT_NAMES 가 동기화 되어 있고, 분리 후 8개."""
+    """COMPONENTS 와 COMPONENT_NAMES 가 동기화 되어 있고, C 단계 후 9개."""
     assert COMPONENT_NAMES == tuple(c.__name__ for c in COMPONENTS)
-    assert len(COMPONENTS) == 8  # dense / neutral_cap / own_loss / 4 penalty / terminal
+    # dense / neutral_cap / own_loss / early_close_neutral_cap / 4 penalty / terminal
+    assert len(COMPONENTS) == 9
 
 
 # ── component 단위 동작 ───────────────────────────────────────────────────────
@@ -374,12 +378,13 @@ def test_capture_events_does_not_affect_existing_rewards():
     b_empty = compose_rewards(ctx_empty)
     b_full  = compose_rewards(ctx_with_events)
     assert b_empty.total == pytest.approx(b_full.total, abs=1e-12)
-    # field-by-field
+    # field-by-field — coef=0 (default) 이라 early_close_neutral_capture_bonus 도 0 → 동일.
     for f in ("dense", "neutral_capture_bonus", "own_planet_loss_penalty",
+              "early_close_neutral_capture_bonus",
               "all_in_penalty", "over_send_penalty", "under_invested_penalty",
               "launch_cost_penalty", "terminal"):
         assert getattr(b_empty, f) == pytest.approx(getattr(b_full, f), abs=1e-12), (
-            f"field {f} 가 capture_events 에 영향받음 — B 단계 parity 위반"
+            f"field {f} 가 capture_events 에 영향받음 — kill switch off 인데 위반"
         )
 
 
@@ -387,3 +392,138 @@ def test_capture_events_default_empty_list():
     """RewardContext 기본값에 capture_events=[] 있어야 (현재 호출부 영향 없도록)."""
     ctx = RewardContext()
     assert ctx.capture_events == []
+
+
+# ── C 단계 — early_close_neutral_capture_bonus 단위 ───────────────────────────
+
+def _meta(turn_norm_at_launch=0.1, nearest_rank=1, req_over_src=0.3,
+          target_id=5, source_id=10):
+    """qualifying launch 의 기본값 (모두 default 조건 만족)."""
+    from reward import LaunchMetadata
+    return LaunchMetadata(
+        turn=int(turn_norm_at_launch * 100), source_id=source_id, target_id=target_id,
+        target_owner_at_launch=-1, target_kind="attack",
+        ships_sent=10, eta_turns=3,
+        req_over_src=req_over_src, req_over_prod=2.0,
+        nearest_neutral_rank=nearest_rank, target_prod=2.0,
+        turn_norm_at_launch=turn_norm_at_launch,
+    )
+
+
+def _event(prev_owner=-1, new_owner=0, target_id=5, target_prod=2.0,
+           linked_launches=None):
+    from reward import CaptureEvent
+    return CaptureEvent(
+        turn=10, planet_id=target_id, prev_owner=prev_owner, new_owner=new_owner,
+        target_prod=target_prod, linked_launches=linked_launches or [],
+    )
+
+
+def _ctx_with_events(events, *, coef=0.05, **overrides):
+    """early_close 활성 + 기본 조건. overrides 로 threshold/max_rank/max_cost 변경."""
+    return RewardContext(
+        capture_events=events, player=0,
+        early_close_neutral_capture_bonus_coef=coef,
+        early_close_threshold_turn_norm=overrides.get("threshold", 0.25),
+        early_close_max_nearest_rank=overrides.get("max_rank", 1),
+        early_close_max_req_over_src=overrides.get("max_cost", 0.5),
+    )
+
+
+def test_early_close_zero_when_coef_off():
+    """coef=0 (default) 이면 events 가 채워져 있어도 항상 0."""
+    ev = _event(linked_launches=[_meta()])
+    ctx = _ctx_with_events([ev], coef=0.0)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_zero_when_no_events():
+    ctx = _ctx_with_events([], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_qualifies_all_conditions():
+    """모든 조건 만족 시 coef × target_prod 가산."""
+    ev = _event(target_prod=4.0, linked_launches=[_meta()])  # default 조건 모두 만족
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == pytest.approx(0.05 * 4.0)
+
+
+def test_early_close_disqualified_by_late_turn_norm():
+    """turn_norm_at_launch ≥ threshold 면 가산 안 함."""
+    ev = _event(linked_launches=[_meta(turn_norm_at_launch=0.30)])  # ≥ 0.25
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_disqualified_by_distant_rank():
+    """nearest_rank > max_rank 면 가산 안 함."""
+    ev = _event(linked_launches=[_meta(nearest_rank=3)])  # > 1
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_disqualified_by_zero_rank_sentinel():
+    """nearest_rank == 0 (계산 안 됨 sentinel) 은 가산 안 함."""
+    ev = _event(linked_launches=[_meta(nearest_rank=0)])
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_disqualified_by_high_cost():
+    """req_over_src > max_cost 면 가산 안 함."""
+    ev = _event(linked_launches=[_meta(req_over_src=0.6)])  # > 0.5
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_loss_event_ignored():
+    """me → enemy loss event 는 (gain only component 라) 무시."""
+    ev = _event(prev_owner=0, new_owner=1, linked_launches=[_meta()])
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_no_attribution_zero():
+    """linked_launches 가 비면 attribution 불가 → 0."""
+    ev = _event(linked_launches=[])
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0
+
+
+def test_early_close_one_qualifying_launch_in_many_is_enough():
+    """linked 중 1개라도 모든 조건 만족하면 가산 (best-case attribution)."""
+    bad = _meta(nearest_rank=5, req_over_src=0.9, turn_norm_at_launch=0.5)  # disqualified
+    good = _meta()  # qualified
+    ev = _event(target_prod=3.0, linked_launches=[bad, good])
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == pytest.approx(0.05 * 3.0)
+
+
+def test_early_close_multiple_events_summed():
+    """여러 qualifying capture event 가 있으면 합산."""
+    ev1 = _event(target_id=5, target_prod=2.0, linked_launches=[_meta(target_id=5)])
+    ev2 = _event(target_id=7, target_prod=3.0, linked_launches=[_meta(target_id=7)])
+    ctx = _ctx_with_events([ev1, ev2], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == pytest.approx(0.05 * (2.0 + 3.0))
+
+
+def test_early_close_one_event_counted_once_even_with_multiple_qualifying_launches():
+    """같은 event 안에 qualifying launch 가 여러 개여도 1번만 가산 (double-count 방지)."""
+    ev = _event(target_prod=2.0, linked_launches=[_meta(), _meta()])
+    ctx = _ctx_with_events([ev], coef=0.05)
+    assert early_close_neutral_capture_bonus(ctx) == pytest.approx(0.05 * 2.0)
+
+
+def test_early_close_max_rank_inclusive():
+    """nearest_rank == max_rank 는 조건 만족 (≤ 비교)."""
+    ev = _event(linked_launches=[_meta(nearest_rank=2)])
+    ctx = _ctx_with_events([ev], coef=0.05, max_rank=2)
+    assert early_close_neutral_capture_bonus(ctx) == pytest.approx(0.05 * 2.0)
+
+
+def test_early_close_threshold_strict():
+    """turn_norm < threshold (strict). 동일 값은 disqualified."""
+    ev = _event(linked_launches=[_meta(turn_norm_at_launch=0.25)])
+    ctx = _ctx_with_events([ev], coef=0.05, threshold=0.25)
+    assert early_close_neutral_capture_bonus(ctx) == 0.0

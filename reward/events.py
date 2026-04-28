@@ -23,6 +23,8 @@ class LaunchMetadata:
 
     필드:
         turn                   : ep_step (에피소드 내 step 번호)
+        turn_norm_at_launch    : turn / episode_steps_max ∈ [0, 1] — launch 시점 phase.
+                                 capture 검출 시점 turn_norm 과는 eta_turns 만큼 차이.
         source_id / target_id  : 행성 id (env 내부 식별자)
         target_owner_at_launch : -1=중립, 0/1=플레이어 — launch 시점 owner.
         target_kind            : "attack" (다른 owner) | "support" (같은 owner)
@@ -45,6 +47,7 @@ class LaunchMetadata:
     req_over_prod: float
     nearest_neutral_rank: int
     target_prod: float
+    turn_norm_at_launch: float = 0.0
 
 
 @dataclass

@@ -857,6 +857,8 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     # CSV mean_cap_bonus 는 둘의 합으로 deprecated 유지.
     sum_neutral_capture_bonus  = 0.0
     sum_own_planet_loss_penalty = 0.0
+    # C 단계 — capture_events 기반. coef=0 (default) 이면 항상 0.
+    sum_early_close_neutral_capture_bonus = 0.0
     sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
     sum_over_send_penalty = 0.0   # 다중 source 협조 실패 페널티 (음수 누적)
     sum_under_invested_penalty = 0.0   # capacity-short launch 시도 페널티 (음수 누적)
@@ -935,6 +937,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         cap_gain_coef               = float(T.get("cap_bonus_gain", 0.05)),
         cap_loss_coef               = float(T.get("cap_bonus_loss", 0.025)),
         cap_early_multiplier        = float(T.get("cap_bonus_early_multiplier", 1.0)),
+        # C 단계 — early_close_neutral_capture_bonus (capture_events 기반).
+        early_close_neutral_capture_bonus_coef = float(T.get("early_close_neutral_capture_bonus", 0.0)),
+        early_close_threshold_turn_norm        = float(T.get("early_close_threshold_turn_norm", 0.25)),
+        early_close_max_nearest_rank           = int(T.get("early_close_max_nearest_rank", 1)),
+        early_close_max_req_over_src           = float(T.get("early_close_max_req_over_src", 0.5)),
     )
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
@@ -978,6 +985,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             launch_metadata_main = [
                 LaunchMetadata(
                     turn=ep_step,
+                    turn_norm_at_launch=turn_norm,
                     source_id=int(l["source_id"]),
                     target_id=int(l["target_id"]),
                     target_owner_at_launch=int(l["target_owner"]),
@@ -1040,6 +1048,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             sum_dense                  += breakdown.dense
             sum_neutral_capture_bonus  += breakdown.neutral_capture_bonus
             sum_own_planet_loss_penalty += breakdown.own_planet_loss_penalty
+            sum_early_close_neutral_capture_bonus += breakdown.early_close_neutral_capture_bonus
             sum_all_in_penalty         += breakdown.all_in_penalty
             sum_over_send_penalty      += breakdown.over_send_penalty
             sum_under_invested_penalty += breakdown.under_invested_penalty
@@ -1148,6 +1157,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "sum_dense":    sum_dense,
         "sum_neutral_capture_bonus":  sum_neutral_capture_bonus,
         "sum_own_planet_loss_penalty": sum_own_planet_loss_penalty,
+        "sum_early_close_neutral_capture_bonus": sum_early_close_neutral_capture_bonus,
         "sum_all_in_penalty": sum_all_in_penalty,
         "sum_over_send_penalty": sum_over_send_penalty,
         "sum_under_invested_penalty": sum_under_invested_penalty,
@@ -1235,6 +1245,7 @@ def _finalize_reward_stats(raw_list):
     total_dense = total_terminal = 0.0
     total_neutral_capture_bonus  = 0.0
     total_own_planet_loss_penalty = 0.0
+    total_early_close_neutral_capture_bonus = 0.0
     total_all_in_penalty = 0.0
     total_over_send_penalty = 0.0
     total_under_invested_penalty = 0.0
@@ -1261,6 +1272,7 @@ def _finalize_reward_stats(raw_list):
         total_dense    += r["sum_dense"]
         total_neutral_capture_bonus  += r.get("sum_neutral_capture_bonus", 0.0)
         total_own_planet_loss_penalty += r.get("sum_own_planet_loss_penalty", 0.0)
+        total_early_close_neutral_capture_bonus += r.get("sum_early_close_neutral_capture_bonus", 0.0)
         total_all_in_penalty += r.get("sum_all_in_penalty", 0.0)
         total_over_send_penalty += r.get("sum_over_send_penalty", 0.0)
         total_under_invested_penalty += r.get("sum_under_invested_penalty", 0.0)
@@ -1299,6 +1311,8 @@ def _finalize_reward_stats(raw_list):
     stats["mean_neutral_capture_bonus"]  = total_neutral_capture_bonus  / steps_safe
     stats["mean_own_planet_loss_penalty"] = total_own_planet_loss_penalty / steps_safe
     stats["mean_cap"]      = stats["mean_neutral_capture_bonus"] + stats["mean_own_planet_loss_penalty"]
+    # C 단계 — capture_events 기반 양수 가산. coef=0 (default) 이면 항상 0.
+    stats["mean_early_close_neutral_capture_bonus"] = total_early_close_neutral_capture_bonus / steps_safe
     stats["mean_terminal"] = total_terminal / steps_safe
     # Sprint 2: per-step all-in launch penalty (음수). all_in_penalty=0 이면 0.
     stats["mean_all_in_penalty"] = total_all_in_penalty / steps_safe
@@ -2083,6 +2097,8 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 # 분리 후 (정식 컬럼).
                 mean_neutral_capture_bonus=rew_stats["mean_neutral_capture_bonus"],
                 mean_own_planet_loss_penalty=rew_stats["mean_own_planet_loss_penalty"],
+                # C 단계 — capture_events 기반. coef=0 (default) 이면 항상 0.
+                mean_early_close_neutral_capture_bonus=rew_stats["mean_early_close_neutral_capture_bonus"],
                 # Deprecated: 옛 로그 추세 비교용. = neutral_capture_bonus + own_planet_loss_penalty.
                 mean_cap_bonus=rew_stats["mean_cap"],
                 mean_terminal_rew=rew_stats["mean_terminal"],

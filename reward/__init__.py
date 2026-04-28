@@ -122,10 +122,15 @@ RewardContext 필드 규약
 허용 필드 (현재):
     state    prev_score, curr_score, prev_map, curr_obs, decode_counts,
              turn_norm, ep_done, raw_terminal, player
+    events   capture_events                                    (B 단계)
     coefs    dense_coef, all_in_penalty_coef, over_send_penalty_coef,
              under_invested_penalty_coef, launch_cost_penalty_coef,
              cap_gain_coef, cap_loss_coef, cap_early_multiplier,
-             terminal_win_reward
+             terminal_win_reward,
+             early_close_neutral_capture_bonus_coef,            (C 단계)
+             early_close_threshold_turn_norm,                   (C 단계)
+             early_close_max_nearest_rank,                      (C 단계)
+             early_close_max_req_over_src                       (C 단계)
 
 피해야 할 필드:
     mask, target_logits, action_logits, policy, model, optimizer, env
@@ -139,14 +144,15 @@ RewardContext 필드 규약
 RewardBreakdown 필드 규약
 
 CSV / log 이름과 최대한 일치시킨다 (utils/logger.py).
-    breakdown.dense                   ↔ mean_dense_rew
-    breakdown.neutral_capture_bonus   ↔ mean_neutral_capture_bonus
-    breakdown.own_planet_loss_penalty ↔ mean_own_planet_loss_penalty
-    breakdown.terminal                ↔ mean_terminal_rew
-    breakdown.all_in_penalty          ↔ mean_all_in_penalty
-    breakdown.over_send_penalty       ↔ mean_over_send_penalty
-    breakdown.launch_cost_penalty     ↔ mean_launch_cost_penalty
-    breakdown.under_invested_penalty  ↔ mean_under_invested_penalty
+    breakdown.dense                             ↔ mean_dense_rew
+    breakdown.neutral_capture_bonus             ↔ mean_neutral_capture_bonus
+    breakdown.own_planet_loss_penalty           ↔ mean_own_planet_loss_penalty
+    breakdown.early_close_neutral_capture_bonus ↔ mean_early_close_neutral_capture_bonus
+    breakdown.terminal                          ↔ mean_terminal_rew
+    breakdown.all_in_penalty                    ↔ mean_all_in_penalty
+    breakdown.over_send_penalty                 ↔ mean_over_send_penalty
+    breakdown.launch_cost_penalty               ↔ mean_launch_cost_penalty
+    breakdown.under_invested_penalty            ↔ mean_under_invested_penalty
 
 Deprecated compatibility 컬럼:
     mean_cap_bonus = mean_neutral_capture_bonus + mean_own_planet_loss_penalty
@@ -218,14 +224,15 @@ def post_capture_reloss_penalty(ctx: RewardContext) -> float:
 ────────────────────────────────────────────────────────────────────────────
 현재 components (reward/components.py, COMPONENTS 순서)
 
-    dense_reward              # Δstate_score × dense_coef
-    neutral_capture_bonus     # 중립 → 내것 (gain only, early_boost)
-    own_planet_loss_penalty   # 내것 → 잃음 (loss only, no early_boost)
-    all_in_penalty            # source 80%+ 비우는 발사
-    over_send_penalty         # target 별 Σships - required 초과분
-    under_invested_penalty    # src.ships < required 발사 시도
-    launch_cost_penalty       # max(0, req/src - 0.5) 합계 (Phase B continuous)
-    terminal_reward           # ±terminal_win_reward / 0
+    dense_reward                       # Δstate_score × dense_coef
+    neutral_capture_bonus              # 중립 → 내것 (gain only, early_boost)
+    own_planet_loss_penalty            # 내것 → 잃음 (loss only, no early_boost)
+    early_close_neutral_capture_bonus  # capture_events 소비 (C 단계). 초반/가까움/저비용 조건 만족 중립 점령 추가 가산.
+    all_in_penalty                     # source 80%+ 비우는 발사
+    over_send_penalty                  # target 별 Σships - required 초과분
+    under_invested_penalty             # src.ships < required 발사 시도
+    launch_cost_penalty                # max(0, req/src - 0.5) 합계 (Phase B continuous)
+    terminal_reward                    # ±terminal_win_reward / 0
 
 순서 자체는 reward 합산에 영향 없음 (덧셈 교환). 진단 / breakdown 출력 순서 용도.
 
@@ -233,6 +240,10 @@ neutral_capture_bonus 와 own_planet_loss_penalty 는 의도적으로 분리:
     - 같은 "행성 소유권 transition" 이지만 게임 의미가 다름 (확장 강화 vs 방어 학습).
     - early_boost 적용 비대칭 (gain 만 amplify, loss 는 phase 무관).
     - 별도 계수 (cap_gain_coef / cap_loss_coef) 로 ablation 가능.
+
+early_close_neutral_capture_bonus 는 stateless component 지만 ctx.capture_events
+를 소비 — events / tracker 인프라의 첫 사용자. nearest_rank/req_over_src/turn_norm
+은 launch 시점 metadata (decoder 가 계산) 그대로 사용 — reward 가 다시 계산 안 함.
 
 ────────────────────────────────────────────────────────────────────────────
 최종 규칙 한 줄
@@ -285,6 +296,16 @@ class RewardContext:
     cap_loss_coef: float = 0.0
     cap_early_multiplier: float = 1.0
     terminal_win_reward: float = 1.0
+    # ── early_close_neutral_capture_bonus (C 단계, capture_events 소비) ────
+    # 초반에 가까운 저비용 중립을 점령했을 때 추가 보너스. 모두 만족할 때만 가산.
+    #   coef               : kill switch (0.0 = off, default).
+    #   threshold_turn_norm: launch 시점 turn_norm < 이 값일 때만 (default 0.25 = 초반 25%).
+    #   max_nearest_rank   : src 기준 ETA 순위 ≤ 이 값 (1 = 가장 가까운 중립만, default).
+    #   max_req_over_src   : required/src.ships ≤ 이 값 (0.5 = 절반 이하만, default).
+    early_close_neutral_capture_bonus_coef: float = 0.0
+    early_close_threshold_turn_norm: float = 0.25
+    early_close_max_nearest_rank: int = 1
+    early_close_max_req_over_src: float = 0.5
 
 
 @dataclass
@@ -300,6 +321,7 @@ class RewardBreakdown:
     dense: float = 0.0
     neutral_capture_bonus: float = 0.0
     own_planet_loss_penalty: float = 0.0
+    early_close_neutral_capture_bonus: float = 0.0
     all_in_penalty: float = 0.0
     over_send_penalty: float = 0.0
     under_invested_penalty: float = 0.0
@@ -312,6 +334,7 @@ class RewardBreakdown:
             self.dense
             + self.neutral_capture_bonus
             + self.own_planet_loss_penalty
+            + self.early_close_neutral_capture_bonus
             + self.all_in_penalty
             + self.over_send_penalty
             + self.under_invested_penalty
@@ -324,6 +347,7 @@ from reward.components import (
     dense_reward,
     neutral_capture_bonus,
     own_planet_loss_penalty,
+    early_close_neutral_capture_bonus,
     all_in_penalty,
     over_send_penalty,
     under_invested_penalty,
@@ -342,6 +366,7 @@ __all__ = [
     "dense_reward",
     "neutral_capture_bonus",
     "own_planet_loss_penalty",
+    "early_close_neutral_capture_bonus",
     "all_in_penalty",
     "over_send_penalty",
     "under_invested_penalty",
