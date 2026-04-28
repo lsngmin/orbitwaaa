@@ -94,7 +94,12 @@ def estimate_arrival_turn(distance, num_ships):
 
 
 def crosses_sun(src_x, src_y, dst_x, dst_y, sun_radius=10.5):
-    """fleet 직선 경로가 태양(중심 50,50)을 통과하는지 체크. 선분-원 교차 판정."""
+    """fleet 직선 경로가 태양(중심 50,50)을 통과하는지 체크. 선분-원 교차 판정.
+
+    sun_radius 기본 10.5 = 엔진 SUN_RADIUS(10.0) + 0.5 보수 margin
+    (mask 가 경계 fleet 도 sun-cross 로 차단). 엔진과 정확 일치는
+    호출자가 sun_radius=SUN_RADIUS 명시.
+    """
     dx = dst_x - src_x
     dy = dst_y - src_y
     fx = src_x - CENTER_X
@@ -153,6 +158,7 @@ def first_collision_on_path(src_planet, angle, num_ships, planets, av,
     cos_a = math.cos(angle)
     sin_a = math.sin(angle)
 
+    # GAME_RULES "Fleet Launch": fleet 은 행성 radius 바로 바깥(+0.1)에서 스폰.
     cur_x = src_planet.x + cos_a * (src_planet.radius + 0.1)
     cur_y = src_planet.y + sin_a * (src_planet.radius + 0.1)
 
@@ -229,6 +235,16 @@ def fleet_dst_and_eta(fleet, planets, radius_margin=1.5):
     encode_fleets 의 dst_idx 산출 logic 과 동일 (radius * 1.5 lenient margin).
     충돌 행성 없으면 (-1, math.inf) 반환.
 
+    ⚠️ 한계 (project_target_at_eta 가 결과를 그대로 신뢰):
+      - radius_margin=1.5: 엔진 정확 radius 보다 lenient → over-predict
+        (실제로 빗맞을 fleet 도 도착 대상에 포함될 수 있음).
+      - 태양 통과 미체크: 태양 너머 행성을 hit 으로 잡음
+        (실제 엔진은 sun cross 시 fleet 소멸).
+      - 보드 밖 미체크: 100x100 밖으로 나가는 ray 도 hit 으로 잡음.
+      - 행성 공전 진행 미반영: target 의 현재 위치만으로 ray-cast.
+        비행 중 target 이 자전해서 빗나가는 케이스 못 봄.
+        정확한 ETA 가 필요하면 aim() 사용.
+
     Returns: (dst_planet_id, eta)  — eta 는 ceil(distance / speed), 최소 1.
     """
     dx = math.cos(fleet.angle)
@@ -264,6 +280,17 @@ def project_target_at_eta(target, eta, planets, fleets):
 
     production 은 owner 무관하게 누적 (기존 required_ships 공식과 동일 동작).
     점령 swap 발생 시 sim_owner 갱신, defender 함선 0 미만 안 되도록 클램핑.
+
+    ⚠️ GAME_RULES 와 다른 점:
+      1. Combat 처리: 같은 ETA 에 서로 다른 owner fleet 이 여럿 도착할 때
+         GAME_RULES "Combat" 은 "largest vs second largest 먼저 → 잔존이
+         garrison 과 전투". 이 함수는 시간순 1:1 처리 → 4P 게임 동시 도착
+         부정확. (2P 게임에선 적이 1명이라 영향 미미.)
+      2. 중립 production: GAME_RULES 상 owned planet (owner ∈ 0..3) 만 production
+         발동. 이 함수는 sim_owner 무관하게 누적 → 중립 target 의 proj_ships 가
+         실제보다 (production × turns) 만큼 과대 → required 과대 → 의미 있는
+         capture 가 mask 에서 차단될 수 있음.
+         (의도적 — 기존 공식 호환. 정정하려면 sim_owner==-1 구간 production=0.)
 
     Args:
         target:   Planet — 시뮬 대상
@@ -405,6 +432,10 @@ def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
                 # 도착 시점에 이미 내 거 — 점령 의미 없음 (호출자가 mask off)
                 return 0
             return max(1, int(proj_ships) + 1)
+        # ⚠️ static fallback — project_target_at_eta 와 동일한 중립 production 버그.
+        # GAME_RULES 상 중립(owner=-1) 은 production 안 됨. 여기선 dst.owner 무관하게
+        # production 을 누적 → 중립 target 의 required 가 (production × turns) 만큼
+        # 과대 추정. 정정하려면 dst.owner == -1 일 때 production 항 빼기.
         return dst.ships + dst.production * eff_turns + 1
 
     def _send_for(req):
