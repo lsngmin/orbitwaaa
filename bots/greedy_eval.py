@@ -18,6 +18,7 @@ C9 refine(top_results, more_seeds)     → 분산 줄여서 재측정
 from __future__ import annotations
 
 import csv
+import multiprocessing as mp
 import os
 import random
 import time
@@ -166,6 +167,19 @@ def evaluate(
     }
 
 
+# ── multiprocessing worker ──────────────────────────────────────────────
+
+def _eval_worker(args):
+    """Pool worker: top-level fn (pickle-able). 1 trial 의 evaluate 수행.
+
+    args = (trial_id, weights_dict, eval_seeds, eval_opponents).
+    returns (trial_id, weights_dict, stats_dict).
+    """
+    trial_id, weights, eval_seeds, eval_opponents = args
+    stats = evaluate(weights, eval_seeds, list(eval_opponents))
+    return trial_id, weights, stats
+
+
 # ── sampler ─────────────────────────────────────────────────────────────
 
 def default_sampler(rng: random.Random | None = None) -> dict:
@@ -205,11 +219,14 @@ def random_search(
     output_csv: str = "agent_logs/greedy_search.csv",
     sampler: Callable = default_sampler,
     rng_seed: int = 0,
+    n_workers: int = 1,
     verbose: bool = True,
 ) -> List[Tuple[dict, dict]]:
-    """log-uniform random search. CSV resume 지원.
+    """log-uniform random search. CSV resume + multiprocessing 지원.
 
-    output_csv 이미 있으면 그 행 수만큼 skip — 도중 중단해도 이어 돌릴 수 있음.
+    output_csv 이미 있으면 그 행 수만큼 skip — 도중 중단해도 이어 돌림.
+    n_workers > 1 이면 Pool. 결과는 imap_unordered 라 완료 순서로 들어옴
+    (CSV 의 trial_id 컬럼은 비순차일 수 있음 — 정렬은 분석에서).
     """
     if eval_seeds is None:
         eval_seeds = list(range(16))
@@ -230,9 +247,29 @@ def random_search(
         with open(output_csv) as f:
             start_trial = max(0, sum(1 for _ in f) - 1)
 
+    # 모든 weights 미리 sampling — reproducibility + worker 분배 위함.
     rng = random.Random(rng_seed + start_trial)
+    tasks = []
+    for trial_id in range(start_trial, n_trials):
+        w = sampler(rng)
+        tasks.append((trial_id, w, eval_seeds, eval_opponents))
+
     write_header = (not os.path.exists(output_csv)
                      or os.path.getsize(output_csv) == 0)
+
+    def _write_row(writer, f, trial_id, weights, stats):
+        row = {"trial_id": trial_id}
+        row.update(flatten_weights(weights))
+        row.update({k: stats.get(k, 0) for k in stat_keys})
+        for op in eval_opponents:
+            lbl = opponent_label(op)
+            row[f"vs_{lbl}_wr"] = stats["per_opponent"].get(lbl, {}).get("win_rate", 0)
+        writer.writerow(row)
+        f.flush()
+        if verbose:
+            print(f"trial {trial_id:3d}: obj={stats['objective']:+.3f} "
+                  f"wr={stats['win_rate']:.2f} t/o={stats['timeout_rate']:.2f} "
+                  f"max_ms={stats['max_step_ms']:.0f}", flush=True)
 
     results: List[Tuple[dict, dict]] = []
     with open(output_csv, "a", newline="") as f:
@@ -241,24 +278,16 @@ def random_search(
             writer.writeheader()
             f.flush()
 
-        for trial in range(start_trial, n_trials):
-            w = sampler(rng)
-            stats = evaluate(w, eval_seeds, eval_opponents)
-
-            row = {"trial_id": trial}
-            row.update(flatten_weights(w))
-            row.update({k: stats.get(k, 0) for k in stat_keys})
-            for op in eval_opponents:
-                lbl = opponent_label(op)
-                row[f"vs_{lbl}_wr"] = stats["per_opponent"].get(lbl, {}).get("win_rate", 0)
-            writer.writerow(row)
-            f.flush()
-
-            results.append((w, stats))
-            if verbose:
-                print(f"trial {trial:3d}: obj={stats['objective']:+.3f} "
-                      f"wr={stats['win_rate']:.2f} t/o={stats['timeout_rate']:.2f} "
-                      f"max_ms={stats['max_step_ms']:.0f}")
+        if n_workers <= 1:
+            for args in tasks:
+                trial_id, weights, stats = _eval_worker(args)
+                _write_row(writer, f, trial_id, weights, stats)
+                results.append((weights, stats))
+        else:
+            with mp.Pool(n_workers) as pool:
+                for trial_id, weights, stats in pool.imap_unordered(_eval_worker, tasks):
+                    _write_row(writer, f, trial_id, weights, stats)
+                    results.append((weights, stats))
 
     return sorted(results, key=lambda x: x[1]["objective"], reverse=True)
 
@@ -270,9 +299,10 @@ def refine(
     more_seeds: List[int] | None = None,
     more_opponents: List = ("random", "baseline"),
     output_csv: str = "agent_logs/greedy_refine.csv",
+    n_workers: int = 1,
     verbose: bool = True,
 ) -> List[Tuple[dict, dict]]:
-    """top_results 의 weights 들을 더 많은 seed 로 재평가. 분산 축소.
+    """top_results 의 weights 들을 더 많은 seed 로 재평가. multiprocessing 지원.
 
     more_seeds: random_search 의 superset 권장 (0~15 → 0~63).
     """
@@ -288,24 +318,38 @@ def refine(
     per_opp_keys = [f"vs_{opponent_label(o)}_wr" for o in more_opponents]
     fieldnames = ["rank"] + weight_keys + stat_keys + per_opp_keys
 
+    tasks = [(rank, w, more_seeds, more_opponents)
+             for rank, (w, _) in enumerate(top_results)]
+
     refined: List[Tuple[dict, dict]] = []
     with open(output_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for rank, (w, _) in enumerate(top_results):
-            stats = evaluate(w, more_seeds, more_opponents)
+        f.flush()
+
+        def _write(rank, weights, stats):
             row = {"rank": rank}
-            row.update(flatten_weights(w))
+            row.update(flatten_weights(weights))
             row.update({k: stats.get(k, 0) for k in stat_keys})
             for op in more_opponents:
                 lbl = opponent_label(op)
                 row[f"vs_{lbl}_wr"] = stats["per_opponent"].get(lbl, {}).get("win_rate", 0)
             writer.writerow(row)
             f.flush()
-            refined.append((w, stats))
             if verbose:
                 print(f"refine rank {rank:2d}: obj={stats['objective']:+.3f} "
-                      f"wr={stats['win_rate']:.2f}")
+                      f"wr={stats['win_rate']:.2f}", flush=True)
+
+        if n_workers <= 1:
+            for args in tasks:
+                rank, weights, stats = _eval_worker(args)
+                _write(rank, weights, stats)
+                refined.append((weights, stats))
+        else:
+            with mp.Pool(n_workers) as pool:
+                for rank, weights, stats in pool.imap_unordered(_eval_worker, tasks):
+                    _write(rank, weights, stats)
+                    refined.append((weights, stats))
 
     return sorted(refined, key=lambda x: x[1]["objective"], reverse=True)
 
@@ -316,9 +360,10 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["evaluate", "search", "refine"])
-    ap.add_argument("--trials", type=int, default=200)
-    ap.add_argument("--seeds",  type=int, default=16)
-    ap.add_argument("--csv",    type=str, default=None)
+    ap.add_argument("--trials",  type=int, default=200)
+    ap.add_argument("--seeds",   type=int, default=16)
+    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--csv",     type=str, default=None)
     args = ap.parse_args()
 
     if args.cmd == "evaluate":
@@ -328,16 +373,15 @@ if __name__ == "__main__":
         out = args.csv or "agent_logs/greedy_search.csv"
         results = random_search(n_trials=args.trials,
                                   eval_seeds=list(range(args.seeds)),
-                                  output_csv=out)
+                                  output_csv=out,
+                                  n_workers=args.workers)
         print(f"top 5:")
         for w, s in results[:5]:
             print(f"  obj={s['objective']:+.3f} wr={s['win_rate']:.2f}")
     elif args.cmd == "refine":
-        # 사전 search 결과 CSV 가 있어야 함 — top 10 읽어서 refine
         in_csv = args.csv or "agent_logs/greedy_search.csv"
         if not os.path.exists(in_csv):
             raise SystemExit(f"missing search CSV: {in_csv}")
-        # 간단히: top 10 by objective 컬럼
         rows = []
         with open(in_csv) as f:
             reader = csv.DictReader(f)
@@ -352,4 +396,4 @@ if __name__ == "__main__":
                     _, kind, name = k.split("_", 2)
                     w[kind][name] = float(v)
             top10.append((w, {"objective": float(r["objective"])}))
-        refine(top10)
+        refine(top10, n_workers=args.workers)
