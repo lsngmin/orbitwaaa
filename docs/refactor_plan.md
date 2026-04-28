@@ -604,13 +604,24 @@ mirror 만 돌리면 자기 정책 corner 에 갇힘.
   · mean_filtered_invalid_target ≈ 0 유지
   · support_launches_per_step > 0 (방어 행동 자체는 일어남)
   · 분리 전후 win_rate ±1σ 이내 (gain/loss + early_close 추가의 parity)
-  · early_neutral_captured_per_episode ≥ 1.0 회복
   · capture_hold_k_rate 추세 ↑
   · post_capture_reloss_rate_k 추세 ↓
   · linked_launches_per_capture_neutral / _enemy 의 분포 sanity
     (window 30턴 이 너무 길/짧으면 multiplicity 가 비정상)
-  · early_close_* 의 trigger rate (너무 자주 → coef 과다, 너무 드뭄 → threshold 재조정)
-- 위 8개가 모두 안정이면 Phase 0 진입
+
+  ── 초반 확장 진단 (단일 metric 으로는 부족 — gen2 사례에서
+       captured 0.75 로 떨어졌는데 nearest_rank 는 멀쩡했던 적 있음. 4-metric cluster 로 본다)
+  · early_neutral_attempts_per_episode      "행동 시도 자체가 줄었나?"
+  · early_neutral_launch_to_cap_rate         "시도가 capture 로 이어지나?"
+  · early_neutral_captured_per_episode ≥ 1.0  최종 결과 (회복 지표)
+  · early_close_trigger_rate
+       너무 드물면 (≪ baseline) → 자격 조건 (turn_norm 0.25 / nearest_rank 1 /
+         req_over_src 0.5) 중 하나가 too tight 이거나 LaunchMetadata 의
+         nearest_rank 가 0 (not computed) 으로 떨어지는 metadata 문제
+       너무 많으면 (≫ baseline) → coef 0.007 이 과다 또는 자격 조건 too loose,
+         neutral_capture_bonus 와 신호 중복 risk
+  · mean_early_close_neutral_capture_bonus  실제 보상 크기 (다른 component 비례 sanity)
+- 위 11개가 모두 안정이면 Phase 0 진입
 ```
 
 **게임 성능 (현재)**: "본진 안 비우는 안정형 그리디 + 초반 가까운 중립 우선 가산". 가까운 중립을 빠르게 확보 (early_close 가 그 행동을 prod-가중으로 보상), 본진에 적이 들어올 때만 짧게 support, 갓 잡은 행성을 즉시 잃는 빈도가 줄어든 *기본기 봇*. 동시 도착·연합 공격·king-maker 같은 상위 정책은 아직 없음.
