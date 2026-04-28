@@ -2,8 +2,7 @@ model:
   embed_dim: 128
   planet_temporal_layers: 2
   fleet_temporal_layers: 1
-  local_layers: 4
-  global_layers: 2
+  encoder_layers: 3        # local+global 통합: [P;F] full self-attn N층, 출력 [:,:P,:] 사용
   num_heads: 8
   temporal_window: 20
   # ── ships head: amount mode 선택 ─────────────────────────────────────────────

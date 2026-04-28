@@ -6,7 +6,7 @@ critic head 만 제외 — state_dict load 시 critic.* 키는 strict=False 로 
 
 학습-제출 parity 보장:
   - 동일 config.yaml 읽음 (embed_dim, layers, NUM_HEADS, HISTORY, bins)
-  - 동일 forward 경로 (Linear → Temporal → Local → Global → actor head)
+  - 동일 forward 경로 (Linear → Temporal → Encoder([P;F]) → actor head)
   - PLANET_DIM=15 (submission_features 와 일치)
 
 Inference only — torch.no_grad 는 caller 가 감싸도 되고 여기 내부에서도 안전.
@@ -36,8 +36,7 @@ ENV = CFG["env"]
 EMBED_DIM              = M["embed_dim"]
 PLANET_TEMPORAL_LAYERS = M["planet_temporal_layers"]
 FLEET_TEMPORAL_LAYERS  = M["fleet_temporal_layers"]
-LOCAL_LAYERS           = M["local_layers"]
-GLOBAL_LAYERS          = M["global_layers"]
+ENCODER_LAYERS         = M["encoder_layers"]
 NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS            = ENV["max_planets"]
@@ -73,18 +72,6 @@ def _make_transformer(layers):
     return nn.TransformerEncoder(enc, num_layers=layers)
 
 
-def _make_decoder(layers):
-    """model.make_decoder 미러 — planet query → [P+F] memory cross-attn."""
-    dec = nn.TransformerDecoderLayer(
-        d_model=EMBED_DIM,
-        nhead=NUM_HEADS,
-        dim_feedforward=EMBED_DIM * 2,
-        dropout=0.0,
-        batch_first=True,
-    )
-    return nn.TransformerDecoder(dec, num_layers=layers)
-
-
 def _safe_pad_mask(pad_mask):
     """model._safe_pad_mask 미러 — all-masked 행 NaN 회피."""
     fully = pad_mask.all(dim=-1, keepdim=True)
@@ -98,7 +85,7 @@ class OrbitWarsActor(nn.Module):
       planet_embed / fleet_embed
       planet_temporal_pos / fleet_temporal_pos
       planet_temporal_attn / fleet_temporal_attn
-      local_attn / global_attn
+      encoder ([P;F] 통합 self-attn — model.py 와 동기)
       actor  (critic 은 제외)
     """
 
@@ -130,9 +117,8 @@ class OrbitWarsActor(nn.Module):
             EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
         )
 
-        self.local_attn  = _make_transformer(LOCAL_LAYERS)
-        # Global: cross-attn decoder (Q=P, KV=P+F) — model.py 와 동기
-        self.global_attn = _make_decoder(GLOBAL_LAYERS)
+        # Encoder: [P;F] 통합 self-attn — model.py 와 동기 (이전 local+global 통합)
+        self.encoder = _make_transformer(ENCODER_LAYERS)
 
         # Step 4 sequential heads + Phase A cost bias — model.py 와 키 동일.
         #   target_i  ~ Categorical(q·k/√E + α_t · target_bias_mlp(pair_feats))
@@ -283,16 +269,10 @@ class OrbitWarsActor(nn.Module):
         f_t = _fuse(f_t, fp_idx_raw, self.fleet_source_value, self.fleet_source_gate)
         f_t = _fuse(f_t, dp_idx_raw, self.fleet_dest_value,   self.fleet_dest_gate)
 
-        # Local (fleet ↔ planet) + Global cross-attn
-        local_tokens = torch.cat([p_t, f_t], dim=1)
-        local_pad    = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
-        local_out    = self.local_attn(local_tokens, src_key_padding_mask=_safe_pad_mask(local_pad))
-        p_query      = local_out[:, :MAX_PLANETS, :]                      # decoder query (B, P, E)
-        global_out   = self.global_attn(
-            tgt=p_query,
-            memory=local_out,                                              # KV = P+F (함대 정보 유지)
-            tgt_key_padding_mask=_safe_pad_mask(planet_pad_now),
-            memory_key_padding_mask=_safe_pad_mask(local_pad),
-        )
+        # Encoder ([P;F] 통합 self-attn — model.py 와 동기)
+        tokens  = torch.cat([p_t, f_t], dim=1)
+        pad     = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
+        enc_out = self.encoder(tokens, src_key_padding_mask=_safe_pad_mask(pad))
+        src_token = enc_out[:, :MAX_PLANETS, :]                            # (B, P, E)
 
-        return global_out
+        return src_token
