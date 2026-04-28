@@ -41,15 +41,15 @@ from . import MaskContext, MaskResult
 def _has_enemy_incoming(ctx: MaskContext, dst: int) -> bool:
     """dst 행성으로 향하는 적 fleet 가 하나라도 있으면 True.
 
-    fleet_dst_and_eta(f, planets) 는 ray-cast 로 fleet 의 첫 충돌 행성 id 를
-    반환. cache 안 함 — 자기 행성은 P 의 작은 부분 (보통 5~10 개) 이라
-    per-mask-build 에 비용 부담 없음.
+    fleet_dst_and_eta(f, planets, av) 는 step-by-step sim 으로 fleet 의 첫
+    충돌 행성 id 를 반환 (orbit/sweep/sun 모두 정확 모델). pos_cache 로
+    행성 위치 예측 캐싱.
     """
     dst_id = ctx.planets[dst].id
     for f in ctx.fleets:
         if f.owner == ctx.acting_player:
             continue
-        target_id, _ = fleet_dst_and_eta(f, ctx.planets)
+        target_id, _ = fleet_dst_and_eta(f, ctx.planets, av=ctx.av, pos_cache=ctx.pos_cache)
         if target_id == dst_id:
             return True
     return False
@@ -146,6 +146,7 @@ def projected_arrival_state(ctx: MaskContext, src: int, dst: int) -> bool:
     eff_turns = turns if turns else 1
     proj_owner, proj_ships = project_target_at_eta(
         ctx.planets[dst], eff_turns, ctx.planets, ctx.fleets,
+        av=ctx.av, pos_cache=ctx.pos_cache,
     )
     ctx.scratch[("proj", src, dst)] = (proj_owner, proj_ships, eff_turns)
     return True

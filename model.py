@@ -4,9 +4,8 @@ Hierarchical Transformer Policy for Orbit Wars.
 구조:
   1. Embedding       — 행성/fleet 토큰 → embed_dim
   2. Temporal Attn   — 과거 N턴 패턴 학습
-  3. Local Attn      — fleet ↔ 행성 관계
-  4. Global Attn     — 전체 전략
-  5. Actor / Critic  — 행동 확률 + 상태 가치
+  3. Encoder Attn    — [P;F] 통합 self-attn (local+global 통합)
+  4. Actor / Critic  — 행동 확률 + 상태 가치
 """
 
 import os
@@ -25,8 +24,7 @@ ENV = CFG["env"]
 EMBED_DIM              = M["embed_dim"]
 PLANET_TEMPORAL_LAYERS = M["planet_temporal_layers"]
 FLEET_TEMPORAL_LAYERS  = M["fleet_temporal_layers"]
-LOCAL_LAYERS           = M["local_layers"]
-GLOBAL_LAYERS          = M["global_layers"]
+ENCODER_LAYERS         = M["encoder_layers"]
 NUM_HEADS              = M["num_heads"]
 HISTORY                = M["temporal_window"]
 MAX_PLANETS     = ENV["max_planets"]
@@ -93,21 +91,6 @@ def make_transformer(layers):
     return nn.TransformerEncoder(encoder_layer, num_layers=layers)
 
 
-def make_decoder(layers):
-    """Cross-attn decoder: planet query 가 [P+F] memory 를 읽음.
-
-    한 층 안에 (planet self-attn) + (planet→[P+F] cross-attn) + FFN.
-    """
-    decoder_layer = nn.TransformerDecoderLayer(
-        d_model=EMBED_DIM,
-        nhead=NUM_HEADS,
-        dim_feedforward=EMBED_DIM * 2,
-        dropout=0.0,
-        batch_first=True,
-    )
-    return nn.TransformerDecoder(decoder_layer, num_layers=layers)
-
-
 def _safe_pad_mask(pad_mask):
     """src_key_padding_mask 안전화: 시퀀스 전체가 padding 인 경우 NaN 회피.
 
@@ -159,14 +142,14 @@ class OrbitWarsPolicy(nn.Module):
             EMBED_DIM, NUM_HEADS, dropout=0.0, batch_first=True
         )
 
-        # 2. Local Attention — fleet ↔ 행성 관계
-        self.local_attn = make_transformer(LOCAL_LAYERS)
-
-        # 3. Global Attention — planet query 가 [P+F] memory 를 cross-attn 으로 읽음.
-        # 기존 P-only self-attn 의 정보 병목 (함대가 local 후 사라짐) 해소:
-        # local 4층으로 P+F 관계 깊게 섞고, global decoder 가 마지막에 P 가 함대까지
-        # 한 번 더 참조해 의사결정 표현 만듦.
-        self.global_attn = make_decoder(GLOBAL_LAYERS)
+        # 2. Encoder Attention — [P;F] 통합 self-attn (local+global 통합).
+        # 이전: local 4층 (encoder) + global 2층 (decoder, P-query × [P+F]-memory cross-attn).
+        # decoder layer 의 self-attn(P→P) / cross-attn(P→[P+F]) / FFN 효과는 self-attn
+        # 만으로도 흡수됨 — P 토큰이 F 토큰을 attend 하는 정보 흐름이 self-attn 한 번이면
+        # 일어나고, decoder 의 dedicated Q/K 분리는 planet_embed/fleet_embed 의 입력 분리로
+        # 자동 학습됨. 6층 → 3층으로 깊이 절반.
+        # 출력의 [:, :MAX_PLANETS, :] 가 actor/critic 입력.
+        self.encoder = make_transformer(ENCODER_LAYERS)
 
         # Actor heads — sequential factorization (Step 4: target pair-aware):
         #   target_i  ~ Categorical(q(H_i) · k(H_j) / sqrt(E))              # (B, P, P)
@@ -277,7 +260,7 @@ class OrbitWarsPolicy(nn.Module):
         """
         obs_flat: (B, HISTORY * (MAX_PLANETS * PLANET_DIM + MAX_FLEETS * FLEET_DIM))
         returns:
-          src_token: (B, MAX_PLANETS, EMBED_DIM) — encoder output (= global_out)
+          src_token: (B, MAX_PLANETS, EMBED_DIM) — encoder([P;F]) 의 [:, :P, :]
           value:     (B, 1)
         head 적용은 get_action_and_value / evaluate_actions 가 담당 (target → amount
         sequential conditional sampling 때문에 forward 단에서 amount logits 를 미리
@@ -344,31 +327,23 @@ class OrbitWarsPolicy(nn.Module):
         f_t = self._gated_planet_fuse(f_t, p_t, planet_pad_now, dp_idx_raw,
                                        self.fleet_dest_value,   self.fleet_dest_gate)
 
-        # --- 2. Local Attention (fleet ↔ 행성) ---
-        local_tokens = torch.cat([p_t, f_t], dim=1)               # (B, P+F, E)
-        local_pad    = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
-        local_out    = self.local_attn(local_tokens, src_key_padding_mask=_safe_pad_mask(local_pad))
-        p_query = local_out[:, :MAX_PLANETS, :]                   # (B, P, E) — decoder query
-
-        # --- 3. Global Attention (cross-attn: P → [P+F]) ---
-        # tgt    = planet local output (B, P, E)
-        # memory = full local output  (B, P+F, E)  — 함대 정보 유지
-        global_out = self.global_attn(
-            tgt=p_query,
-            memory=local_out,
-            tgt_key_padding_mask=_safe_pad_mask(planet_pad_now),
-            memory_key_padding_mask=_safe_pad_mask(local_pad),
-        )
+        # --- 2. Encoder Attention ([P;F] 통합 self-attn) ---
+        # 이전 local 4층 + global 2층 (decoder cross-attn) 을 단일 encoder N층으로 통합.
+        # P 토큰이 F 토큰을 self-attn 으로 attend → cross-attn 효과 흡수.
+        tokens  = torch.cat([p_t, f_t], dim=1)                    # (B, P+F, E)
+        pad     = torch.cat([planet_pad_now, fleet_pad_now], dim=1)
+        enc_out = self.encoder(tokens, src_key_padding_mask=_safe_pad_mask(pad))
+        src_token = enc_out[:, :MAX_PLANETS, :]                   # (B, P, E) — actor/critic 입력
 
         # --- Critic (masked mean 풀링) ---
         # 빈 행성 토큰을 평균에서 배제 — 후반 P_alive ≪ MAX_PLANETS 일 때
         # 분모를 P 로 고정하면 V 가 인위적으로 줄어들어 advantage 가 부풀어 오름.
-        valid_p     = (~planet_pad_now).to(global_out.dtype).unsqueeze(-1)   # (B, P, 1)
-        valid_sum   = (global_out * valid_p).sum(dim=1)                       # (B, E)
+        valid_p     = (~planet_pad_now).to(src_token.dtype).unsqueeze(-1)    # (B, P, 1)
+        valid_sum   = (src_token * valid_p).sum(dim=1)                        # (B, E)
         valid_count = valid_p.sum(dim=1).clamp(min=1.0)                       # (B, 1)
         value       = self.critic(valid_sum / valid_count)                    # (B, 1)
 
-        return global_out, value
+        return src_token, value
 
     def _gather_amount_features(self, amount_features, target_idx):
         """Shape-detect helper: full (B,P,P,K,F) → gathered (B,P,K,F) by target_idx.

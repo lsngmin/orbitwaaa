@@ -604,6 +604,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             fleets_for_proj = analysis.fleets if analysis is not None else []
             proj_owner, proj_ships = project_target_at_eta(
                 target, eff_turns_proj, planets, fleets_for_proj,
+                av=av, pos_cache=pos_cache,
             )
             required = compute_support_required(p, target, proj_owner, proj_ships, acting_player)
             if required is None:

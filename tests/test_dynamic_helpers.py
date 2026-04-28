@@ -43,10 +43,11 @@ def test_no_fleets_only_production():
 
 def test_self_fleet_reinforces_owner():
     """같은 owner fleet 도착 → 함선 +."""
-    target = _planet(0, owner=1, x=50.0, y=50.0, ships=10, production=0)
-    src    = _planet(99, owner=1, x=10.0, y=50.0, ships=0)
-    # fleet at (15, 50) angle=0 (east) → planet 0 방향
-    fleet  = _fleet(0, owner=1, x=15.0, y=50.0, angle=0.0, ships=20, from_pid=99)
+    # y=20 — sun(50,50) 안 가로지르는 위치 (행성이 sun 위에 있을 수 없으므로).
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=10, production=0)
+    src    = _planet(99, owner=1, x=10.0, y=20.0, ships=0)
+    # fleet at (15, 20) angle=0 (east) → planet 0 방향
+    fleet  = _fleet(0, owner=1, x=15.0, y=20.0, angle=0.0, ships=20, from_pid=99)
     proj_owner, proj_ships = project_target_at_eta(
         target, eta=30, planets=[target, src], fleets=[fleet],
     )
@@ -57,9 +58,9 @@ def test_self_fleet_reinforces_owner():
 
 def test_enemy_fleet_captures_when_overwhelming():
     """적 fleet 의 ships > defender → 점령 swap."""
-    target = _planet(0, owner=1, x=50.0, y=50.0, ships=5, production=0)
-    src    = _planet(99, owner=0, x=10.0, y=50.0, ships=0)
-    fleet  = _fleet(0, owner=0, x=15.0, y=50.0, angle=0.0, ships=20, from_pid=99)
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=5, production=0)
+    src    = _planet(99, owner=0, x=10.0, y=20.0, ships=0)
+    fleet  = _fleet(0, owner=0, x=15.0, y=20.0, angle=0.0, ships=20, from_pid=99)
     proj_owner, proj_ships = project_target_at_eta(
         target, eta=30, planets=[target, src], fleets=[fleet],
     )
@@ -69,9 +70,9 @@ def test_enemy_fleet_captures_when_overwhelming():
 
 def test_enemy_fleet_attack_repelled_when_undermanned():
     """적 fleet 의 ships ≤ defender → 점령 실패, owner 유지."""
-    target = _planet(0, owner=1, x=50.0, y=50.0, ships=50, production=0)
-    src    = _planet(99, owner=0, x=10.0, y=50.0, ships=0)
-    fleet  = _fleet(0, owner=0, x=15.0, y=50.0, angle=0.0, ships=20, from_pid=99)
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=50, production=0)
+    src    = _planet(99, owner=0, x=10.0, y=20.0, ships=0)
+    fleet  = _fleet(0, owner=0, x=15.0, y=20.0, angle=0.0, ships=20, from_pid=99)
     proj_owner, proj_ships = project_target_at_eta(
         target, eta=30, planets=[target, src], fleets=[fleet],
     )
@@ -103,8 +104,8 @@ def test_fleet_after_eta_ignored():
 
 def test_fleet_dst_and_eta_basic():
     """ray-cast 가 첫 충돌 행성 + 도착 turn 반환."""
-    p = _planet(7, x=80.0, y=50.0)
-    f = _fleet(0, owner=0, x=15.0, y=50.0, angle=0.0, ships=10)
+    p = _planet(7, x=80.0, y=20.0)
+    f = _fleet(0, owner=0, x=15.0, y=20.0, angle=0.0, ships=10)
     dst_pid, eta = fleet_dst_and_eta(f, [p])
     assert dst_pid == 7
     assert eta >= 1   # 도착 시간 양수
@@ -117,6 +118,35 @@ def test_fleet_dst_and_eta_no_hit():
     f = _fleet(0, owner=0, x=50.0, y=90.0, angle=0.0, ships=10)
     dst_pid, eta = fleet_dst_and_eta(f, [p])
     assert dst_pid == -1
+    assert eta == math.inf
+
+
+def test_fleet_dst_and_eta_av_affects_orbiting_target():
+    """Tier C: av 파라미터가 공전 target 예측에 반영됨.
+
+    같은 fleet/target 이라도 av=0 (정적 가정) 와 av != 0 (실제 공전) 의 예측
+    결과가 달라야 함. target 은 orbital_radius=30, radius 5 → is_orbiting.
+    """
+    target = _planet(0, owner=1, x=50.0, y=20.0, ships=10, production=0)
+    f = _fleet(0, owner=0, x=10.0, y=20.0, angle=0.0, ships=20)
+
+    # av=0: target 은 현재 위치 고정 → fleet 이 정확히 hit.
+    dst_static, eta_static = fleet_dst_and_eta(f, [target], av=0.0)
+    assert dst_static == 0, "av=0 정적 view: target hit 예상"
+
+    # av=0.5: target 이 매우 빠르게 회전 → 정적 가정과 다른 결과.
+    dst_orbit, eta_orbit = fleet_dst_and_eta(f, [target], av=0.5)
+    assert (dst_orbit, eta_orbit) != (dst_static, eta_static), \
+        "av 적용 시 결과가 정적 가정과 달라야 함 (Tier C: orbit 진행 반영)"
+
+
+def test_fleet_dst_and_eta_sun_cross_excludes_target():
+    """A1: 경로가 sun 가로지르면 target 도달 못 함 (engine: fleet 소멸)."""
+    # target 이 sun 너머. fleet 동쪽 발사 → 경로가 sun(50,50) 통과 → 소멸.
+    target = _planet(0, owner=1, x=80.0, y=50.0, ships=10, production=0)
+    f = _fleet(0, owner=0, x=20.0, y=50.0, angle=0.0, ships=20)
+    dst_pid, eta = fleet_dst_and_eta(f, [target], av=0.0)
+    assert dst_pid == -1, "sun 통과 경로 → fleet 소멸, target 도달 못 함"
     assert eta == math.inf
 
 

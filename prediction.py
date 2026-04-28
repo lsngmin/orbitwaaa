@@ -94,7 +94,12 @@ def estimate_arrival_turn(distance, num_ships):
 
 
 def crosses_sun(src_x, src_y, dst_x, dst_y, sun_radius=10.5):
-    """fleet 직선 경로가 태양(중심 50,50)을 통과하는지 체크. 선분-원 교차 판정."""
+    """fleet 직선 경로가 태양(중심 50,50)을 통과하는지 체크. 선분-원 교차 판정.
+
+    sun_radius 기본 10.5 = 엔진 SUN_RADIUS(10.0) + 0.5 보수 margin
+    (mask 가 경계 fleet 도 sun-cross 로 차단). 엔진과 정확 일치는
+    호출자가 sun_radius=SUN_RADIUS 명시.
+    """
     dx = dst_x - src_x
     dy = dst_y - src_y
     fx = src_x - CENTER_X
@@ -153,6 +158,7 @@ def first_collision_on_path(src_planet, angle, num_ships, planets, av,
     cos_a = math.cos(angle)
     sin_a = math.sin(angle)
 
+    # GAME_RULES "Fleet Launch": fleet 은 행성 radius 바로 바깥(+0.1)에서 스폰.
     cur_x = src_planet.x + cos_a * (src_planet.radius + 0.1)
     cur_y = src_planet.y + sin_a * (src_planet.radius + 0.1)
 
@@ -223,53 +229,125 @@ def aim(src_planet, dst_planet, angular_velocity, num_ships, pos_cache=None):
     return math.atan2(ty - src_planet.y, tx - src_planet.x), tx, ty, turns
 
 
-def fleet_dst_and_eta(fleet, planets, radius_margin=1.5):
-    """fleet 의 ray-cast 첫 충돌 행성 id 와 ETA(turns).
+def fleet_dst_and_eta(fleet, planets, av=0.0, radius_margin=1.0, max_turns=200,
+                       pos_cache=None):
+    """fleet 의 미래 도착 행성 + ETA — 엔진 turn order 정확 모델.
 
-    encode_fleets 의 dst_idx 산출 logic 과 동일 (radius * 1.5 lenient margin).
-    충돌 행성 없으면 (-1, math.inf) 반환.
+    매 turn t (1..max_turns) 시뮬레이션 (GAME_RULES "Turn Order" 정확 미러):
+      Step 5 (Fleet Movement):
+        a. fleet 1턴 이동 → new_pos.
+        b. OOB / sun cross / planet collision 순서 체크.
+        c. planet collision 은 planet at (t-1) rotation 위치 기준
+           (엔진은 fleet movement 시점에 그 step 의 planet rotation 미적용).
+        d. 같은 turn 에 여러 행성이 후보면 segment 따라 가장 먼저 만나는 것.
+      Step 6 (Planet Rotation + Sweep):
+        - 공전 행성: position_{t-1} → position_t 호 (chord 근사).
+        - 그 chord 가 fleet 의 post-Step-5 위치를 휩쓸면 sweep hit.
+        - 정적 행성은 sweep 없음.
 
-    Returns: (dst_planet_id, eta)  — eta 는 ceil(distance / speed), 최소 1.
+    Args:
+        fleet:    Fleet — in-flight 함대 (현재 obs 위치/각도).
+        planets:  list[Planet] — 모든 행성 (현재 obs 위치).
+        av:       float — angular_velocity (radians/turn). obs 에서 가져와 전달.
+                  0 이면 모두 정적 가정 (정적 행성만 있는 환경에서만 안전).
+        radius_margin: float — 충돌 반경 배율. default 1.0 = engine 정확 (엔진은
+                  point_to_segment_distance < planet.radius strict). lenient
+                  필요 시 (encoder dst_idx 같은 ML 피처) 호출자가 1.5 명시.
+        max_turns: int — 최대 시뮬 턴 (default 200, board 대각선 + 안전 여유).
+        pos_cache: PositionCache — 있으면 predict_position 캐싱 (성능).
+
+    Returns:
+        (dst_planet_id, eta) — 충돌 없으면 (-1, math.inf). eta 는 정확한 첫 도착 turn.
     """
-    dx = math.cos(fleet.angle)
-    dy = math.sin(fleet.angle)
-    dst_pid = -1
-    first_t = math.inf
-    for p in planets:
-        fx = fleet.x - p.x
-        fy = fleet.y - p.y
-        t  = -(fx * dx + fy * dy)
-        if t <= 0:
-            continue
-        cx = fleet.x + t * dx
-        cy = fleet.y + t * dy
-        if math.hypot(cx - p.x, cy - p.y) > p.radius * radius_margin:
-            continue
-        if t < first_t:
-            first_t = t
-            dst_pid = p.id
-    if dst_pid == -1:
-        return -1, math.inf
     speed = fleet_speed(fleet.ships)
-    eta = max(1, int(math.ceil(first_t / speed)))
-    return dst_pid, eta
+    cos_a = math.cos(fleet.angle)
+    sin_a = math.sin(fleet.angle)
+
+    cur_x, cur_y = fleet.x, fleet.y
+
+    def _ppos(planet, turns):
+        if pos_cache is not None:
+            return pos_cache.predict(planet, turns)
+        return predict_position(planet, av, turns)
+
+    for t in range(1, max_turns + 1):
+        new_x = cur_x + cos_a * speed
+        new_y = cur_y + sin_a * speed
+
+        # Step 5a: out-of-bounds (GAME_RULES "Fleet Movement").
+        if not (0.0 <= new_x <= BOARD_SIZE and 0.0 <= new_y <= BOARD_SIZE):
+            return -1, math.inf
+
+        # Step 5b: sun cross — fleet 소멸. SUN_RADIUS strict (engine 일치).
+        if point_to_segment_distance((CENTER, CENTER),
+                                     (cur_x, cur_y), (new_x, new_y)) < SUN_RADIUS:
+            return -1, math.inf
+
+        # Step 5c: direct planet collision (planet at (t-1) rotation).
+        # 같은 turn 에 여러 후보면 segment 상에서 더 먼저 만나는 것 (smaller seg_t).
+        seg_dx = new_x - cur_x
+        seg_dy = new_y - cur_y
+        seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy
+        best_dst  = -1
+        best_segt = math.inf
+        for planet in planets:
+            px, py = _ppos(planet, t - 1)
+            d = point_to_segment_distance((px, py), (cur_x, cur_y), (new_x, new_y))
+            if d >= planet.radius * radius_margin:
+                continue
+            if seg_len_sq <= 0:
+                seg_t = 0.0
+            else:
+                seg_t = ((px - cur_x) * seg_dx + (py - cur_y) * seg_dy) / seg_len_sq
+                seg_t = max(0.0, min(1.0, seg_t))
+            if seg_t < best_segt:
+                best_segt = seg_t
+                best_dst  = planet.id
+        if best_dst != -1:
+            return best_dst, t
+
+        # Step 6: planet rotation + sweep (GAME_RULES "Planet rotation").
+        # 공전 행성이 (t-1) → (t) 호를 그리며 fleet 의 post-Step-5 위치를 휩쓸 수 있음.
+        # 정적 행성은 px_prev==px_now 라 자동 skip.
+        for planet in planets:
+            px_prev, py_prev = _ppos(planet, t - 1)
+            px_now,  py_now  = _ppos(planet, t)
+            if px_prev == px_now and py_prev == py_now:
+                continue
+            d = point_to_segment_distance((new_x, new_y),
+                                          (px_prev, py_prev), (px_now, py_now))
+            if d < planet.radius * radius_margin:
+                return planet.id, t
+
+        cur_x, cur_y = new_x, new_y
+
+    return -1, math.inf
 
 
-def project_target_at_eta(target, eta, planets, fleets):
+def project_target_at_eta(target, eta, planets, fleets, av=0.0, pos_cache=None):
     """target 행성을 eta 시점까지 forward simulate.
 
     in-flight fleet 들의 도착을 시간순으로 적용해서 (proj_owner, proj_ships) 반환.
     "freeze" 가정 외부 — 이 함수는 obs 에 보이는 사실만 사용 (적이 새로 안 쏠
     거라는 가정은 호출자 수준의 한계이지 이 함수의 한계가 아님).
 
-    production 은 owner 무관하게 누적 (기존 required_ships 공식과 동일 동작).
-    점령 swap 발생 시 sim_owner 갱신, defender 함선 0 미만 안 되도록 클램핑.
+    production 은 sim_owner != -1 구간에만 누적 (GAME_RULES "Production":
+    owned planet 만 함선 생성). 점령 swap 발생 시 sim_owner 갱신, defender
+    함선 0 미만 안 되도록 클램핑.
+
+    ⚠️ GAME_RULES 와 다른 점 (남은 한계):
+      Combat 처리: 같은 ETA 에 서로 다른 owner fleet 이 여럿 도착할 때
+      GAME_RULES "Combat" 은 "largest vs second largest 먼저 → 잔존이
+      garrison 과 전투". 이 함수는 시간순 1:1 처리 → 4P 게임 동시 도착
+      부정확. (2P 게임에선 적이 1명이라 영향 미미.)
 
     Args:
         target:   Planet — 시뮬 대상
         eta:      int    — sim horizon (turns). target 의 함선 변화는 이 시점 기준.
-        planets:  list[Planet] — 모든 행성 (ray-cast 용 좌표)
+        planets:  list[Planet] — 모든 행성 (좌표/공전 정보용)
         fleets:   list[Fleet]  — 모든 in-flight fleet
+        av:       float — angular_velocity (obs). fleet 도착 예측에 필요.
+        pos_cache: PositionCache — 있으면 fleet_dst_and_eta 캐싱 가속.
 
     Returns:
         (proj_owner, proj_ships) — eta 시점 owner (-1/0/1) 와 함선 수
@@ -279,14 +357,16 @@ def project_target_at_eta(target, eta, planets, fleets):
 
     arrivals = []
     for f in fleets:
-        dst_pid, f_eta = fleet_dst_and_eta(f, planets)
+        dst_pid, f_eta = fleet_dst_and_eta(f, planets, av=av, pos_cache=pos_cache)
         if dst_pid == target.id and f_eta <= eta:
             arrivals.append((f_eta, f))
     arrivals.sort(key=lambda x: x[0])
 
     last_t = 0
     for arrive_t, f in arrivals:
-        sim_ships += target.production * (arrive_t - last_t)
+        # A3: 중립(owner=-1) 구간엔 production 없음 (GAME_RULES).
+        if sim_owner != -1:
+            sim_ships += target.production * (arrive_t - last_t)
         if f.owner == sim_owner:
             sim_ships += f.ships
         else:
@@ -297,7 +377,8 @@ def project_target_at_eta(target, eta, planets, fleets):
                 sim_ships -= f.ships
         last_t = arrive_t
 
-    sim_ships += target.production * (eta - last_t)
+    if sim_owner != -1:
+        sim_ships += target.production * (eta - last_t)
     return sim_owner, sim_ships
 
 
@@ -400,11 +481,17 @@ def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
 
     def _required_at(eff_turns):
         if use_dynamic:
-            proj_owner, proj_ships = project_target_at_eta(dst, eff_turns, planets, fleets)
+            proj_owner, proj_ships = project_target_at_eta(
+                dst, eff_turns, planets, fleets,
+                av=angular_velocity, pos_cache=pos_cache,
+            )
             if proj_owner == src.owner:
                 # 도착 시점에 이미 내 거 — 점령 의미 없음 (호출자가 mask off)
                 return 0
             return max(1, int(proj_ships) + 1)
+        # A4: static fallback — 중립(owner=-1) 은 production 없음 (GAME_RULES).
+        if dst.owner == -1:
+            return dst.ships + 1
         return dst.ships + dst.production * eff_turns + 1
 
     def _send_for(req):
