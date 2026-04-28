@@ -102,6 +102,16 @@ class HitRateTracker:
         "capture_hold_k_total", "capture_hold_k_success",
         "post_reloss_k_total", "post_reloss_k_count",
         "unknown_removal",
+        # Phase B: launch cost penalty (continuous req/src) accumulator.
+        "launch_cost_excess_sum",
+        # Phase C support (자기 행성 지원 launch). neutral/enemy 와 분리.
+        "support_launches", "support_ships_to_send_sum",
+        # 초반 중립 확장 진단 (turn_norm < 0.25 AND target.owner == -1).
+        "early_neutral_count",
+        "early_neutral_eta_sum",
+        "early_neutral_req_over_src_sum",
+        "early_neutral_nearest_rank_sum",
+        "early_neutral_eta_advantage_sum",
     ) + tuple(f"ships_bin_hist_{k}" for k in range(NUM_SHIPS_BINS))
     HOME_EXPAND_TURNS = 20
     HOME_EXPAND_RADIUS = 25.0
@@ -380,6 +390,30 @@ class HitRateTracker:
         out["early_neutral_launch_to_cap_rate"] = (
             counters.get("early_launch_neutral_captured", 0) / max(early_n_att, 1)
         )
+
+        # ── 초반 중립 확장 품질 (turn_norm < 0.25 AND target.owner == -1) ─────
+        # "가까운 저비용 중립을 빠르게 먹는가" 검증용. 평균 위주 stat 만으론
+        # nearest_rank=1 (가장 가까움) vs rank=8 (멀고 비싼) 구분 X.
+        # decode 가 launched 기준으로 누적 — under_invested / filtered 제외.
+        early_n_count = counters.get("early_neutral_count", 0)
+        if early_n_count > 0:
+            out["early_neutral_eta_mean"]            = counters.get("early_neutral_eta_sum", 0.0) / early_n_count
+            out["early_neutral_req_over_src_mean"]   = counters.get("early_neutral_req_over_src_sum", 0.0) / early_n_count
+            out["early_neutral_nearest_rank_mean"]   = counters.get("early_neutral_nearest_rank_sum", 0.0) / early_n_count
+            out["early_neutral_eta_advantage_mean"]  = counters.get("early_neutral_eta_advantage_sum", 0.0) / early_n_count
+        else:
+            out["early_neutral_eta_mean"]            = 0.0
+            out["early_neutral_req_over_src_mean"]   = 0.0
+            out["early_neutral_nearest_rank_mean"]   = 0.0
+            out["early_neutral_eta_advantage_mean"]  = 0.0
+
+        # Phase C support (자기 행성 지원 launch). neutral/enemy capture 와 분리.
+        support_n = counters.get("support_launches", 0)
+        if support_n > 0:
+            out["support_ships_to_send_mean"] = counters.get("support_ships_to_send_sum", 0) / support_n
+        else:
+            out["support_ships_to_send_mean"] = 0.0
+        out["support_launches_per_step"] = support_n / steps
         # ── ships 분포 실측 파생 지표 (surplus-fraction Categorical) ─────
         # pooled variance: var = E[X²] - E[X]² 는 counter 합산에도 유효.
         # under_invested: src.ships < required (capacity short — bin 무관 점령 불가)

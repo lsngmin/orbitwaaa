@@ -485,7 +485,7 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
 # ── Agent 행동 생성 ───────────────────────────────────────────────────────────
 
 def decode_action_to_moves(action_np, raw_planets, av, acting_player,
-                           return_counts=False, analysis=None):
+                           return_counts=False, analysis=None, turn_norm=0.0):
     """Pure function: 샘플된 action_np → env moves 리스트. 모델 접근 없음.
 
     acting_player: 절대 owner ID (0 or 1). 행성 소유 판정에 사용.
@@ -494,6 +494,10 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         ships, angle, start_x, start_y, +진단 전용 src_ships_at_launch / required /
         ships_bin). fleet_id 매핑/resolve_step 입력 + req_over_src/send_frac×bin 진단.
     analysis: ActionSpace. 있으면 planets/pos_cache 재사용 (mask 단계와 공유).
+    turn_norm: ep_step / episode_steps_max ∈ [0, 1]. early-neutral 진단 (turn_norm <
+        EARLY_PHASE_THRESHOLD = 0.25 이고 target.owner == -1) 에서 nearest_rank /
+        eta / req_over_src / eta_advantage 분포를 별도 집계 — “초반에 가까운 저비용
+        중립 잡는가” 검증용.
     """
     if analysis is not None:
         planets   = analysis.planets
@@ -541,7 +545,23 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                # 1.0+   : capacity short (penalty cap = req/src 그대로)
                # all_in_penalty (binary 80%) 와 별개 channel — cost feature
                # 와 reward 사이 continuous gradient 다리.
-               "launch_cost_excess_sum": 0.0}
+               "launch_cost_excess_sum": 0.0,
+               # ── Phase C support (자기 행성 지원 launch) ───────────────────
+               # decode 의 target.owner == acting_player 분기. 이전엔 invalid_target
+               # 으로 폐기됐던 launch 가 fa784e9 fix 후 정상 처리. neutral/enemy
+               # 통계와 분리해서 집계 — launch_to_cap_rate_enemy=1.43 같은 stat
+               # pollution 방지.
+               "support_launches": 0,
+               "support_ships_to_send_sum": 0,
+               # ── 초반 중립 확장 진단 (turn_norm < 0.25 AND target.owner == -1) ─
+               # "가까운 저비용 중립을 빠르게 먹는가" 검증용. 평균 위주 stat 만
+               # 으론 nearest_rank=1 (이상적) 인지 rank=8 (멀고 비싼) 인지 구분 X.
+               # 모두 launched (실제 발사된) 기준 — under_invested / filtered 제외.
+               "early_neutral_count": 0,                  # 분모
+               "early_neutral_eta_sum": 0.0,              # 평균 eta_turns
+               "early_neutral_req_over_src_sum": 0.0,     # 평균 cost
+               "early_neutral_nearest_rank_sum": 0.0,     # 평균 rank (1=가장 가까운)
+               "early_neutral_eta_advantage_sum": 0.0}    # 평균 race signal (>0=내가 빠름)
     # action 5-way 선택 히스토그램: idx 0 = skip, idx 1..K = bin (k-1).
     # ships_bin_hist_k 는 발사된 launch 들의 bin (0..K-1) 분포.
     # action_skip_count 는 skip 선택된 source step 수 (per-source 발사 보류 빈도).
@@ -607,10 +627,14 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         # under_invested: src.ships < required → 1-A 가 ships_needed=0 으로 막은 케이스.
         # filtered_zero_ships 와 분리해서 *발사 시도* 시점에 집계 (학습 페널티/지표용).
         # required=0 (target 이 ETA 시점 self-owned) 은 점령 자체 의미 없음 → 제외.
+        # Phase C: self-target (support) 는 capture 가 아니므로 neutral/enemy 분기에서 제외.
         if required > 0 and p.ships < required:
             counts["under_invested_count"] += 1
-            suffix = "neutral" if target.owner == -1 else "enemy"
-            counts[f"under_invested_count_{suffix}"] += 1
+            if target.owner == -1:
+                counts["under_invested_count_neutral"] += 1
+            elif target.owner != acting_player:  # enemy
+                counts["under_invested_count_enemy"] += 1
+            # self-target under_invested 는 support_launches 카운트에서 함의됨
         if ships_needed <= 0:
             counts["filtered_zero_ships"] += 1
             continue
@@ -647,11 +671,20 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         counts["required_ships_sum"]       += required
         counts["send_required_ratio_sum"]  += srr
         counts[f"ships_bin_hist_{ships_bin}"] += 1
-        # target-type 분리 (neutral vs enemy)
-        suffix = "neutral" if target.owner == -1 else "enemy"
-        counts[f"ships_to_send_sum_{suffix}"]       += ships_needed
-        counts[f"required_ships_sum_{suffix}"]      += required
-        counts[f"send_required_ratio_sum_{suffix}"] += srr
+        # target-type 분리 (neutral / enemy / self-support).
+        # self-support 는 launch_to_cap_rate / send_required_ratio 정의가 다름
+        # (방어 회복 vs 점령) → 별도 카운트, capture 통계 (neutral/enemy) 와 분리.
+        if target.owner == -1:
+            counts["ships_to_send_sum_neutral"]       += ships_needed
+            counts["required_ships_sum_neutral"]      += required
+            counts["send_required_ratio_sum_neutral"] += srr
+        elif target.owner != acting_player:  # enemy
+            counts["ships_to_send_sum_enemy"]       += ships_needed
+            counts["required_ships_sum_enemy"]      += required
+            counts["send_required_ratio_sum_enemy"] += srr
+        else:  # self / Phase C support
+            counts["support_launches"]            += 1
+            counts["support_ships_to_send_sum"]   += ships_needed
         # per-target 누적 (over-send 산출용 — 같은 target 두 번째 launch 부터는 required 고정)
         target_sends[target.id]   = target_sends.get(target.id, 0) + ships_needed
         target_required.setdefault(target.id, required)
@@ -674,6 +707,34 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         if p.ships > 0:
             req_over_src_lin = float(required) / float(p.ships)
             counts["launch_cost_excess_sum"] += max(0.0, req_over_src_lin - 0.5)
+
+        # 초반 중립 확장 진단: turn_norm < 0.25 AND target.owner == -1.
+        #   nearest_rank: src 에서 launchable 한 모든 중립을 ETA 오름차순 정렬,
+        #     선택한 target 의 순위. 1=가장 가까운 중립, 8=8번째로 가까운 중립.
+        #   eta_advantage: pair_features ch6, >0 = 적보다 빨리 도달.
+        # analysis 가 None 이면 pair_features 접근 불가 → skip.
+        EARLY_PHASE_THRESHOLD = 0.25
+        if (turn_norm < EARLY_PHASE_THRESHOLD
+                and target.owner == -1
+                and analysis is not None):
+            counts["early_neutral_count"] += 1
+            counts["early_neutral_eta_sum"] += float(turns) if turns else 1.0
+            counts["early_neutral_req_over_src_sum"] += float(required) / max(p.ships, 1)
+            # nearest_rank 산출: src=i 에서 launchable 한 중립들을 eta_norm (ch2) 으로 정렬.
+            pair_feats = analysis.pair_features_target  # (P, P, F_t)
+            tmask_row = analysis.target_mask[i]          # (P,) bool
+            candidates = []
+            for j in range(len(planets)):
+                if bool(tmask_row[j]) and planets[j].owner == -1:
+                    eta_val = float(pair_feats[i, j, 2])  # ch2 = eta_norm
+                    candidates.append((j, eta_val))
+            candidates.sort(key=lambda x: x[1])
+            rank = next((idx + 1 for idx, (j, _) in enumerate(candidates)
+                         if j == target_idx), 0)
+            if rank > 0:
+                counts["early_neutral_nearest_rank_sum"] += rank
+            # eta_advantage = pair_features ch6.
+            counts["early_neutral_eta_advantage_sum"] += float(pair_feats[i, target_idx, 6])
 
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
@@ -734,7 +795,7 @@ def _opp_moves(opponent_model, obs_tensor, raw_planets, raw_fleets, av, device, 
         )
     return decode_action_to_moves(
         action.squeeze(0).cpu().numpy(), raw_planets, av,
-        acting_player=1, analysis=analysis,
+        acting_player=1, analysis=analysis, turn_norm=turn_norm,
     )
 
 
@@ -872,7 +933,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             action_np  = action_t.squeeze(0).cpu().numpy()
             moves_main, decode_counts, launches_main = decode_action_to_moves(
                 action_np, raw_planets, av, acting_player=0, return_counts=True,
-                analysis=analysis,
+                analysis=analysis, turn_norm=turn_norm,
             )
             hit_tracker.record(decode_counts)
 
@@ -1596,6 +1657,7 @@ def evaluate(main_model, opponent_model, n_games=20):
             moves_main, counts, _launches = decode_action_to_moves(
                 action_t.squeeze(0).cpu().numpy(), raw_p, av,
                 acting_player=0, analysis=analysis_e, return_counts=True,
+                turn_norm=turn_norm_e,
             )
             game_launched += counts.get("launched", 0)
             game_under    += counts.get("under_invested_count", 0)
@@ -1697,6 +1759,7 @@ def _run_eval_game(p0_model, p1_model, tracker):
         moves_p0, counts, launches = decode_action_to_moves(
             action_t.squeeze(0).cpu().numpy(), raw_p, av,
             acting_player=0, analysis=analysis, return_counts=True,
+            turn_norm=turn_norm_v,
         )
         tracker.record(counts)
 
@@ -2044,6 +2107,14 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 mean_early_launch_neutral_captured=rew_stats.get("mean_early_launch_neutral_captured", 0.0),
                 early_launch_neutral_captured_per_episode=rew_stats.get("early_launch_neutral_captured_per_episode", 0.0),
                 early_neutral_launch_to_cap_rate=rew_stats.get("early_neutral_launch_to_cap_rate", 0.0),
+                # 초반 중립 확장 품질 (Phase E 진단)
+                early_neutral_eta_mean=rew_stats.get("early_neutral_eta_mean", 0.0),
+                early_neutral_req_over_src_mean=rew_stats.get("early_neutral_req_over_src_mean", 0.0),
+                early_neutral_nearest_rank_mean=rew_stats.get("early_neutral_nearest_rank_mean", 0.0),
+                early_neutral_eta_advantage_mean=rew_stats.get("early_neutral_eta_advantage_mean", 0.0),
+                # Phase C support stats
+                support_launches_per_step=rew_stats.get("support_launches_per_step", 0.0),
+                support_ships_to_send_mean=rew_stats.get("support_ships_to_send_mean", 0.0),
                 chosen_surplus_frac_mean=rew_stats.get("chosen_surplus_frac_mean", 0.0),
                 chosen_surplus_frac_std=rew_stats.get("chosen_surplus_frac_std", 0.0),
                 send_fraction_of_src_mean=rew_stats.get("send_fraction_of_src_mean", 0.0),

@@ -119,6 +119,19 @@ class TrainingLogger:
             "early_neutral_captured_per_episode",
             "early_launch_neutral_captured_per_episode",
             "early_neutral_launch_to_cap_rate",
+            # ── 초반 중립 확장 품질 (turn_norm < 0.25 AND target.owner == -1) ─
+            # "가까운 저비용 중립을 빠르게 먹는가" 검증. 모두 launched 기준.
+            #   eta_mean             : 평균 eta_turns (작을수록 가까움)
+            #   req_over_src_mean    : 평균 cost (낮을수록 저비용)
+            #   nearest_rank_mean    : src 에서 launchable 중립 ETA-sort 시 평균 순위
+            #                          (1=항상 가장 가까운 중립, ≥3=비효율 확장)
+            #   eta_advantage_mean   : 평균 race signal (>0=내가 더 빠름)
+            "early_neutral_eta_mean", "early_neutral_req_over_src_mean",
+            "early_neutral_nearest_rank_mean", "early_neutral_eta_advantage_mean",
+            # Phase C support (자기 행성 지원 launch). neutral/enemy capture 와 분리.
+            #   support_launches_per_step : per-step 평균 support launch 수
+            #   support_ships_to_send_mean: support launch 당 평균 함선 수
+            "support_launches_per_step", "support_ships_to_send_mean",
             # ── ships 분포 실측 (Categorical surplus-fraction head) ─────────
             # chosen_surplus_frac_*: capacity-short 제외한 bin 선택 분포
             # send_fraction_of_src_*: floor 포함 실제 자원 소진률 (ships/src.ships)
