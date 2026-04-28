@@ -38,13 +38,26 @@ from prediction import (
 # 각 항의 의미는 _score 함수 docstring 참조. 코드는 가중합만 한다.
 # black-box 최적화 (CMA-ES / grid search) 의 입력 차원 = len(WEIGHTS).
 
+# ── 정규화 상수 ─────────────────────────────────────────────────────────
+# 모든 feature 가 ~[0, 1] 스케일에 들어오도록 게임 룰 기반 분모.
+# 가중치 의미를 비교 가능하게 하기 위함 — 튜닝 전 필수.
+PROD_MAX      = 5.0      # production ∈ [1, 5] (GAME_RULES Planets)
+EPISODE_STEPS = 500.0    # episodeSteps default
+SHIPS_REF     = 20.0     # "보통" launch 함선 수 (스케일 단위, 튜닝 무관)
+ETA_REF       = 120.0    # 정상 in-range eta 의 상한 (board 대각선 ~141)
+
+
+# ── 가중치 벡터 (튜닝 대상) ──────────────────────────────────────────────
+# 모든 feature 가 정규화돼 있어 weight 들이 같은 스케일에서 비교됨 →
+# random search / CMA-ES search 공간이 의미를 가짐. 손튜닝 금지.
+
 WEIGHTS = {
-    "cap_value":   1.0,   # 점령 시 얻을 production × 잔여 step 의 효율
-    "eta":         0.05,  # ETA 길수록 불확실 → 음수 가중
+    "cap_eff":     1.0,   # production-per-ship efficiency (정규화)
+    "eta":         1.0,   # ETA 길수록 불확실 → 음수 가중
     "src_drain":   1.0,   # src 함선 비율 소진 패널티
-    "support":     2.0,   # 내 행성 방어 보너스 (잃을 production 회수)
-    "tgt_prod":    0.5,   # target.production 자체 매력도
-    "neutral_aff": 0.0,   # 중립 vs 적 선호 (default 0 = 점수식이 알아서 결정)
+    "support":     1.0,   # 내 행성 보강 보너스
+    "tgt_prod":    1.0,   # target 자체 production (즉시 가치)
+    "neutral_aff": 0.0,   # 중립 vs 적 선호 (default 0)
 }
 
 
@@ -67,31 +80,32 @@ class GreedyExpandSupportBot:
 
     def _score(self, *, dst, ships_needed, src_ships, eta, total_steps_left,
                is_support: bool) -> float:
-        """후보 (src→dst) 의 가중합 점수.
+        """후보 (src→dst) 의 가중합 점수. 모든 feature 는 ~[0, 1] 정규화.
 
-        모든 feature 는 단조 의미를 갖는 연속값. phase 별 if-else 없음.
-
-        cap_value:   dst.production × 잔여 step / ships_needed
-                     - 한 함선당 미래 누적 생산 기대값 (점령 효율).
-                     - 이 항만으로도 "초반엔 싸고 가까운 중립 우선, 후반엔 점령
-                       해도 시간 짧아 매력↓" 가 자연스럽게 나옴.
-        eta:         도착까지 턴. 음수 가중 — 길수록 적이 반응 / 상황 변화.
-        src_drain:   ships_needed / src.ships. src 비우는 행동 패널티.
-        support:     내 행성 보강이면 +1 (잃을 production 회수의 가치).
-        tgt_prod:    target 자체 production. 점령 후 즉시 가치.
-        neutral_aff: dst 가 중립이면 +1, 적이면 -1. default 0 (점수식이
-                     이미 efficiency 로 구분하므로 추가 편향 안 줌).
+        cap_eff:     (prod/5) · (steps_left/500) / max(1, ships/20)
+                     점령 효율 — 한 함선당 미래 누적 생산. 분모는 SHIPS_REF
+                     기준으로 1 미만 안 되도록 클램핑 (소량 send 폭주 방지).
+        eta:         eta / ETA_REF. 도착까지 턴 (음수 가중).
+        src_drain:   ships / src_ships. src 비우는 행동 패널티 (이미 0~1).
+        support:     0/1 indicator.
+        tgt_prod:    prod / PROD_MAX. target 자체 production (즉시 가치).
+        neutral_aff: dst 가 중립이면 +1, 적이면 -1, support 면 0.
+                     (capture 후보 안에서만 의미 있는 부호 indicator.)
         """
-        prod_per_ship = (dst.production * max(1, total_steps_left)) / max(1, ships_needed)
-        drain         = ships_needed / max(1, src_ships)
-        neutral_sign  = 1.0 if dst.owner == -1 else (-1.0 if not is_support else 0.0)
+        prod_norm  = dst.production / PROD_MAX
+        steps_norm = max(1.0, total_steps_left) / EPISODE_STEPS
+        ships_norm = max(1.0, ships_needed / SHIPS_REF)
+        cap_eff    = (prod_norm * steps_norm) / ships_norm
+        eta_norm   = eta / ETA_REF
+        drain      = ships_needed / max(1, src_ships)
+        neutral_sign = 0.0 if is_support else (1.0 if dst.owner == -1 else -1.0)
 
         return (
-              self.w["cap_value"]   * prod_per_ship
-            - self.w["eta"]         * eta
+              self.w["cap_eff"]     * cap_eff
+            - self.w["eta"]         * eta_norm
             - self.w["src_drain"]   * drain
             + self.w["support"]     * (1.0 if is_support else 0.0)
-            + self.w["tgt_prod"]    * dst.production
+            + self.w["tgt_prod"]    * prod_norm
             + self.w["neutral_aff"] * neutral_sign
         )
 
