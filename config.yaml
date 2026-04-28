@@ -92,7 +92,7 @@ training:
   #   threshold_turn_norm               : launch 시점 turn_norm < 이 값 (default 0.25).
   #   max_nearest_rank                  : src 기준 ETA 정렬 시 ≤ 이 값 (1=가장 가까움).
   #   max_req_over_src                  : required/src.ships ≤ 이 값 (0.5=절반 이하).
-  early_close_neutral_capture_bonus: 0.0
+  early_close_neutral_capture_bonus: 0.007
   early_close_threshold_turn_norm: 0.25
   early_close_max_nearest_rank: 1
   early_close_max_req_over_src: 0.5
