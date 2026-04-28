@@ -18,7 +18,6 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 from prediction import (
     PositionCache,
     fleet_dst_and_eta,
-    project_target_at_eta,
 )
 
 EPISODE_STEPS = 500.0
@@ -51,6 +50,7 @@ class StepCache:
         self.inbound_ally_ships:  Dict[int, int]   = {}
         self.inbound_by_owner:    Dict[Tuple[int, int], int] = {}  # (pid, owner) → ships
         self.enemy_min_eta:       Dict[int, int]   = {}    # planet_id → 최소 적 ETA
+        self.fleet_arrivals:      Dict[int, List[Tuple[int, Fleet]]] = {}
         self.local_ally_prod:     Dict[int, float] = {}    # planet_id → 반경 내 합
         self.local_enemy_prod:    Dict[int, float] = {}
 
@@ -71,6 +71,7 @@ class StepCache:
                                             pos_cache=self.pos_cache)
             if dpid == -1:
                 continue
+            self.fleet_arrivals.setdefault(dpid, []).append((int(eta), f))
             self.inbound_by_owner[(dpid, f.owner)] = (
                 self.inbound_by_owner.get((dpid, f.owner), 0) + int(f.ships))
             if f.owner == self.player:
@@ -110,9 +111,30 @@ class StepCache:
         cached = self._proj_cache.get(key)
         if cached is not None:
             return cached
-        owner, ships = project_target_at_eta(
-            dst, eta, self.planets, self.fleets,
-            av=self.av, pos_cache=self.pos_cache,
-        )
+        owner = dst.owner
+        ships = float(dst.ships)
+        arrivals = [
+            (arrive_t, f)
+            for arrive_t, f in self.fleet_arrivals.get(dst.id, [])
+            if arrive_t <= eta
+        ]
+        arrivals.sort(key=lambda x: x[0])
+
+        last_t = 0
+        for arrive_t, f in arrivals:
+            if owner != -1:
+                ships += dst.production * (arrive_t - last_t)
+            if f.owner == owner:
+                ships += f.ships
+            else:
+                if f.ships > ships:
+                    owner = f.owner
+                    ships = f.ships - ships
+                else:
+                    ships -= f.ships
+            last_t = arrive_t
+
+        if owner != -1:
+            ships += dst.production * (eta - last_t)
         self._proj_cache[key] = (owner, ships)
         return owner, ships

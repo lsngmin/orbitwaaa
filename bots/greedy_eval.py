@@ -241,21 +241,27 @@ def random_search(
     per_opp_keys = [f"vs_{opponent_label(o)}_wr" for o in eval_opponents]
     fieldnames = ["trial_id"] + weight_keys + stat_keys + per_opp_keys
 
-    # Resume: 기존 행 수 = 다음 trial id
-    start_trial = 0
+    # Resume: 완료된 trial_id 를 기준으로 skip.
+    # n_workers > 1 에서는 CSV 행 순서가 trial_id 순서가 아니고, crash 시
+    # 중간 trial만 기록될 수 있으므로 row count 로 재개하면 weight가 꼬인다.
+    completed_trials = set()
     if os.path.exists(output_csv) and os.path.getsize(output_csv) > 0:
         with open(output_csv) as f:
-            start_trial = max(0, sum(1 for _ in f) - 1)
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    completed_trials.add(int(row["trial_id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
 
     # 모든 weights 미리 sampling — reproducibility + worker 분배 위함.
     # Resume 시에도 trial_id별 weight가 처음부터 연속 실행한 경우와 같아야 한다.
     rng = random.Random(rng_seed)
-    for _ in range(start_trial):
-        sampler(rng)
     tasks = []
-    for trial_id in range(start_trial, n_trials):
+    for trial_id in range(n_trials):
         w = sampler(rng)
-        tasks.append((trial_id, w, eval_seeds, eval_opponents))
+        if trial_id not in completed_trials:
+            tasks.append((trial_id, w, eval_seeds, eval_opponents))
 
     write_header = (not os.path.exists(output_csv)
                      or os.path.getsize(output_csv) == 0)
