@@ -25,10 +25,10 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 
 from bots.greedy_cache import StepCache
 from prediction import (
+    aim,
     compute_support_required,
     crosses_sun,
     resolve_ships_for_capture,
-    resolve_ships_for_support,
 )
 
 
@@ -59,7 +59,7 @@ WEIGHTS = {
     },
     "neutral": {
         "bias":          0.0,
-        "nearest":       1.0,   # 0 = 가장 가까운, 1 = 가장 먼
+        "nearest":       1.0,   # 1 = 가장 가까운, 0 = 가장 먼
     },
     "enemy": {
         "bias":          0.0,
@@ -187,22 +187,33 @@ class GreedyExpandSupportBot:
             enemy_in = cache.inbound_enemy_ships.get(dst.id, 0)
             if enemy_in <= 0:
                 return None
-            ally_in = cache.inbound_ally_ships.get(dst.id, 0)
-            net = dst.ships + ally_in - enemy_in
-            if net >= dst.ships:
-                return None
-            proj_owner = player if net > 0 else (
-                cache.fleets[0].owner if cache.fleets else -1
-            )
-            proj_ships = abs(net) if net > 0 else (enemy_in - dst.ships)
-            required = compute_support_required(src, dst, proj_owner, proj_ships, player)
+
+            # Support must be based on the state when our reinforcement lands,
+            # not on a flat sum of inbound ships. Iterate because ships changes
+            # fleet speed, which can change the target projection at ETA.
+            cap = max(1, int(math.ceil(int(src.ships) * 0.35)))
+            ships = min(int(src.ships), cap)
+            required = None
+            angle = 0.0
+            eta = 0
+            for _ in range(4):
+                angle, _, _, eta = aim(src, dst, cache.av, max(1, ships),
+                                       pos_cache=cache.pos_cache)
+                proj_owner, proj_ships = cache.project(dst, int(eta))
+                if proj_owner == player and proj_ships >= dst.ships:
+                    return None
+                required = compute_support_required(
+                    src, dst, proj_owner, proj_ships, player
+                )
+                if required is None:
+                    return None
+                next_ships = min(int(src.ships), cap, int(required))
+                if next_ships == ships:
+                    break
+                ships = next_ships
             if required is None:
                 return None
-            ships, angle, _, _, eta, req = resolve_ships_for_support(
-                src, dst, cache.av, bin_value=1.0,
-                src_ships=src.ships, required=required,
-                pos_cache=cache.pos_cache,
-            )
+            req = required
             kind = "support"
         else:
             # capture (neutral / enemy) — static 공식 (fleets/planets=None).
@@ -304,7 +315,7 @@ class GreedyExpandSupportBot:
             lst.sort()
             n = max(1, len(lst) - 1)
             for rank, (_, dst_id) in enumerate(lst):
-                neutral_rank_lookup[(src_id, dst_id)] = rank / n
+                neutral_rank_lookup[(src_id, dst_id)] = 1.0 - (rank / n)
 
         # feature 채움
         for c in raw_candidates:

@@ -248,7 +248,10 @@ def random_search(
             start_trial = max(0, sum(1 for _ in f) - 1)
 
     # 모든 weights 미리 sampling — reproducibility + worker 분배 위함.
-    rng = random.Random(rng_seed + start_trial)
+    # Resume 시에도 trial_id별 weight가 처음부터 연속 실행한 경우와 같아야 한다.
+    rng = random.Random(rng_seed)
+    for _ in range(start_trial):
+        sampler(rng)
     tasks = []
     for trial_id in range(start_trial, n_trials):
         w = sampler(rng)
