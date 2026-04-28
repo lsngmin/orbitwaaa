@@ -18,17 +18,15 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Tuple
+from collections import defaultdict
+from typing import Dict, Tuple
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 
+from bots.greedy_cache import StepCache
 from prediction import (
-    PositionCache,
-    aim,
     compute_support_required,
     crosses_sun,
-    fleet_dst_and_eta,
-    project_target_at_eta,
     resolve_ships_for_capture,
     resolve_ships_for_support,
 )
@@ -39,7 +37,6 @@ from prediction import (
 PROD_MAX        = 5.0      # production ∈ [1, 5] (GAME_RULES Planets)
 EPISODE_STEPS   = 500.0    # episodeSteps default
 ETA_REF         = 120.0    # 정상 in-range eta 상한 (board 대각선 ~141)
-LOCAL_RADIUS    = 25.0     # local_pressure 집계 반경 (board 100×100 의 1/4)
 PROD_LIFE_REF   = PROD_MAX * EPISODE_STEPS   # = 2500. prod_save 정규화 분모.
 
 
@@ -74,102 +71,6 @@ WEIGHTS = {
         "prod_save":     1.0,   # dst.production · steps_left / 2500
     },
 }
-
-
-# ── StepCache ───────────────────────────────────────────────────────────
-# act(obs) 진입 시 build, 종료 시 폐기. 전역 금지.
-
-class StepCache:
-    """Turn-local cache. scoring 은 read-only (committed_to_target 만 mutate).
-
-    build() 가 무거운 계산 (inbound, pressure, projection) 1회 수행.
-    Per-pair (eta, required, ships) 는 enumerate 단계에서 lazy 채워짐.
-    """
-
-    def __init__(self, planets: List[Planet], fleets: List[Fleet],
-                 player: int, av: float, step: int):
-        self.planets    = planets
-        self.fleets     = fleets
-        self.player     = player
-        self.av         = av
-        self.step       = step
-        self.steps_left = max(1, int(EPISODE_STEPS) - int(step))
-
-        self.pos_cache = PositionCache(planets, av)
-        self.my_planets = [p for p in planets if p.owner == player]
-        self._planet_by_id = {p.id: p for p in planets}
-
-        # build() 에서 채움
-        self.inbound_enemy_ships: Dict[int, int]   = {}    # planet_id → ships 합
-        self.inbound_ally_ships:  Dict[int, int]   = {}
-        self.inbound_by_owner:    Dict[Tuple[int, int], int] = {}  # (pid, owner) → ships
-        self.enemy_min_eta:       Dict[int, int]   = {}    # planet_id → 최소 적 ETA
-        self.local_ally_prod:     Dict[int, float] = {}    # planet_id → 반경 내 합
-        self.local_enemy_prod:    Dict[int, float] = {}
-
-        # (dst.id, eta) → projection 결과. inbound 있는 dst 만 채움.
-        self._proj_cache: Dict[Tuple[int, int], Tuple[int, float]] = {}
-
-        # MUTABLE during scoring — accept 마다 += ships
-        self.committed_to_target: Dict[int, int] = {}
-
-    def build(self) -> None:
-        """무거운 step-level 계산 1회."""
-        self._build_inbound()
-        self._build_local_pressure()
-
-    def _build_inbound(self) -> None:
-        for f in self.fleets:
-            dpid, eta = fleet_dst_and_eta(f, self.planets, av=self.av,
-                                            pos_cache=self.pos_cache)
-            if dpid == -1:
-                continue
-            self.inbound_by_owner[(dpid, f.owner)] = (
-                self.inbound_by_owner.get((dpid, f.owner), 0) + int(f.ships))
-            if f.owner == self.player:
-                self.inbound_ally_ships[dpid] = self.inbound_ally_ships.get(dpid, 0) + int(f.ships)
-            else:
-                self.inbound_enemy_ships[dpid] = self.inbound_enemy_ships.get(dpid, 0) + int(f.ships)
-                if dpid not in self.enemy_min_eta or eta < self.enemy_min_eta[dpid]:
-                    self.enemy_min_eta[dpid] = eta
-
-    def _build_local_pressure(self) -> None:
-        # O(P²) 1회. P~30 이라 ~900 ops, 무시 가능.
-        for target in self.planets:
-            ally_p = enemy_p = 0.0
-            for other in self.planets:
-                if other.id == target.id:
-                    continue
-                d = math.hypot(target.x - other.x, target.y - other.y)
-                if d > LOCAL_RADIUS:
-                    continue
-                if other.owner == self.player:
-                    ally_p += other.production
-                elif other.owner != -1:
-                    enemy_p += other.production
-            self.local_ally_prod[target.id]  = ally_p
-            self.local_enemy_prod[target.id] = enemy_p
-
-    def project(self, dst: Planet, eta: int) -> Tuple[int, float]:
-        """target_owner_at_eta, target_ships_at_eta — lazy 캐시.
-
-        inbound 없는 dst 면 정적 공식 (production 만 누적). 있으면 호출.
-        """
-        if (dst.id not in self.inbound_enemy_ships and
-            dst.id not in self.inbound_ally_ships):
-            # static: owner 변화 없음. neutral 은 production 0.
-            ships = dst.ships + (dst.production * eta if dst.owner != -1 else 0)
-            return dst.owner, float(ships)
-        key = (dst.id, eta)
-        cached = self._proj_cache.get(key)
-        if cached is not None:
-            return cached
-        owner, ships = project_target_at_eta(
-            dst, eta, self.planets, self.fleets,
-            av=self.av, pos_cache=self.pos_cache,
-        )
-        self._proj_cache[key] = (owner, ships)
-        return owner, ships
 
 
 # ── Candidate ───────────────────────────────────────────────────────────
@@ -394,7 +295,6 @@ class GreedyExpandSupportBot:
 
         # nearest_neutral_rank: src 별 neutral 후보 거리 정렬.
         neutral_rank_lookup: Dict[Tuple[int, int], float] = {}
-        from collections import defaultdict
         by_src_neutral = defaultdict(list)
         for c in raw_candidates:
             if c.kind == "neutral":
