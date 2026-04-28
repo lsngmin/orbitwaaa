@@ -92,6 +92,10 @@ BUNDLE_DIRS: list[tuple[str, Path]] = [
     # Phase C 이후 train.py 가 `from mask import ...` 함. 누락 시 Kaggle agent
     # import 단계에서 ImportError → 매 턴 status=ERROR (실제 episode 75585463 사례).
     ("mask",  ROOT),
+    # Reward 1차 분리 (2026-04) 이후 train.py 가 `from reward import ...` 함.
+    # 학습 reward 합성에만 쓰이고 inference 엔 영향 없지만, train.py top-level import
+    # 라 번들에 빠지면 ImportError → 매 턴 status=ERROR (episode 75590467 사례).
+    ("reward", ROOT),
 ]
 
 
