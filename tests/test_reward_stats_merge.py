@@ -21,12 +21,19 @@ from utils.hit_tracker import HitRateTracker
 
 
 def _make_raw(n_steps, episodes, dense, cap, terminal, **counters):
+    """legacy `cap` 인자는 분리 후 neutral_capture_bonus 쪽으로 전부 흘려보냄.
+
+    cap 분리: neutral_capture_bonus (gain) + own_planet_loss_penalty (loss).
+    이 helper 는 옛 단일 cap 시그니처를 유지하기 위해 cap 전체를 gain 으로
+    매핑 — mean_cap (deprecated) = cap / n_steps 동작이 보존됨.
+    """
     return {
         "counters":     defaultdict(float, counters),
         "n_steps":      n_steps,
         "episodes":     episodes,
         "sum_dense":    dense,
-        "sum_cap":      cap,
+        "sum_neutral_capture_bonus":  cap,
+        "sum_own_planet_loss_penalty": 0.0,
         "sum_terminal": terminal,
     }
 

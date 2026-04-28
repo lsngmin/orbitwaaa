@@ -44,6 +44,8 @@ from prediction import (
 )
 from mask import MaskContext, build_target_mask, build_action_mask
 from reward import RewardContext, compose_rewards
+from reward.events import LaunchMetadata
+from reward.trackers import LaunchCaptureTracker
 
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 with open(_cfg_path) as f:
@@ -706,19 +708,13 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             req_over_src_lin = float(required) / float(p.ships)
             counts["launch_cost_excess_sum"] += max(0.0, req_over_src_lin - 0.5)
 
-        # 초반 중립 확장 진단: turn_norm < 0.25 AND target.owner == -1.
-        #   nearest_rank: src 에서 launchable 한 모든 중립을 ETA 오름차순 정렬,
-        #     선택한 target 의 순위. 1=가장 가까운 중립, 8=8번째로 가까운 중립.
-        #   eta_advantage: pair_features ch6, >0 = 적보다 빨리 도달.
-        # analysis 가 None 이면 pair_features 접근 불가 → skip.
-        EARLY_PHASE_THRESHOLD = 0.25
-        if (turn_norm < EARLY_PHASE_THRESHOLD
-                and target.owner == -1
-                and analysis is not None):
-            counts["early_neutral_count"] += 1
-            counts["early_neutral_eta_sum"] += float(turns) if turns else 1.0
-            counts["early_neutral_req_over_src_sum"] += float(required) / max(p.ships, 1)
-            # nearest_rank 산출: src=i 에서 launchable 한 중립들을 eta_norm (ch2) 으로 정렬.
+        # nearest_rank: src 에서 launchable 한 모든 중립을 ETA 오름차순 정렬,
+        #   선택한 target 의 순위. 1=가장 가까운, 0=계산 안 됨 (target 비중립 또는 analysis 없음).
+        # 분리 전엔 early_neutral 진단 블록 안에서만 계산했으나, B 단계에서 launches
+        # metadata (reward attribution 입력) 로도 쓰이므로 phase 무관 / 모든 중립 launch
+        # 에서 계산. early_neutral_nearest_rank_sum 누적은 분기 안에서 그대로 진행.
+        nearest_rank = 0
+        if target.owner == -1 and analysis is not None:
             pair_feats = analysis.pair_features_target  # (P, P, F_t)
             tmask_row = analysis.target_mask[i]          # (P,) bool
             candidates = []
@@ -727,12 +723,26 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
                     eta_val = float(pair_feats[i, j, 2])  # ch2 = eta_norm
                     candidates.append((j, eta_val))
             candidates.sort(key=lambda x: x[1])
-            rank = next((idx + 1 for idx, (j, _) in enumerate(candidates)
-                         if j == target_idx), 0)
-            if rank > 0:
-                counts["early_neutral_nearest_rank_sum"] += rank
-            # eta_advantage = pair_features ch6.
-            counts["early_neutral_eta_advantage_sum"] += float(pair_feats[i, target_idx, 6])
+            nearest_rank = next((idx + 1 for idx, (j, _) in enumerate(candidates)
+                                 if j == target_idx), 0)
+
+        # 초반 중립 확장 진단: turn_norm < 0.25 AND target.owner == -1.
+        EARLY_PHASE_THRESHOLD = 0.25
+        if (turn_norm < EARLY_PHASE_THRESHOLD
+                and target.owner == -1
+                and analysis is not None):
+            counts["early_neutral_count"] += 1
+            counts["early_neutral_eta_sum"] += float(turns) if turns else 1.0
+            counts["early_neutral_req_over_src_sum"] += float(required) / max(p.ships, 1)
+            if nearest_rank > 0:
+                counts["early_neutral_nearest_rank_sum"] += nearest_rank
+            # eta_advantage = pair_features ch6, >0 = 적보다 빨리 도달.
+            counts["early_neutral_eta_advantage_sum"] += float(
+                analysis.pair_features_target[i, target_idx, 6]
+            )
+
+        # target_kind: support (자기 행성) / attack (그 외). Phase C 분기와 동일 의미.
+        target_kind = "support" if target.owner == acting_player else "attack"
 
         moves.append([p.id, angle, ships_needed])
         start_x = p.x + math.cos(angle) * (p.radius + 0.1)
@@ -742,7 +752,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             "target_id": target.id,
             "source_idx": i,                # planets[] index (eta_advantage lookup 용)
             "target_idx": target_idx,       # planets[] index
-            "target_owner": target.owner,   # -1: neutral, 그 외: 적 (우리는 self 마스킹됨)
+            "target_owner": target.owner,   # -1: neutral, 그 외: 적/자기
             "ships": ships_needed,
             "angle": angle,
             "start_x": start_x,
@@ -758,6 +768,16 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             "ships_bin": int(ships_bin),
             "src_prod_at_launch": float(p.production),
             "eta_turns": int(turns) if turns else 1,
+            # B 단계 — reward 의 LaunchMetadata 로 매핑되는 metadata.
+            #   target_kind            : "attack" | "support" (Phase C 분기와 동일)
+            #   nearest_neutral_rank   : src 기준 중립 ETA 정렬 시 target 순위 (1=가장 가까움, 0=N/A)
+            #   req_over_src/prod      : cost 측 ratio (이미 진단에서 분포로도 추적 중)
+            # turn 은 caller (train.py) 가 ep_step 을 채움 (decode 는 ep_step 모름).
+            "target_kind": target_kind,
+            "nearest_neutral_rank": nearest_rank,
+            "req_over_src": float(required) / max(p.ships, 1),
+            "req_over_prod": float(required) / max(p.production, 1),
+            "target_prod_at_launch": float(target.production),
         })
 
     # over-send 정산: target 별 합산 ships 가 required 초과한 만큼 누적.
@@ -832,7 +852,13 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     #     evaluate_actions 시 _gather_amount_features 의 4D pass-through 분기 탐.
     pair_feat_list, amount_feat_list = [], []
     hit_tracker = HitRateTracker()
-    sum_dense = sum_cap = sum_terminal = 0.0
+    sum_dense = sum_terminal = 0.0
+    # cap_bonus 분리: gain (중립 → 내것) / loss (내것 → 잃음).
+    # CSV mean_cap_bonus 는 둘의 합으로 deprecated 유지.
+    sum_neutral_capture_bonus  = 0.0
+    sum_own_planet_loss_penalty = 0.0
+    # C 단계 — capture_events 기반. coef=0 (default) 이면 항상 0.
+    sum_early_close_neutral_capture_bonus = 0.0
     sum_all_in_penalty = 0.0   # Sprint 2: 발사 시 자원 보존 인센티브 (음수 누적)
     sum_over_send_penalty = 0.0   # 다중 source 협조 실패 페널티 (음수 누적)
     sum_under_invested_penalty = 0.0   # capacity-short launch 시도 페널티 (음수 누적)
@@ -875,6 +901,10 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     env = make("orbit_wars", debug=False)
     env.reset()
     hit_tracker.reset_episode(env.state[0].observation)
+    # B 단계 — reward attribution 용 stateful tracker. 매 step register_launches +
+    # update_step 호출. update_step 결과를 ctx.capture_events 로 reward component 에 전달.
+    # 현재는 어떤 component 도 capture_events 를 소비하지 않음 (C 단계에서 도입).
+    capture_tracker = LaunchCaptureTracker()
     # episode-level step counter (buffer 의 `step` 과 다름 — 에피소드 내 0..episodeSteps-1).
     # turn_norm = ep_step / episode_steps_max ∈ [0, 1] phase 신호로 모델/reward 에 전달.
     episode_steps_max = int(getattr(env.configuration, "episodeSteps", 500) or 500)
@@ -907,6 +937,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         cap_gain_coef               = float(T.get("cap_bonus_gain", 0.05)),
         cap_loss_coef               = float(T.get("cap_bonus_loss", 0.025)),
         cap_early_multiplier        = float(T.get("cap_bonus_early_multiplier", 1.0)),
+        # C 단계 — early_close_neutral_capture_bonus (capture_events 기반).
+        early_close_neutral_capture_bonus_coef = float(T.get("early_close_neutral_capture_bonus", 0.0)),
+        early_close_threshold_turn_norm        = float(T.get("early_close_threshold_turn_norm", 0.25)),
+        early_close_max_nearest_rank           = int(T.get("early_close_max_nearest_rank", 1)),
+        early_close_max_req_over_src           = float(T.get("early_close_max_req_over_src", 0.5)),
     )
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
@@ -944,6 +979,28 @@ def _collect_single(main_model, opponent_model, n_steps, device):
                 analysis=analysis, turn_norm=turn_norm,
             )
             hit_tracker.record(decode_counts)
+            # B 단계 — launches dict → LaunchMetadata 변환 + tracker 등록.
+            #   decode 는 ep_step 을 모르므로 turn 은 여기서 채운다.
+            #   ships_sent=0 인 noop launch 는 attribution 무의미 → 제외.
+            launch_metadata_main = [
+                LaunchMetadata(
+                    turn=ep_step,
+                    turn_norm_at_launch=turn_norm,
+                    source_id=int(l["source_id"]),
+                    target_id=int(l["target_id"]),
+                    target_owner_at_launch=int(l["target_owner"]),
+                    target_kind=str(l["target_kind"]),
+                    ships_sent=int(l["ships"]),
+                    eta_turns=int(l["eta_turns"]),
+                    req_over_src=float(l["req_over_src"]),
+                    req_over_prod=float(l["req_over_prod"]),
+                    nearest_neutral_rank=int(l["nearest_neutral_rank"]),
+                    target_prod=float(l["target_prod_at_launch"]),
+                )
+                for l in launches_main
+                if int(l["ships"]) > 0
+            ]
+            capture_tracker.register_launches(launch_metadata_main)
 
             raw_obs_opp = env.state[1].observation
             obs_opp, raw_planets_opp, raw_fleets_opp, av_opp = get_obs_tensor(raw_obs_opp, 1, history_p_opp, history_f_opp)
@@ -960,6 +1017,11 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             curr_obs_main  = env.state[0].observation
             max_speed      = env.configuration.shipSpeed
             hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
+            # B 단계 — capture 검출 + window 안 launch 와 attribution.
+            # 현재 component 가 소비 안 하지만 ctx 로 흘려보내 C 단계 도입 시 즉시 사용 가능.
+            capture_events = capture_tracker.update_step(
+                prev_map, curr_obs_main, player=0, turn=ep_step,
+            )
             curr_score     = (state_score(curr_obs_main, player=0)
                             - state_score(env.state[1].observation, player=1))
             raw_terminal   = env.state[0].reward if ep_done else 0
@@ -976,6 +1038,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
                 ep_done=ep_done,
                 raw_terminal=raw_terminal,
                 player=0,
+                capture_events=capture_events,
                 **reward_coefs,
             )
             breakdown  = compose_rewards(ctx)
@@ -983,7 +1046,9 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             prev_score = curr_score
 
             sum_dense                  += breakdown.dense
-            sum_cap                    += breakdown.cap_bonus
+            sum_neutral_capture_bonus  += breakdown.neutral_capture_bonus
+            sum_own_planet_loss_penalty += breakdown.own_planet_loss_penalty
+            sum_early_close_neutral_capture_bonus += breakdown.early_close_neutral_capture_bonus
             sum_all_in_penalty         += breakdown.all_in_penalty
             sum_over_send_penalty      += breakdown.over_send_penalty
             sum_under_invested_penalty += breakdown.under_invested_penalty
@@ -1058,6 +1123,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         env = make("orbit_wars", debug=False)
         env.reset()
         hit_tracker.reset_episode(env.state[0].observation)
+        capture_tracker.reset_episode()
         episode_steps_max = int(getattr(env.configuration, "episodeSteps", 500) or 500)
         ep_step       = 0
         prev_score    = (state_score(env.state[0].observation, player=0)
@@ -1089,7 +1155,9 @@ def _collect_single(main_model, opponent_model, n_steps, device):
         "n_steps":      hit_tracker.n_steps,
         "episodes":     hit_tracker.episodes,
         "sum_dense":    sum_dense,
-        "sum_cap":      sum_cap,
+        "sum_neutral_capture_bonus":  sum_neutral_capture_bonus,
+        "sum_own_planet_loss_penalty": sum_own_planet_loss_penalty,
+        "sum_early_close_neutral_capture_bonus": sum_early_close_neutral_capture_bonus,
         "sum_all_in_penalty": sum_all_in_penalty,
         "sum_over_send_penalty": sum_over_send_penalty,
         "sum_under_invested_penalty": sum_under_invested_penalty,
@@ -1174,7 +1242,10 @@ def _finalize_reward_stats(raw_list):
     total_counters = defaultdict(float)
     total_n_steps = 0
     total_episodes = 0
-    total_dense = total_cap = total_terminal = 0.0
+    total_dense = total_terminal = 0.0
+    total_neutral_capture_bonus  = 0.0
+    total_own_planet_loss_penalty = 0.0
+    total_early_close_neutral_capture_bonus = 0.0
     total_all_in_penalty = 0.0
     total_over_send_penalty = 0.0
     total_under_invested_penalty = 0.0
@@ -1199,7 +1270,9 @@ def _finalize_reward_stats(raw_list):
         total_n_steps  += r["n_steps"]
         total_episodes += r["episodes"]
         total_dense    += r["sum_dense"]
-        total_cap      += r["sum_cap"]
+        total_neutral_capture_bonus  += r.get("sum_neutral_capture_bonus", 0.0)
+        total_own_planet_loss_penalty += r.get("sum_own_planet_loss_penalty", 0.0)
+        total_early_close_neutral_capture_bonus += r.get("sum_early_close_neutral_capture_bonus", 0.0)
         total_all_in_penalty += r.get("sum_all_in_penalty", 0.0)
         total_over_send_penalty += r.get("sum_over_send_penalty", 0.0)
         total_under_invested_penalty += r.get("sum_under_invested_penalty", 0.0)
@@ -1234,7 +1307,12 @@ def _finalize_reward_stats(raw_list):
     )
     steps_safe = max(total_n_steps, 1)
     stats["mean_dense"]    = total_dense    / steps_safe
-    stats["mean_cap"]      = total_cap      / steps_safe
+    # cap_bonus 분리 (gain/loss). mean_cap (deprecated) = 둘의 합 — 옛 로그와의 추세 비교용.
+    stats["mean_neutral_capture_bonus"]  = total_neutral_capture_bonus  / steps_safe
+    stats["mean_own_planet_loss_penalty"] = total_own_planet_loss_penalty / steps_safe
+    stats["mean_cap"]      = stats["mean_neutral_capture_bonus"] + stats["mean_own_planet_loss_penalty"]
+    # C 단계 — capture_events 기반 양수 가산. coef=0 (default) 이면 항상 0.
+    stats["mean_early_close_neutral_capture_bonus"] = total_early_close_neutral_capture_bonus / steps_safe
     stats["mean_terminal"] = total_terminal / steps_safe
     # Sprint 2: per-step all-in launch penalty (음수). all_in_penalty=0 이면 0.
     stats["mean_all_in_penalty"] = total_all_in_penalty / steps_safe
@@ -2016,6 +2094,12 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 # rollout 내 승률 (on-policy, noisy지만 match_type별로 분포별 성능 확인 가능).
                 win_rate=rew_stats.get("win_rate", 0.0),
                 mean_dense_rew=rew_stats["mean_dense"],
+                # 분리 후 (정식 컬럼).
+                mean_neutral_capture_bonus=rew_stats["mean_neutral_capture_bonus"],
+                mean_own_planet_loss_penalty=rew_stats["mean_own_planet_loss_penalty"],
+                # C 단계 — capture_events 기반. coef=0 (default) 이면 항상 0.
+                mean_early_close_neutral_capture_bonus=rew_stats["mean_early_close_neutral_capture_bonus"],
+                # Deprecated: 옛 로그 추세 비교용. = neutral_capture_bonus + own_planet_loss_penalty.
                 mean_cap_bonus=rew_stats["mean_cap"],
                 mean_terminal_rew=rew_stats["mean_terminal"],
                 # Sprint 2: 발사 시 자원 보존 페널티 (음수). all_in_penalty=0 이면 0.

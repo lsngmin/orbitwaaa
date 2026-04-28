@@ -33,7 +33,17 @@ class TrainingLogger:
             "ent_action", "ent_target",
             "kl_action", "kl_target",
             "cf_action", "cf_target",
-            "mean_dense_rew", "mean_cap_bonus", "mean_terminal_rew",
+            "mean_dense_rew",
+            # cap_bonus 분리 (gain / loss). 정식 컬럼.
+            "mean_neutral_capture_bonus",      # 중립 → 내것 점령 (양수 mean, early_boost 적용).
+            "mean_own_planet_loss_penalty",    # 내것 → 잃음 (음수 mean, phase 무관).
+            # C 단계 — capture_events 기반. 초반/가까움/저비용 조건 만족 중립 점령에 추가 가산.
+            #   coef=0 (default) 이면 항상 0. 양수 mean = qualifying capture / step × prod 가중.
+            "mean_early_close_neutral_capture_bonus",
+            # Deprecated: mean_neutral_capture_bonus + mean_own_planet_loss_penalty.
+            # 옛 로그와의 추세 비교용으로만 유지. 새 분석은 분리된 두 컬럼을 본다.
+            "mean_cap_bonus",
+            "mean_terminal_rew",
             # Sprint 2: 발사 시 자원 보존 페널티 (음수 mean). all_in_penalty=0 이면 0.
             "mean_all_in_penalty",
             # Phase B: per-launch cost penalty (continuous, req/src>0.5). 0 이면 비활성.
