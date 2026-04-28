@@ -51,7 +51,7 @@ training:
   #   = 1.5             → 초반 1.5×, 말기 1.0× (말기 base 보존)
   # neutral GAIN 한정 (own loss / enemy capture 는 boost 무관 — 초반 중립 race 만 가속).
   # 1.0=off baseline 검증 후 1.5 → 2.0 ablation 권장.
-  cap_bonus_early_multiplier: 1.0
+  cap_bonus_early_multiplier: 1.5
   # Sprint 2: 발사 시 source 의 80%+ 비우는(all-in) 발사 페널티.
   # 1차 측정에서 all_in_launch_rate=0.94, remaining_ships_after_launch≈8 — policy가
   # 자원 무시 발사 default. cap_bonus_loss(잃을 때)와 별개 채널로 "발사 시점 보존"
