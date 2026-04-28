@@ -661,3 +661,124 @@ opponent_pred aux 가 RL loss 를 압도하지 않도록 weight 0.1~0.3.
 > **정책은 16축으로 보되 reward 는 그중 결과로 검증 가능한 것만 표현하고, fleet/planet 을 시점이 아닌 궤적으로 다루는 temporal-aware encoder 를 토대로 2인전·4인전을 구분된 head 와 ranking-aware reward 로 학습시키며, league 다양성과 rule-bot 의무 편성으로 self-play corner 를 깨고, action space 는 multi-source coordinated decoder 까지 확장한다.**
 
 이 한 줄을 시스템 전체의 북극성으로 둔다.
+
+---
+
+## 15. 본 청사진의 단점 / 한계 — 현 코드 기준 진단 + 보완 (2026-04-28 추가)
+
+### 15.1 현 코드 진단 (Plan 대비 위치)
+
+현재 `main` 코드를 plan 의 각 장과 비교하면 사실상 **Phase A 기준선**이다. 즉 plan 의 1~6 phase 모두가 미착수.
+
+| 영역 | 현 상태 | Plan 목표 | 갭 |
+|---|---|---|---|
+| Mask (`mask/`) | 5개 hard gate (`target_owner_allowed, flight_path_clear, projected_arrival_state, attack_still_needed, capacity_sufficient`) — hard-invalid 원칙 충실 | 동일 (확장 거의 불필요) | **거의 없음** |
+| Reward (`reward/components.py`) | 7 component (`dense, neutral_capture, all_in, over_send, under_invested, launch_cost, terminal`) | ~20+ component, ranking/race/denial/coordinated 추가, 4p 모드별 분리 | **큼** |
+| Feature/Encoder (`model.py`) | snapshot + HISTORY=20 temporal, planet/fleet MLP+attention | arrival_schedule, multi-relation graph attn (5종), per-opponent encoder, player_count embed, future rollout sim | **매우 큼** |
+| Architecture (`model.py`) | single-source decoder, 단일 critic, cost-bias MLP (Phase A) | multi-source coord decoder, aux opponent_pred head, 2p/4p 분기 head, FiLM mode gate | **매우 큼** |
+| Action space | one-launch-per-turn, 이산 ship multiplier | multi-source set per turn, 연속 fraction head | **큼** |
+| League (`train.py LeaguePool`) | snapshot rotation only | rule-bot 4종 의무 편성, sibling reward seed, 2p/4p curriculum, role-asymmetric 4p match | **매우 큼** |
+| Logger (`utils/logger.py`) | ~140 컬럼, 정책 1/4/5/6 만 부분 검증 | 정책 1~16 전체 검증 metric, 4p rank dist | **중간** (절반) |
+| Eval | 2p win_rate 기반, fixed-seed pool 없음 | fixed-seed eval matrix (rule-bot/sibling/snapshot-N), 4p rank distribution | **큼** |
+| Player-count 분기 | 없음 (Kaggle 2p 전제 단일 코드) | 2p/4p 별 head·normalizer·env·league·reward·eval 모두 분리 | **결정적** (4p 인프라 0%) |
+| Stateful event infra | `HitRateTracker` (진단 전용) | `events.py / trackers.py` 기반 reward 컴포넌트 | **중간** (인프라는 있고 reward 연결만 부재) |
+
+요약: **mask 만 plan 과 정렬**, 나머지 9개 영역은 미착수. 4인전은 환경부터 0%.
+
+### 15.2 청사진의 단점 + 보완
+
+#### 15.2.1 단점 — Phase 1 자체가 거대해서 단일 phase 로 다룰 수 없음
+Phase 1 은 (a) arrival_schedule (b) multi-relation graph attention (5종 관계) (c) per-opponent encoder (d) player_count embedding (e) opponent_pred aux head — 다섯 개의 독립 변경을 한 phase 로 묶었다. 각각이 1~2주 작업이고 디버깅까지 합치면 phase 1 만 1~3개월. 이 동안 reward·league 쪽 진척이 0 인 risk.
+**보완**: Phase 1 을 1a~1d 로 쪼갠다.
+- **1a**: arrival_schedule 내장 + future rollout (5.3, 5.4) — 결정론적 시뮬, 모델 변경 없음. 가장 안전. 먼저.
+- **1b**: player_count embedding + per-opponent feature pad (4p 0-pad 으로 2p 도 입력 통일) — feature dim 만 변동.
+- **1c**: multi-relation graph attention — 가장 큰 모델 변경. 단독 phase 로.
+- **1d**: opponent_pred aux head — 1c 끝나야 의미 있음.
+각 단계 끝마다 기존 win_rate 회귀 검사 (≥ baseline - σ).
+
+#### 15.2.2 단점 — 4인전 환경이 0%인데 plan 의 30% 가 4p 전제
+5.6 (per-opponent encoder), 7.2 (4p reward), 8 (4p head, FiLM gate), 9.2 (4p league), 11.4 (4p eval) — 모두 4p env 가 있어야 검증 가능. 현재 코드는 Kaggle 2p 환경만 사용. plan 에 "4p env 어떻게 만드나" 가 없다.
+**보완**: Phase 0 ("4p env trakck") 를 main track 과 **병렬**로 분리 신설.
+- 0-track: 4p sim 환경 wrapper (Kaggle 4p 룰 또는 자체 sim) + 4p match runner + 4p eval harness — main 트랙과 독립적으로 진행, **2p main 트랙은 plan Phase 1~3 까지 4p 무관하게 진행**.
+- Phase 4 진입 시점에 0-track 산출물이 준비되어 있어야 main 트랙이 4p 로 합류.
+- 만약 0-track 이 늦으면 Phase 4·일부 5 를 보류하고 Phase 5 (multi-source) 를 2p 안에서 먼저.
+
+#### 15.2.3 단점 — Plan 이 env observability 를 무검증 가정
+arrival_schedule (5.3), opponent_pred aux (8.3), per-opponent target distribution (11.2) 모두 fleet 의 (src, tgt, launch_turn, eta) 와 상대 launch event 가 obs 로 노출된다고 전제. Kaggle 환경이 이걸 모두 노출하는지 plan 은 검증하지 않음.
+**보완**: Phase 1a 진입 전에 **env adapter audit** 1주 작업 추가.
+- 현 obs 에서 fleet 별 (src, tgt, launch_turn, eta, owner) 가 직접 노출되는지 grep.
+- 누락된 필드는 obs delta 로 inference 가능한지 (예: 새 fleet 등장 = launch event) 검증.
+- inference 도 불가능한 필드 (예: opponent 의 ship 의도, 미래 launch 계획) 는 plan 에서 명시적으로 제외.
+
+#### 15.2.4 단점 — Aux opponent_pred 의 ground-truth 정의 모호
+8.3 은 "predict opponent's next target, CE with realized action" 이라고 쓰지만, Kaggle obs 에서 opponent action 이 atomic 하게 노출되지 않을 수 있다. fleet delta 로 추론 시 noise 가 들어가고, multi-source 환경에선 어느 src 의 어느 tgt 인지 라벨이 모호.
+**보완**: 라벨링 layer 명시.
+- self-play replay 에서는 opponent action 직접 access (그라운드트루스 100%).
+- 외부 봇 매치는 fleet delta 로 inferred target — 다중 launch 면 single-target softmax 대신 multi-label BCE.
+- 라벨 신뢰도 < 0.7 인 step 은 aux loss 에서 mask out.
+
+#### 15.2.5 단점 — Reward catalog 폭증 → cross-correlation/weight 탐색 비용 폭발
+7.3 catalog 는 component 13개+, 4p 전용 4개 추가. 각각 weight 가 필요하고 mode 별 (2p/4p) 별도. 단순 grid 로도 (3 weight per comp)^17 = 천문학적. plan 은 13.1 에 "corr > 0.7 이면 합치거나 폐기" 만 쓰고 *추가 시점 게이트* 가 약함.
+**보완**: 새 component 추가 게이트 강화.
+- (a) 기존 component 와의 cross-corr < 0.5 (0.7 → 0.5).
+- (b) **해당 component 없을 때** 정책 metric 이 정체된다는 ablation 증거 (사후가 아닌 사전).
+- (c) weight 는 단일 점이 아닌 logarithmic 3-point grid (×0.3, ×1, ×3) 로만 sweep, mode 별 별도.
+- 둘 다 통과 못 하면 component 화 보류, **metric 으로만 logger 추가**.
+
+#### 15.2.6 단점 — Logger 가 16정책 중 4정책만 검증 가능 → 측정 없는 학습 risk
+Phase 1·2 변화의 효과를 axis 별로 측정 못 하면 "encoder 가 정책 11/13 을 실제로 강화했는지" 판단 불가. plan 11.2 가 정의는 했지만 *언제 logger 에 추가하나* 가 phase 에 없음.
+**보완**: Phase 0 에 **metric infra** 명시 추가 — Phase 1 시작 *전에* logger 에 정책 2/9/10/11/12/13~16 컬럼 (값은 0 으로라도) 추가. 신호가 없어도 컬럼이 있어야 phase 1·2 가 무엇을 움직이는지 차분 측정 가능. **컬럼 없는 reward component 도입 금지** 룰.
+
+#### 15.2.7 단점 — Plan 7.3 의 "weak filtered_path_penalty / weak race_lost_attempt_penalty" 와 CLAUDE.md "reward = 결과만 평가" 충돌 의심
+filtered_path 는 mask 가 거른 행동을 다시 reward 로 평가하는 모양새고, race_lost_attempt 는 "도착이 늦었으니 시도 자체가 잘못" 이라는 행동가능성 판정에 가깝다. CLAUDE.md 최종 규칙 ("Reward 는 행동 가능성을 판단하지 않는다") 와 마찰.
+**보완**: 이런 보더라인 component 는 도입 단계 명시.
+- 1단계: **metric only** (logger 에 rate 만 기록, reward 화 X).
+- 2단계: 정책 metric (race_attempt_rate, filtered_path_rate) 이 baseline 대비 유의 악화 시에만 reward 화 검토.
+- 3단계: 도입 시 weight 0.05 미만, 1만 step 후 axis metric 회복 못 하면 즉시 0.
+이렇게 하면 "결과 평가" 원칙과 "약한 nudge" 의 타협점이 측정 기반.
+
+#### 15.2.8 단점 — 13.5 는 action space curriculum 만 언급, encoder 변경 시 정책 붕괴 risk 미언급
+Phase 1c (multi-relation graph attention) 처럼 encoder 가 통째로 바뀌면 기존 학습 정책의 표현이 mismatch 되어 win_rate 가 한 번 무너진다. plan 13.5 는 action space 만 다루지 encoder swap curriculum 은 없음.
+**보완**: 13장에 **13.8 encoder swap curriculum** 항목 추가 (별도 보완은 아래 코드 변경엔 포함 안 함, 본 단점 노트로만 — 추후 phase 1c 직전에 13.8 작성).
+- old encoder 는 freeze, new encoder 만 학습 → linear probe 로 동일 task 만 → 점진적 unfreeze.
+- 또는 dual-stream + gating: gate 가 점진적으로 new encoder 쪽으로 이동.
+- win_rate 가 baseline - 2σ 이상 떨어지면 즉시 rollback.
+
+#### 15.2.9 단점 — Phase 5 multi-source decoder 는 "head 추가" 가 아닌 RL pipeline 전면 리팩터
+PPO buffer 는 step 당 (s, a, log_prob, advantage) 가정. multi-source 면 step 당 (s, [a_1...a_K], [log_prob_1...K], [adv_1...K]) 으로 텐서 shape, advantage 분배, KL 계산 모두 변경. 단순 model 변경이 아니라 train loop 변경이라서 plan Phase 5 의 작업량이 크게 과소평가됨.
+**보완**: Phase 5 를 5a/5b 로 분리.
+- **5a (infra)**: action representation 을 list 로 리팩터 (단, max_sources=1 강제 → 동작은 single-source 와 동일). PPO buffer/advantage/log_prob 모두 list-aware. 회귀 검사 = baseline 동등.
+- **5b (활성)**: max_sources 점진적 증가 (1→2→3). 5a 가 통과해야 5b 진입.
+
+#### 15.2.10 단점 — Sibling reward seed 의 GPU·시간 비용 미반영
+9.4 는 "다른 weight 로 학습된 sibling 을 pool 에 합류" 하는데, sibling 1개 = full 학습 run 1개 = main 학습과 동일 비용. 2~3개 sibling 이면 GPU 시간 3~4배. plan 은 이 비용을 다루지 않음.
+**보완**: sibling 을 별도 full run 으로 만들지 말고,
+- (a) **multi-head reward**: 하나의 학습에서 head 별로 다른 reward weight 로 학습 (encoder 공유). 의사-sibling 효과.
+- (b) **single-run snapshot diversity**: 학습 도중 reward weight 를 주기적으로 변동 (curriculum 형태) → 그때 snapshot 을 sibling 처럼 풀에 합류.
+- (c) 진짜 별도 sibling run 은 main 모델이 한 번 충분히 안정화된 *후* 1개만 학습 — 처음부터 병렬 N개는 ROI 부족.
+
+#### 15.2.11 단점 — Fixed-seed eval matrix 부재 (전 phase 의 회귀 검출 불가)
+11.4 는 "fix seed 풀" 을 명시하지만 phase 1 의 어디에도 *언제* 만드는지 없음. 회귀 검사 (15.2.1, 15.2.8 의 보완) 가 모두 fixed eval 에 의존하는데 정작 그게 없음.
+**보완**: Phase 0 (15.2.6 의 metric infra 와 같이 묶음) 에 **fixed-seed eval harness** 도 포함.
+- seed 32~64개 고정, opponent set = {현 baseline snapshot, 단순 rule-bot 1개 (greedy_radius 만이라도 먼저)}.
+- 매 N=1k step 자동 평가, win_rate + axis metric 차분 알람.
+- Phase 1~5 의 모든 회귀 검사가 이 harness 의 출력으로만 판단.
+
+### 15.3 종합 — 즉시 권장 변경 (코드 손대지 않는 plan 수정)
+
+위 단점들을 반영해 **plan 12장 (로드맵)** 에 다음을 추가하는 것이 권장된다 (이번 turn 에선 미반영, 사용자 승인 후 별도 변경).
+
+```text
+Phase 0 (신설) — 인프라 / 측정 / 환경 audit
+  - env adapter audit (15.2.3)
+  - logger 16정책 컬럼 stub 추가 (15.2.6)
+  - fixed-seed eval harness (15.2.11)
+  - rule-bot greedy_radius 1개 우선 구현 (Phase 3 의 일부 선행)
+  - (병렬 0-track) 4p env wrapper 가능성 조사 (15.2.2)
+
+Phase 1 → 1a/1b/1c/1d 로 분할 (15.2.1)
+Phase 5 → 5a (infra-only, single-source 강제) / 5b (multi-source 활성) 로 분할 (15.2.9)
+13장에 13.8 encoder swap curriculum 추가 (15.2.8)
+```
+
+이 변경은 **plan 의 야심을 줄이지 않으면서 phase 단위 회귀 위험을 제어** 하기 위한 것이며, 구현 시점은 사용자 결정.
