@@ -1,26 +1,40 @@
-"""Target mask — (P, P) bool. 4 게이트 순차 적용.
+"""Target mask — (P, P) bool. attack/support 양 종류를 한 mask 에 담음.
 
-게이트 우선순위 (현 train.py 와 동일):
-    owner_rule → sun_path → enemy_neutral_filter → capacity_short
+게이트 순서 (GATES):
+    target_owner_allowed
+    → flight_path_clear
+    → projected_arrival_state
+    → attack_still_needed
+    → capacity_sufficient
 
-원본 로직: train.py:378-417.
+scratch 캐시:
+    ("target_kind", src, dst) = "attack" | "support"   (target_owner_allowed 통과 시)
+    ("aim", src, dst)         = (angle, tx, ty, turns) (flight_path_clear 통과 시)
+    ("proj", src, dst)        = (proj_owner, proj_ships, eff_turns)
+                                                       (projected_arrival_state 통과 시,
+                                                        kind 무관하게 항상 채움)
+    ("required", src, dst)    = int                    (capacity_sufficient 통과 시;
+                                                        attack=capture_required,
+                                                        support=support_required)
 
-ctx.scratch 캐시 키 (다운스트림 feature 계산이 재활용):
-    ("aim", src, dst)      = (angle, tx, ty, turns)              # sun_path 통과 시
-    ("proj", src, dst)     = (proj_owner, proj_ships, eff_turns) # enemy_neutral_filter 통과 시
-    ("required", src, dst) = int                                  # capacity_short 통과 시
+설계 원칙 (Phase C support — 정식 action mode):
+    support 는 "내 행성 + 적 incoming" 인 dst 에만 허용된다 (target_owner_allowed).
+    support_required 는 prediction.compute_support_required 가 정의:
+        proj_owner == own  → max(1, ceil(proj_ships * 0.20), ceil(dst.production))
+        proj_owner != own  → max(1, proj_ships + 1)  (rescue/recapture)
+        모든 경우 source 35% cap 초과 시 None → mask 차단.
+    decoder 의 resolve_ships_for_support 가 동일한 함수를 호출 → mask/decoder parity.
 
-[Phase C] owner_rule 선택적 open — 자기 행성 중 적 fleet 가 incoming 인 곳만
-support target 으로 허용. 후속 게이트가 자동 필터:
-    - enemy_neutral_filter: 적이 약해서 어차피 내가 지킨다 (proj_owner==own) → 차단
-    - capacity_short: 자원 부족 → 차단
-즉 owner_rule 만 풀어주면 “위협 없는 자기 행성” 은 enemy_neutral_filter 가
-잡아내므로 action space 가 폭발하지 않음.
+원본 로직: train.py:378-417 (rename 전 owner_rule/sun_path/enemy_neutral_filter/
+capacity_short).
 """
 from __future__ import annotations
 import torch
 
-from prediction import aim, crosses_sun, first_collision_on_path, project_target_at_eta, fleet_dst_and_eta
+from prediction import (
+    aim, crosses_sun, first_collision_on_path, project_target_at_eta,
+    fleet_dst_and_eta, compute_support_required,
+)
 from . import MaskContext, MaskResult
 
 
@@ -41,17 +55,25 @@ def _has_enemy_incoming(ctx: MaskContext, dst: int) -> bool:
     return False
 
 
-def owner_rule(ctx: MaskContext, src: int, dst: int) -> bool:
-    """train.py:378-386 + Phase C support open.
+def target_owner_allowed(ctx: MaskContext, src: int, dst: int) -> bool:
+    """target 종류 결정 gate.
+
+    게임 의미:
+        src 행성에서 dst 행성으로 보낼 수 있는 목적지 종류인가?
+
+    통과:
+        enemy/neutral 행성 → attack target.
+        내 행성 + 적 incoming 있음 → support target.
 
     차단:
-      - padded idx (src/dst >= P_actual)
-      - self-target (src == dst)
-      - src 미소유 또는 src.ships == 0
-      - dst 내 행성 AND 적 incoming 없음 (안전 → 지원 불필요)
-    허용:
-      - dst 적/중립 (기존 capture 경로)
-      - dst 내 행성 AND 적 incoming 있음 (Phase C support 경로)
+        padding index (src/dst >= P_actual)
+        자기 자신 (src == dst)
+        src 가 내 행성이 아님
+        src.ships <= 0
+        안전한 내 행성 (적 incoming 없음 — 지원 불필요)
+
+    scratch:
+        ("target_kind", src, dst) = "attack" | "support"
     """
     P_actual = len(ctx.planets)
     if src >= P_actual or dst >= P_actual or src == dst:
@@ -61,14 +83,32 @@ def owner_rule(ctx: MaskContext, src: int, dst: int) -> bool:
         return False
     dst_p = ctx.planets[dst]
     if dst_p.owner == ctx.acting_player:
-        # 자기 행성 — 적 incoming 있을 때만 support target 허용.
         if not _has_enemy_incoming(ctx, dst):
             return False
+        ctx.scratch[("target_kind", src, dst)] = "support"
+        return True
+    ctx.scratch[("target_kind", src, dst)] = "attack"
     return True
 
 
-def sun_path(ctx: MaskContext, src: int, dst: int) -> bool:
-    """train.py:387-401 — 직접 태양 차폐 + first_collision 이 의도한 dst 가 아닌 경우."""
+def flight_path_clear(ctx: MaskContext, src: int, dst: int) -> bool:
+    """공통 gate (attack/support).
+
+    게임 의미:
+        src 에서 dst 까지 함대가 실제로 도달 가능한가?
+
+    통과:
+        태양에 막히지 않고,
+        first collision 이 의도한 dst 행성임.
+
+    차단:
+        태양을 지나거나,
+        다른 행성에 먼저 충돌하거나,
+        경로 계산상 도달 불가.
+
+    scratch:
+        ("aim", src, dst) = (angle, tx, ty, turns)
+    """
     src_p = ctx.planets[src]
     tgt_p = ctx.planets[dst]
     if crosses_sun(src_p.x, src_p.y, tgt_p.x, tgt_p.y):
@@ -86,30 +126,108 @@ def sun_path(ctx: MaskContext, src: int, dst: int) -> bool:
     return True
 
 
-def enemy_neutral_filter(ctx: MaskContext, src: int, dst: int) -> bool:
-    """train.py:402-410 — Guard A. 도착 시점 owner == acting_player 면 차단."""
-    angle, tx, ty, turns = ctx.scratch[("aim", src, dst)]
+def projected_arrival_state(ctx: MaskContext, src: int, dst: int) -> bool:
+    """공통 gate — projection 계산 책임만, 차단하지 않음.
+
+    게임 의미:
+        내 함대가 dst 에 도착할 ETA 시점에, 현재 예정된 함대들만 고려하면
+        dst 의 owner/ships 가 어떻게 될 것인가?
+
+    통과:
+        항상 (kind 무관). proj 결과는 후행 게이트가 차단 결정에 사용.
+
+    차단:
+        없음.
+
+    scratch:
+        ("proj", src, dst) = (proj_owner, proj_ships, eff_turns)
+    """
+    _, _, _, turns = ctx.scratch[("aim", src, dst)]
     eff_turns = turns if turns else 1
     proj_owner, proj_ships = project_target_at_eta(
         ctx.planets[dst], eff_turns, ctx.planets, ctx.fleets,
     )
-    if proj_owner == ctx.acting_player:
-        return False
     ctx.scratch[("proj", src, dst)] = (proj_owner, proj_ships, eff_turns)
     return True
 
 
-def capacity_short(ctx: MaskContext, src: int, dst: int) -> bool:
-    """train.py:411-416 — src.ships < required(=proj_ships+1) 차단."""
-    _, proj_ships, _ = ctx.scratch[("proj", src, dst)]
-    required = max(1, int(proj_ships) + 1)
-    if ctx.planets[src].ships < required:
+def attack_still_needed(ctx: MaskContext, src: int, dst: int) -> bool:
+    """공격 target 전용 gate (support 는 통과).
+
+    게임 의미:
+        attack target 이라면, dst 에 추가 공격 함대를 보낼 필요가 있는가?
+
+    통과:
+        support target → 항상 통과 (이 gate 적용 대상 아님).
+        attack target → 도착 시점 dst 가 아직 내 소유가 아닐 것으로 예측됨.
+
+    차단:
+        attack target 인데 도착 시점에 이미 내 소유가 될 예정.
+        (이미 가는 내 함대가 점령할 예정이라 중복 공격.)
+    """
+    kind = ctx.scratch[("target_kind", src, dst)]
+    if kind == "support":
+        return True
+    proj_owner, _, _ = ctx.scratch[("proj", src, dst)]
+    if proj_owner == ctx.acting_player:
+        return False
+    return True
+
+
+def capacity_sufficient(ctx: MaskContext, src: int, dst: int) -> bool:
+    """공격/지원 병력 충분성 gate (kind 분기).
+
+    게임 의미:
+        src 가 이 target kind 에 맞는 최소 병력을 보낼 수 있는가?
+
+    attack:
+        capture_required = max(1, proj_ships + 1)  (도착 시점 점령 비용)
+        src.ships >= capture_required 여야 통과.
+
+    support:
+        support_required = compute_support_required(...)
+            proj_owner==own  → max(1, ceil(proj_ships*0.20), ceil(dst.production))
+            proj_owner!=own  → max(1, proj_ships + 1)
+        source 35% cap 초과 시 차단 (None 반환).
+        통과 시 src.ships >= support_required (cap 안에서 자동 보장).
+
+    차단:
+        attack: src.ships < capture_required.
+        support: compute_support_required 가 None (cap 초과) 또는 src 부족.
+
+    scratch:
+        ("required", src, dst) = int
+        attack 와 support 의 required 는 서로 다른 의미. 읽는 쪽은
+        ("target_kind", src, dst) 도 함께 확인해야 한다.
+    """
+    kind = ctx.scratch[("target_kind", src, dst)]
+    proj_owner, proj_ships, _ = ctx.scratch[("proj", src, dst)]
+    src_p = ctx.planets[src]
+    src_ships = int(src_p.ships)
+    dst_p = ctx.planets[dst]
+
+    if kind == "attack":
+        required = max(1, int(proj_ships) + 1)
+    else:  # "support"
+        required = compute_support_required(
+            src_p, dst_p, proj_owner, proj_ships, ctx.acting_player,
+        )
+        if required is None:
+            return False
+
+    if src_ships < required:
         return False
     ctx.scratch[("required", src, dst)] = required
     return True
 
 
-GATES = (owner_rule, sun_path, enemy_neutral_filter, capacity_short)
+GATES = (
+    target_owner_allowed,
+    flight_path_clear,
+    projected_arrival_state,
+    attack_still_needed,
+    capacity_sufficient,
+)
 GATE_NAMES = tuple(g.__name__ for g in GATES)
 
 

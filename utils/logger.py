@@ -51,15 +51,17 @@ class TrainingLogger:
             "self_fallback_active_rate_ge5",
             "self_fallback_active_rate_ge10",
             "self_fallback_active_rate_ge20",
-            # Phase A 진단 A': mask first-failure 분해 — 4 게이트 × 4 threshold (16 cols).
+            # Phase A 진단 A': mask first-failure 분해 — 5 게이트 × 4 threshold (20 cols).
             # 분모: active_by_thresh (acting_player 소유 + ships≥thresh src 수).
             # 가설별 신호:
-            #   capacity_short_ge20 ↑↑ : 진짜 mask 위기 (큰 src 가 비싼 target 에 막혀 idle).
-            #   owner_rule          ↑  : 게임 룰 (acting_player 소유 행성 비율 — 후반 정상 ↑).
-            #   enemy_neutral_filter↑  : Guard A 가 in-flight 중복 발사 차단 (정상).
-            #   sun_path            ↑  : 사선/태양 차폐 — geometric (mask issue 아님).
+            #   capacity_sufficient_ge20 ↑↑ : 진짜 mask 위기 (큰 src 가 비싼 target 에 막혀 idle).
+            #   target_owner_allowed     ↑  : 게임 룰 (acting_player 소유 행성 비율 — 후반 정상 ↑).
+            #   attack_still_needed      ↑  : Guard A 가 in-flight 중복 발사 차단 (정상; support 는 통과).
+            #   flight_path_clear        ↑  : 사선/태양 차폐 — geometric (mask issue 아님).
+            #   projected_arrival_state         : 차단 안 함 (proj 계산만) — 항상 0 기대.
             *(f"mask_block_{g}_ge{t}"
-              for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+              for g in ("target_owner_allowed", "flight_path_clear", "projected_arrival_state",
+                        "attack_still_needed", "capacity_sufficient")
               for t in (1, 5, 10, 20)),
             # Phase A 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
             # send_required_ratio≈1.17 / send_fraction≈0.80 → req/src ≈ 0.68 가설.
@@ -418,16 +420,16 @@ class TrainingLogger:
 
         # Phase A 진단 A' (mask first-failure ge20): 큰 src(≥20 ships) 기준 게이트별 차단 rate.
         # 작은 src threshold 는 노이즈 많아 ge20 만 콘솔 — 다른 threshold 는 CSV 에 있음.
-        # cap ↑↑ → 진짜 mask 위기, own ↑ → 게임 룰, enf ↑ → Guard A 적정,
-        # sun ↑ → geometric (mask issue 아님).
-        mb_own_ge20 = kwargs.get("mask_block_owner_rule_ge20", "")
-        mb_enf_ge20 = kwargs.get("mask_block_enemy_neutral_filter_ge20", "")
-        mb_sun_ge20 = kwargs.get("mask_block_sun_path_ge20", "")
-        mb_cap_ge20 = kwargs.get("mask_block_capacity_short_ge20", "")
+        # cap ↑↑ → 진짜 mask 위기, own ↑ → 게임 룰, atk ↑ → Guard A 적정 (support 통과),
+        # path ↑ → geometric (mask issue 아님).
+        mb_own_ge20  = kwargs.get("mask_block_target_owner_allowed_ge20", "")
+        mb_atk_ge20  = kwargs.get("mask_block_attack_still_needed_ge20",  "")
+        mb_path_ge20 = kwargs.get("mask_block_flight_path_clear_ge20",    "")
+        mb_cap_ge20  = kwargs.get("mask_block_capacity_sufficient_ge20",  "")
         if _is_num(mb_own_ge20):
             line11 = (
-                f"mask_ge20=[own={mb_own_ge20:.1f}/enf={mb_enf_ge20:.1f}"
-                f"/sun={mb_sun_ge20:.1f}/cap={mb_cap_ge20:.1f}]"
+                f"mask_ge20=[own={mb_own_ge20:.1f}/atk={mb_atk_ge20:.1f}"
+                f"/path={mb_path_ge20:.1f}/cap={mb_cap_ge20:.1f}]"
             )
             print(line11)
 

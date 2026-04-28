@@ -301,6 +301,68 @@ def project_target_at_eta(target, eta, planets, fleets):
     return sim_owner, sim_ships
 
 
+SUPPORT_SOURCE_CAP_FRAC = 0.35   # support launch 가 source 에서 소진할 수 있는 최대 비율
+SUPPORT_HOLD_PROJ_FRAC  = 0.20   # proj_owner==own 인 경우 보강량 = ceil(proj_ships * 이 비율)
+
+
+def compute_support_required(src, dst, proj_owner, proj_ships, acting_player):
+    """Support launch 의 최소 필요 병력 (mask + decoder 공통).
+
+    게임 의미:
+        proj_owner == acting_player → 보강 (이미 버티지만 적 incoming 있음)
+            required = max(1, ceil(proj_ships * 0.20), ceil(dst.production))
+        proj_owner != acting_player → rescue/recapture (도착 시 빼앗길 예정)
+            required = max(1, proj_ships + 1)
+
+    source cap:
+        required > ceil(src.ships * 0.35) 이면 None 반환 — mask 차단 신호.
+        decoder 가 같은 cap 으로 ships 를 clip 한다 (parity).
+
+    None 반환 의미: 이 (src, dst) 는 support 로 의미 있는 launch 가 불가능
+        (source 를 35% 이상 비워야 함 → 다른 곳 방어 무너짐).
+    """
+    src_ships = max(1, int(src.ships))
+    if proj_owner == acting_player:
+        required = max(
+            1,
+            int(math.ceil(int(proj_ships) * SUPPORT_HOLD_PROJ_FRAC)),
+            int(math.ceil(dst.production)),
+        )
+    else:
+        required = max(1, int(proj_ships) + 1)
+
+    max_support = max(1, int(math.ceil(src_ships * SUPPORT_SOURCE_CAP_FRAC)))
+    if required > max_support:
+        return None
+    return required
+
+
+def resolve_ships_for_support(src, dst, angular_velocity, bin_value, src_ships,
+                               required, pos_cache=None, amount_mode="multiplier"):
+    """Support launch 의 ships_needed 결정 (mask 통과 후 decoder 호출).
+
+    capture 와 다른 점:
+      - required 는 compute_support_required 결과 (보강/rescue 의미).
+      - source cap = ceil(src.ships * 0.35) — 방어가 source 비우는 행동 방지.
+      - 고정점 반복 없음: required 가 mask 단계에서 결정됐고, ships 변동에
+        따른 ETA 변화는 support 의미상 무시 가능 (점령이 아니라 보강).
+    """
+    src_ships = int(src_ships)
+    angle, tx, ty, turns = aim(src, dst, angular_velocity, max(1, src_ships), pos_cache=pos_cache)
+    if src_ships <= 0 or required <= 0:
+        return 0, angle, tx, ty, turns, required
+
+    if amount_mode == "multiplier":
+        raw = required * bin_value
+    else:  # "surplus"
+        surplus = max(0, src_ships - required)
+        raw     = required + bin_value * surplus
+    ships = max(1, int(math.ceil(raw)))
+    cap   = max(1, int(math.ceil(src_ships * SUPPORT_SOURCE_CAP_FRAC)))
+    ships = min(src_ships, cap, ships)
+    return ships, angle, tx, ty, turns, required
+
+
 def resolve_ships_for_capture(src, dst, angular_velocity, bin_value, src_ships,
                                pos_cache=None, max_iter=5, fleets=None,
                                planets=None, amount_mode="multiplier"):

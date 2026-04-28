@@ -39,9 +39,11 @@ from env_wrapper import (
 from model import TARGET_PAIR_FEAT_DIM, AMOUNT_BIN_FEAT_DIM
 from prediction import (
     aim, crosses_sun, first_collision_on_path, PositionCache,
-    resolve_ships_for_capture, project_target_at_eta,
+    resolve_ships_for_capture, resolve_ships_for_support,
+    compute_support_required, project_target_at_eta,
 )
 from mask import MaskContext, build_target_mask, build_action_mask
+from reward import RewardContext, compose_rewards
 
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 with open(_cfg_path) as f:
@@ -178,44 +180,9 @@ def _snapshot_obs_for_resolve(raw_obs):
     }
 
 
-def neutral_capture_bonus(prev_map, curr_raw_obs, player, turn_norm=0.0):
-    """중립 행성 점령 보너스: production에 비례한 즉각 보상.
-
-    prev_map: _snapshot_planet_owners()로 미리 추출한 {pid: (owner, prod)}.
-              env.step() 이후 참조 오염을 피하기 위해 raw_obs 직접 참조 대신 사용.
-
-    계수는 config.yaml의 training.cap_bonus_gain / cap_bonus_loss로 관리.
-
-    early_boost (multiplicative, neutral GAIN 한정):
-      cap_bonus_early_multiplier (default 1.0 = off) ≥ 1.0 일 때만 의미 있음.
-      early_boost = 1.0 + (multiplier - 1.0) × max(0, 1 - turn_norm)
-      → turn_norm=0 (게임 초반) 일 때 multiplier 그대로, turn_norm=1 (말기) 일 때 1.0.
-      base bonus 를 대체하지 않고 곱해서 amplify 만 함 (말기에도 base 는 보존).
-      enemy capture / own loss 는 boost 안 적용 — 초반 중립 race 만 가속하려는 의도.
-    """
-    gain_coef = T.get("cap_bonus_gain", 0.05)
-    loss_coef = T.get("cap_bonus_loss", 0.025)
-    early_mult = float(T.get("cap_bonus_early_multiplier", 1.0))
-    tn         = float(max(0.0, min(1.0, turn_norm)))
-    early_boost = 1.0 + (early_mult - 1.0) * max(0.0, 1.0 - tn)
-
-    if isinstance(curr_raw_obs, dict):
-        curr_planets = curr_raw_obs.get("planets", [])
-    else:
-        curr_planets = getattr(curr_raw_obs, "planets", [])
-
-    bonus = 0.0
-    for p in curr_planets:
-        pid   = p[0] if isinstance(p, (list, tuple)) else p.id
-        owner = p[1] if isinstance(p, (list, tuple)) else p.owner
-        prev_owner, prod = prev_map.get(pid, (-1, 0))
-        if prev_owner == -1 and owner == player:        # 중립 → 내 것
-            # neutral GAIN 만 early_boost 적용 (multiplicative — base 보존).
-            bonus += prod * gain_coef * early_boost
-        elif prev_owner == player and owner != player:  # 내 것 → 잃음
-            # own loss 는 boost 없음 — phase 무관 일정 페널티.
-            bonus -= prod * loss_coef
-    return bonus
+# neutral_capture_bonus 는 reward.components 로 이전됨.
+# train.py 는 RewardContext 빌드 시 prev_map / curr_obs / cap_*_coef 를 채워주고
+# compose_rewards(ctx) 가 component 들을 합성한다.
 
 
 # ── Action masking ───────────────────────────────────────────────────────────
@@ -264,8 +231,10 @@ class ActionSpace:
         self.active_by_thresh        = active_by_thresh or {}
         # 진단: mask first-failure 분해 (per src.ships threshold).
         # {gate_name: {1: int, 5: int, 10: int, 20: int}, ...}
-        # gate 우선순위: owner_rule → enemy_neutral_filter → sun_path → capacity_short
+        # gate 우선순위: target_owner_allowed → flight_path_clear → projected_arrival_state
+        #              → attack_still_needed → capacity_sufficient
         # 각 (src, dst) pair 는 첫 실패 게이트에만 카운트됨.
+        # projected_arrival_state 는 차단 안 함 (proj 계산만) — first-failure 카운트 0 기대.
         self.mask_block_by_thresh    = mask_block_by_thresh or {}
         # ── Phase A explicit cost features ───────────────────────────────────
         # pair_features_target: (P, P, TARGET_PAIR_FEAT_DIM=8) float32
@@ -297,10 +266,11 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
         repeat 발사 / 같은 target 중복 commit 을 mask 차원에서 차단.
 
     Mask first-failure tracking:
-      - 게이트 우선순위: owner_rule (i==j or tgt.owner==acting_player)
-        → enemy_neutral_filter (Guard A: proj_owner == acting_player)
-        → sun_path (crosses_sun OR path collision)
-        → capacity_short (src.ships < required)
+      - 게이트 우선순위: target_owner_allowed (i==j / src 미소유 / 안전한 own / kind 결정)
+        → flight_path_clear (crosses_sun OR path collision)
+        → projected_arrival_state (proj 계산만, 차단 X)
+        → attack_still_needed (Guard A: attack 인데 proj_owner == acting_player)
+        → capacity_sufficient (attack: capture_required, support: support_required+35% cap)
       - 각 (src, dst) pair 가 첫 실패한 게이트에 1회만 카운트 (중복 X).
       - src.ships threshold 4종 (1/5/10/20) × gate 4종 = 16 카운터.
       - 진짜 mask 위기 (cap_ge20 ↑) vs 게임 룰 (own ↑) 분리 진단용.
@@ -340,7 +310,8 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
     for j, tgt in enumerate(planets):
         if tgt.owner == acting_player:
             # 내 행성은 enemy race 의미 없음 (race signal off → 0 nominal advantage).
-            # tgt 가 owner_rule 게이트로 어차피 mask off 라 의미 없지만 shape 유지.
+            # tgt 가 own 이면 race 신호 자체가 무의미 (support 도 race 가 아니라 방어).
+            # target_owner_allowed 가 안전한 own 은 어차피 차단하므로 영향 X — shape 유지용.
             dst_to_enemy_eta[j] = ENEMY_ETA_CAP
             continue
         best = ENEMY_ETA_CAP
@@ -360,8 +331,9 @@ def analyze_action_space(raw_planets, raw_fleets, av, acting_player, turn_norm=0
         dst_to_enemy_eta[j] = min(best, ENEMY_ETA_CAP)
 
     # ── Build masks via mask/ module ────────────────────────────────────────
-    # 게이트 우선순위: owner_rule → sun_path → enemy_neutral_filter → capacity_short
-    # ctx.scratch 에 aim/proj/required 캐시 저장 → 아래 feature 루프가 재활용.
+    # 게이트 우선순위: target_owner_allowed → flight_path_clear → projected_arrival_state
+    #              → attack_still_needed → capacity_sufficient
+    # ctx.scratch 에 target_kind/aim/proj/required 캐시 저장 → 아래 feature 루프가 재활용.
     ctx = MaskContext(
         planets=planets, fleets=fleets, av=av, acting_player=acting_player,
         pos_cache=pos_cache, num_planets=MAX_PLANETS, num_actions=NUM_ACTIONS,
@@ -616,19 +588,43 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
 
         target = planets[target_idx]
 
-        # 고정점 반복: surplus formula 로 ships_needed 결정.
-        # 동적: fleets/planets 전달 시 in-flight 효과를 ETA forward sim 으로 반영.
-        ships_needed, angle, tx, ty, turns, required, _ = resolve_ships_for_capture(
-            p, target, av, bin_value, p.ships, pos_cache=pos_cache,
-            fleets=(analysis.fleets if analysis is not None else None),
-            planets=(planets if analysis is not None else None),
-            amount_mode=AMOUNT_MODE,
-        )
+        # ── Phase C: target.owner 로 attack/support 분기 ──────────────────
+        # mask 의 target_owner_allowed 가 ("target_kind", src, dst) 를 저장하지만
+        # decoder 는 analysis.scratch 를 들고 있지 않을 수 있으므로 owner 로 재판정.
+        # mask 와 동일 규칙 (own dst → support, 그 외 → attack) → parity 보장.
+        is_support = (target.owner == acting_player)
+
+        if is_support:
+            # support: required 는 mask 와 동일한 compute_support_required 사용 (parity).
+            # ETA 는 매 launch 마다 aim() 으로 직접 계산 — mask 단계와 동일 결과.
+            _, _, _, turns_eta = aim(p, target, av, max(1, int(p.ships)), pos_cache=pos_cache)
+            eff_turns_proj = max(int(turns_eta or 0), 1)
+            fleets_for_proj = analysis.fleets if analysis is not None else []
+            proj_owner, proj_ships = project_target_at_eta(
+                target, eff_turns_proj, planets, fleets_for_proj,
+            )
+            required = compute_support_required(p, target, proj_owner, proj_ships, acting_player)
+            if required is None:
+                # mask 가 cap 으로 차단했어야 할 케이스 — defensive.
+                counts["filtered_invalid_target"] += 1
+                continue
+            ships_needed, angle, tx, ty, turns, required = resolve_ships_for_support(
+                p, target, av, bin_value, p.ships, required,
+                pos_cache=pos_cache, amount_mode=AMOUNT_MODE,
+            )
+        else:
+            # attack: 고정점 반복으로 ships_needed 결정.
+            ships_needed, angle, tx, ty, turns, required, _ = resolve_ships_for_capture(
+                p, target, av, bin_value, p.ships, pos_cache=pos_cache,
+                fleets=(analysis.fleets if analysis is not None else None),
+                planets=(planets if analysis is not None else None),
+                amount_mode=AMOUNT_MODE,
+            )
         # under_invested: src.ships < required → 1-A 가 ships_needed=0 으로 막은 케이스.
         # filtered_zero_ships 와 분리해서 *발사 시도* 시점에 집계 (학습 페널티/지표용).
         # required=0 (target 이 ETA 시점 self-owned) 은 점령 자체 의미 없음 → 제외.
         # Phase C: self-target (support) 는 capture 가 아니므로 neutral/enemy 분기에서 제외.
-        if required > 0 and p.ships < required:
+        if not is_support and required > 0 and p.ships < required:
             counts["under_invested_count"] += 1
             if target.owner == -1:
                 counts["under_invested_count_neutral"] += 1
@@ -660,20 +656,22 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         # send_required_ratio = ships_needed / required  (실제 공급 비율).
         # under_invested 는 위에서 *발사 시도* 시점에 이미 집계됨 (1-A 가 ships_needed=0
         # 으로 차단했기 때문에 여기 도달하면 항상 src.ships >= required).
-        srr = ships_needed / max(required, 1)
+        # 정책 레벨 분포 (chosen_bin / send_frac / ships_bin_hist) 는 attack/support 합산.
         send_frac_src = ships_needed / max(p.ships, 1)
         counts["chosen_surplus_frac_sum"]    += bin_value
         counts["chosen_surplus_frac_sq_sum"] += bin_value ** 2
         counts["bin_effective_count"]        += 1
         counts["send_fraction_of_src_sum"]    += send_frac_src
         counts["send_fraction_of_src_sq_sum"] += send_frac_src ** 2
-        counts["ships_to_send_sum"]        += ships_needed
-        counts["required_ships_sum"]       += required
-        counts["send_required_ratio_sum"]  += srr
         counts[f"ships_bin_hist_{ships_bin}"] += 1
-        # target-type 분리 (neutral / enemy / self-support).
-        # self-support 는 launch_to_cap_rate / send_required_ratio 정의가 다름
-        # (방어 회복 vs 점령) → 별도 카운트, capture 통계 (neutral/enemy) 와 분리.
+        # capture 전용 stat: ships_to_send / required / send_required_ratio.
+        # support 는 required 의미가 다름 (방어/보강 vs 점령) → 별도 카운트.
+        if not is_support:
+            srr = ships_needed / max(required, 1)
+            counts["ships_to_send_sum"]        += ships_needed
+            counts["required_ships_sum"]       += required
+            counts["send_required_ratio_sum"]  += srr
+        # target-type 분리.
         if target.owner == -1:
             counts["ships_to_send_sum_neutral"]       += ships_needed
             counts["required_ships_sum_neutral"]      += required
@@ -682,7 +680,7 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
             counts["ships_to_send_sum_enemy"]       += ships_needed
             counts["required_ships_sum_enemy"]      += required
             counts["send_required_ratio_sum_enemy"] += srr
-        else:  # self / Phase C support
+        else:  # support
             counts["support_launches"]            += 1
             counts["support_ships_to_send_sum"]   += ships_needed
         # per-target 누적 (over-send 산출용 — 같은 target 두 번째 launch 부터는 required 고정)
@@ -847,11 +845,12 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     sum_self_fallback_by_thresh = {1: 0, 5: 0, 10: 0, 20: 0}
     sum_active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
     # 진단: mask first-failure 분해 — 4 게이트 × 4 src.ships threshold (1/5/10/20).
-    # gate: owner_rule | enemy_neutral_filter | sun_path | capacity_short
+    # gate: target_owner_allowed | flight_path_clear | projected_arrival_state
+    #     | attack_still_needed   | capacity_sufficient   (5 게이트 × 4 threshold = 20 cols)
     # 분모는 sum_active_by_thresh (위와 동일) — 동일 step active source 수 기준 rate 산출.
     sum_mask_block_by_thresh = {
         g: {1: 0, 5: 0, 10: 0, 20: 0}
-        for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+        for g in ("target_owner_allowed", "flight_path_clear", "projected_arrival_state", "attack_still_needed", "capacity_sufficient")
     }
     # 진단: per-launch eta_advantage_norm 분포 (race signal). 양수 = 적보다 빨리 도달.
     # 가설: 초반 launch 의 p50/p75 가 양수 → 정책이 race-favorable target 우선 선택.
@@ -886,20 +885,29 @@ def _collect_single(main_model, opponent_model, n_steps, device):
     history_p_opp = deque([np.zeros((MAX_PLANETS, PLANET_DIM), dtype=np.float32)] * HISTORY, maxlen=HISTORY)
     history_f_opp = deque([np.zeros((MAX_FLEETS,  FLEET_DIM),  dtype=np.float32)] * HISTORY, maxlen=HISTORY)
 
-    dense_coef = T["dense_reward_coef"]
-    terminal_win_reward = float(T.get("terminal_win_reward", 1.0))
-    # Sprint 2: 발사 시 source 80%+ 비우는 발사당 페널티 (음수). 0 이면 비활성.
-    all_in_penalty_coef = float(T.get("all_in_penalty", 0.0))
-    # 다중 source over-send 페널티 (per-excess-ship). 0 이면 비활성.
-    over_send_penalty_coef = float(T.get("over_send_penalty", 0.0))
-    # under-invested: src.ships < required (capacity short — 점령 수학적 불가).
-    # 발사 *시도* 당 페널티. 1-A 가 decode 단에서 ships=0 으로 차단하지만
-    # mask 가 못 잡는 edge (target_mask 이후 fixed-point oscillation 등) 를 reward 로 억제.
-    under_invested_penalty_coef = float(T.get("under_invested_penalty", 0.0))
-    # Phase B: launch cost penalty (continuous). 0 이면 비활성.
-    # all_in_penalty (binary 80%) 와 별개 — req/src > 0.5 부터 단조 페널티.
-    # cost feature 가 reward 와 묶여 target_bias_alpha 가 자랄 신호 생성.
-    launch_cost_penalty_coef = float(T.get("launch_cost_penalty", 0.0))
+    # RewardContext 의 coef 필드들 — episode 내 불변. config 에서 한 번 읽어
+    # **reward_coefs 형태로 매 step ctx 에 주입.
+    #   dense_coef                     : Δstate_score 기반 dense reward 계수
+    #   terminal_win_reward            : 에피소드 종료 시 ±W
+    #   all_in_penalty_coef            : source 80%+ 비우는 발사당 페널티 (Sprint 2)
+    #   over_send_penalty_coef         : target 다중 source over-send (per-excess-ship)
+    #   under_invested_penalty_coef    : src.ships < required 발사 시도당 페널티
+    #     (1-A 가 decode 단에서 차단하지만 mask edge 를 reward 로 보강)
+    #   launch_cost_penalty_coef       : Phase B continuous, max(0, req/src - 0.5) 합계
+    #     (target cost feature 와 reward 사이 직접 다리)
+    #   cap_gain_coef / cap_loss_coef  : 중립 점령 / 자기 행성 상실 보너스 계수
+    #   cap_early_multiplier           : 초반 (turn_norm≈0) 중립 GAIN amplify
+    reward_coefs = dict(
+        dense_coef                  = T["dense_reward_coef"],
+        terminal_win_reward         = float(T.get("terminal_win_reward", 1.0)),
+        all_in_penalty_coef         = float(T.get("all_in_penalty", 0.0)),
+        over_send_penalty_coef      = float(T.get("over_send_penalty", 0.0)),
+        under_invested_penalty_coef = float(T.get("under_invested_penalty", 0.0)),
+        launch_cost_penalty_coef    = float(T.get("launch_cost_penalty", 0.0)),
+        cap_gain_coef               = float(T.get("cap_bonus_gain", 0.05)),
+        cap_loss_coef               = float(T.get("cap_bonus_loss", 0.025)),
+        cap_early_multiplier        = float(T.get("cap_bonus_early_multiplier", 1.0)),
+    )
     prev_score = (state_score(env.state[0].observation, player=0)
                 - state_score(env.state[1].observation, player=1))
 
@@ -954,40 +962,33 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             hit_tracker.resolve_step(prev_obs_snap, curr_obs_main, max_speed)
             curr_score     = (state_score(curr_obs_main, player=0)
                             - state_score(env.state[1].observation, player=1))
-            dense_r        = dense_coef * (curr_score - prev_score)
-            cap_bonus      = neutral_capture_bonus(prev_map, curr_obs_main, player=0,
-                                                   turn_norm=turn_norm)
-            # Sprint 2: 이번 step 의 all-in 발사 수에 비례한 페널티 (decode 시 이미 카운트됨).
-            #   penalty = -coef × n_all_in   (coef=0 이면 비활성, Sprint 1 baseline 동일)
-            all_in_penalty = -all_in_penalty_coef * decode_counts.get("all_in_launches", 0)
-            # over-send: per-target Σships - required 의 양수 초과분에 비례한 페널티.
-            #   다중 source 에서 같은 target 에 redundant 발사 시 함선 단위로 줄임.
-            over_send_penalty = -over_send_penalty_coef * decode_counts.get("over_send_excess_sum", 0)
-            # under-invested: src.ships < required 상태에서의 launch 시도 수에 비례한 페널티.
-            under_invested_penalty = -under_invested_penalty_coef * decode_counts.get("under_invested_count", 0)
-            # Phase B: launch cost (continuous). max(0, req/src - 0.5) 의 step 합계.
-            #   target cost feature 와 reward 사이 직접 다리 — 비싼 target 고를수록 손해.
-            launch_cost_penalty = -launch_cost_penalty_coef * decode_counts.get("launch_cost_excess_sum", 0.0)
-            terminal_r     = 0.0
-            reward         = (dense_r + cap_bonus + all_in_penalty + over_send_penalty
-                              + under_invested_penalty + launch_cost_penalty)
-            prev_score     = curr_score
-
+            raw_terminal   = env.state[0].reward if ep_done else 0
             if ep_done:
-                r          = env.state[0].reward
-                terminal_r = terminal_win_reward if r == 1 else (
-                    -terminal_win_reward if r == -1 else 0.0
-                )
-                reward    += terminal_r
-                sum_wins  += 1.0 if r == 1 else (0.5 if r == 0 else 0.0)
+                sum_wins += 1.0 if raw_terminal == 1 else (0.5 if raw_terminal == 0 else 0.0)
 
-            sum_dense    += dense_r
-            sum_cap      += cap_bonus
-            sum_all_in_penalty += all_in_penalty
-            sum_over_send_penalty += over_send_penalty
-            sum_under_invested_penalty += under_invested_penalty
-            sum_launch_cost_penalty += launch_cost_penalty
-            sum_terminal += terminal_r
+            ctx = RewardContext(
+                prev_score=prev_score,
+                curr_score=curr_score,
+                prev_map=prev_map,
+                curr_obs=curr_obs_main,
+                decode_counts=decode_counts,
+                turn_norm=turn_norm,
+                ep_done=ep_done,
+                raw_terminal=raw_terminal,
+                player=0,
+                **reward_coefs,
+            )
+            breakdown  = compose_rewards(ctx)
+            reward     = breakdown.total
+            prev_score = curr_score
+
+            sum_dense                  += breakdown.dense
+            sum_cap                    += breakdown.cap_bonus
+            sum_all_in_penalty         += breakdown.all_in_penalty
+            sum_over_send_penalty      += breakdown.over_send_penalty
+            sum_under_invested_penalty += breakdown.under_invested_penalty
+            sum_launch_cost_penalty    += breakdown.launch_cost_penalty
+            sum_terminal               += breakdown.terminal
             # Step 4 계측: 이 step 의 self_fallback 빈도. active_sources 는 분모 (acting
             # player 소유 + ships>0 인 src 수) — 매 step launchable[i] 결정 후 알 수 있음.
             sum_self_fallback_active += analysis.self_fallback_active
@@ -1000,7 +1001,7 @@ def _collect_single(main_model, opponent_model, n_steps, device):
             # 진단: mask first-failure 분해 (4 게이트 × 4 threshold). 각 (src,dst) pair 가
             # 첫 실패 게이트에만 카운트되어 들어옴 (analyze_action_space 가 보장).
             mb_bt = analysis.mask_block_by_thresh
-            for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short"):
+            for g in ("target_owner_allowed", "flight_path_clear", "projected_arrival_state", "attack_still_needed", "capacity_sufficient"):
                 gate_dict = mb_bt.get(g, {})
                 for thresh in (1, 5, 10, 20):
                     sum_mask_block_by_thresh[g][thresh] += gate_dict.get(thresh, 0)
@@ -1185,7 +1186,7 @@ def _finalize_reward_stats(raw_list):
     total_active_by_thresh        = {1: 0, 5: 0, 10: 0, 20: 0}
     total_mask_block_by_thresh    = {
         g: {1: 0, 5: 0, 10: 0, 20: 0}
-        for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+        for g in ("target_owner_allowed", "flight_path_clear", "projected_arrival_state", "attack_still_needed", "capacity_sufficient")
     }
     total_req_over_src_list      = []
     total_req_over_prod_list     = []
@@ -1215,7 +1216,7 @@ def _finalize_reward_stats(raw_list):
             total_active_by_thresh[thresh]        += ac_bt.get(thresh, 0)
         # 진단: mask first-failure (gate × threshold) — worker 단순 합산.
         mb_bt = r.get("sum_mask_block_by_thresh", {})
-        for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short"):
+        for g in ("target_owner_allowed", "flight_path_clear", "projected_arrival_state", "attack_still_needed", "capacity_sufficient"):
             gd = mb_bt.get(g, {})
             for thresh in (1, 5, 10, 20):
                 total_mask_block_by_thresh[g][thresh] += gd.get(thresh, 0)
@@ -1264,11 +1265,12 @@ def _finalize_reward_stats(raw_list):
     # 한 src 가 P 개 dst 와 비교되니 분모×P 가 (src,dst) pair 총수지만,
     # 분모를 active_src 로 두면 "src 당 평균 막힌 dst 수" 의미가 됨 — 모니터링 친숙.
     # 가설:
-    #   - cap_short_ge20 ↑↑ : 진짜 mask 위기 (큰 src 가 비싼 target 에 막혀 idle).
-    #   - own_ge20 ↑       : 게임 룰 (대부분의 행성이 acting_player 소유 — 후반).
-    #   - enemy_neutral_filter ↑ : Guard A 가 in-flight 중복 방지로 자주 컷.
-    #   - sun_path ↑       : 사선/태양 차폐 — geometric (mask issue 아님).
-    for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short"):
+    #   - capacity_sufficient_ge20  ↑↑ : 진짜 mask 위기 (큰 src 가 비싼 target 에 막혀 idle).
+    #   - target_owner_allowed_ge20 ↑  : 게임 룰 (대부분의 행성이 acting_player 소유 — 후반).
+    #   - attack_still_needed       ↑  : Guard A 가 in-flight 중복 방지 (attack 만; support 통과).
+    #   - flight_path_clear         ↑  : 사선/태양 차폐 — geometric (mask issue 아님).
+    #   - projected_arrival_state          : 차단 안 하므로 항상 0 기대 (regression 감지용).
+    for g in ("target_owner_allowed", "flight_path_clear", "projected_arrival_state", "attack_still_needed", "capacity_sufficient"):
         for thresh in (1, 5, 10, 20):
             stats[f"mask_block_{g}_ge{thresh}"] = (
                 total_mask_block_by_thresh[g][thresh]
@@ -2035,7 +2037,7 @@ def train(n_envs=1, total_timesteps=None, eval_interval=None, n_games=None, roll
                 # 진단 A': mask first-failure 분해 (4 게이트 × 4 src.ships threshold = 16 cols).
                 # finalize 가 stats 에 채워준 키를 logger 로 forward — 안 빼먹어야 CSV 채워짐.
                 **{f"mask_block_{g}_ge{t}": rew_stats.get(f"mask_block_{g}_ge{t}", 0.0)
-                   for g in ("owner_rule", "enemy_neutral_filter", "sun_path", "capacity_short")
+                   for g in ("target_owner_allowed", "flight_path_clear", "projected_arrival_state", "attack_still_needed", "capacity_sufficient")
                    for t in (1, 5, 10, 20)},
                 # 진단 B: per-launch req/src.ships 분포 (target 비용 측면).
                 req_over_src_launched_mean=rew_stats.get("req_over_src_launched_mean", 0.0),
