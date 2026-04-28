@@ -572,7 +572,25 @@ def decode_action_to_moves(action_np, raw_planets, av, acting_player,
         bin_value = float(SHIPS_BINS[ships_bin])
         counts["attempts"] += 1
 
-        if target_idx >= len(planets) or planets[target_idx].owner == acting_player:
+        # mask-decoder parity (Phase C 이후):
+        #   기존 owner 체크 (target.owner==acting_player → invalid) 는 capture-only
+        #   가정. Phase C 가 own-planet support 를 mask 에서 허용하면서 decoder 가
+        #   support launch 를 전부 폐기 → mean_filtered_invalid_target 폭증 (0→0.87).
+        #
+        # 새 규칙:
+        #   1) target_idx 범위 밖 → invalid (out-of-bounds)
+        #   2) target_idx == i (self-self) → invalid (mask 의 self_fallback sentinel
+        #      = "valid target 없음" 신호. 학습 에서 skip 으로 해석되어야 함)
+        #   3) analysis 가 있고 target_mask[i, target_idx]==False → invalid (mask 와
+        #      sample 의 동기 깨진 케이스. softmax masked_fill 으로 보통 안 일어나나
+        #      defensive)
+        #   own planet target 인데 mask 가 통과시킨 경우 = Phase C support → 정상 launch.
+        #   resolve_ships_for_capture 의 _required_at 가 proj_owner==enemy 만 정상 required
+        #   반환하므로 위협 없는 own 은 어차피 ships_needed=0 으로 자연 차단됨.
+        if target_idx >= len(planets) or i == target_idx:
+            counts["filtered_invalid_target"] += 1
+            continue
+        if analysis is not None and not bool(analysis.target_mask[i, target_idx]):
             counts["filtered_invalid_target"] += 1
             continue
 
